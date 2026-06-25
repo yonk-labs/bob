@@ -1,4 +1,3 @@
-#![allow(dead_code)] // fields used by later tasks (builder, engine, etc.)
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 

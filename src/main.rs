@@ -1,3 +1,4 @@
+#![allow(dead_code)] // interface stubs consumed by later tasks
 mod cli;
 mod config;
 mod doctor;

@@ -1,4 +1,3 @@
-#![allow(dead_code)] // used by engine in later tasks
 /// Cheap secret markers. Returns human-readable findings; empty == clean.
 pub fn scan(text: &str) -> Vec<String> {
     let markers: &[(&str, &str)] = &[
