@@ -3,6 +3,7 @@ mod builder;
 mod cli;
 mod config;
 mod doctor;
+mod judge;
 mod safety;
 mod verify;
 mod worktree;
