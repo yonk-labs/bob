@@ -4,6 +4,7 @@ builder:
 judge:
   cmd: abe
   mode: validate          # validate | debate
+  timeout_secs: 600       # judge call timeout; abe debate can be slower than a build
 verify:
   cmds:                   # objective gates; empty = abe-only (warned)
     - cargo test

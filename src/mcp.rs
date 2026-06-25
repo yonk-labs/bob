@@ -73,7 +73,7 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
     let j = judge::Abe {
         cmd: cfg.judge.cmd.clone(),
         mode: cfg.judge.mode,
-        timeout: std::time::Duration::from_secs(cfg.builder.timeout_secs),
+        timeout: std::time::Duration::from_secs(cfg.judge.timeout_secs),
     };
     let opts = engine::RunOpts {
         spec,
@@ -104,7 +104,7 @@ fn json_or_error(r: anyhow::Result<String>) -> String {
         Ok(s) => s,
         Err(e) => format!(
             "{{\"error\":{}}}",
-            serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"error\"".into())
+            serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "{\"error\":\"internal serialization error\"}".to_string())
         ),
     }
 }

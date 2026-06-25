@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
             let builder = builder::Opencode { cmd: cfg.builder.cmd.clone(),
                 timeout: std::time::Duration::from_secs(cfg.builder.timeout_secs) };
             let judge = judge::Abe { cmd: cfg.judge.cmd.clone(), mode: cfg.judge.mode,
-                timeout: std::time::Duration::from_secs(cfg.builder.timeout_secs) };
+                timeout: std::time::Duration::from_secs(cfg.judge.timeout_secs) };
             let run_id = format!("{}", std::process::id());
             let opts = engine::RunOpts { spec: spec_text, context_files: files, apply, keep, run_id };
             let res = engine::run(&cfg, opts, &builder, &judge).await?;

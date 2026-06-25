@@ -30,7 +30,10 @@ pub struct JudgeCfg {
     pub cmd: String,
     #[serde(default)]
     pub mode: JudgeMode,
+    #[serde(default = "default_judge_timeout")]
+    pub timeout_secs: u64,
 }
+fn default_judge_timeout() -> u64 { 600 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -119,6 +122,7 @@ judge:
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.builder.cmd, "opencode");
         assert_eq!(cfg.builder.timeout_secs, 600);
+        assert_eq!(cfg.judge.timeout_secs, 600);
         assert_eq!(cfg.judge.mode, JudgeMode::Validate);
         assert_eq!(cfg.loop_cfg.max_iterations, 3);
         assert_eq!(cfg.scope.max_changed_files, 20);

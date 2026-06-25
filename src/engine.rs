@@ -357,7 +357,7 @@ mod flow_tests {
 
         let cfg = crate::config::Config {
             builder: crate::config::BuilderCfg { cmd: "opencode".into(), timeout_secs: 5 },
-            judge: crate::config::JudgeCfg { cmd: "abe".into(), mode: crate::config::JudgeMode::Validate },
+            judge: crate::config::JudgeCfg { cmd: "abe".into(), mode: crate::config::JudgeMode::Validate, timeout_secs: 600 },
             verify: crate::config::VerifyCfg { cmds: vec![] },
             loop_cfg: crate::config::LoopCfg { max_iterations: 3, max_walltime_secs: 60 },
             scope: Default::default(), apply: false, artifacts: Default::default(),
