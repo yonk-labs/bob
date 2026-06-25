@@ -29,7 +29,7 @@ impl Judge for Abe {
             args.push(statement.clone());
         }
         let child = Command::new(&self.cmd).args(&args)
-            .stdout(std::process::Stdio::piped()).kill_on_drop(true).spawn()
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn()
             .map_err(|e| anyhow::anyhow!("spawning judge '{}': {e}", self.cmd))?;
         let out = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
             Ok(o) => o?,
@@ -74,11 +74,12 @@ fn collect_disagreements(v: &serde_json::Value) -> String {
     let d = from("disagreements");
     if d.is_empty() {
         // debate puts them under report.disagreements
-        v.get("report").map(|r| {
+        let fb = v.get("report").map(|r| {
             r.get("disagreements").and_then(|x| x.as_array())
              .map(|a| a.iter().filter_map(|i| i.as_str()).collect::<Vec<_>>().join("\n- "))
              .unwrap_or_default()
-        }).unwrap_or_default()
+        }).unwrap_or_default();
+        if fb.is_empty() { String::new() } else { format!("- {fb}") }
     } else { format!("- {d}") }
 }
 
@@ -108,5 +109,12 @@ mod tests {
     #[test]
     fn errors_on_garbage() {
         assert!(parse_abe_validate("not json").is_err());
+    }
+    #[test]
+    fn debate_shape_fallback_is_bulleted() {
+        let json = r#"{"report":{"disagreements":["foo","bar"]}}"#;
+        let o = parse_abe_validate(json).unwrap();
+        assert!(o.critique.contains("- foo"), "expected bullet prefix on first item: {}", o.critique);
+        assert!(o.critique.contains("bar"), "expected second item in critique: {}", o.critique);
     }
 }
