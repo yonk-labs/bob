@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod doctor;
 mod safety;
+mod verify;
 mod worktree;
 
 use clap::Parser;
