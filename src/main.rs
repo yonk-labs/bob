@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod doctor;
 mod safety;
+mod worktree;
 
 use clap::Parser;
 use cli::{Cli, Command};
