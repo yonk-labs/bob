@@ -17,7 +17,7 @@ pub enum LoopAction {
 #[derive(Debug, PartialEq, Eq)]
 pub enum StopReason {
     MaxIterations, Walltime, EmptyDiffAfterCritique,
-    RepeatedVerifyFailure, RepeatedUncertain, ScopeExceeded,
+    RepeatedVerifyFailure, RepeatedUncertain, ScopeExceeded, SecretScanBlocked,
 }
 
 /// Mutable per-loop history the decision function reads.
@@ -177,14 +177,14 @@ pub async fn run(
             }
         };
 
-        // update streaks BEFORE deciding
+        let action = next_action(&state, &step);
+
+        // update streaks AFTER deciding
         if let StepOutcome::Judged { verdict: Verdict::Uncertain, .. } = &step {
             state.uncertain_streak += 1;
         } else if let StepOutcome::Judged { .. } = &step {
             state.uncertain_streak = 0;
         }
-
-        let action = next_action(&state, &step);
 
         // remember verify failure for repeat detection
         if let StepOutcome::VerifyFailed { output } = &step {
@@ -197,6 +197,7 @@ pub async fn run(
                 let diff_hits = crate::safety::scan(&final_diff);
                 if !diff_hits.is_empty() {
                     eprintln!("secret-scan flagged the candidate diff; NOT applying: {diff_hits:?}");
+                    stop_reason = Some(StopReason::SecretScanBlocked);
                 } else if opts.apply {
                     ws.commit_candidate(&format!("bob: {}", opts.spec.lines().next().unwrap_or("change")))?;
                     match ws.apply_to_main()? {
@@ -275,6 +276,12 @@ mod decision_tests {
             LoopAction::Continue { critique } => assert!(critique.contains("missing X")),
             other => panic!("expected Continue, got {other:?}"),
         }
+    }
+    #[test]
+    fn first_uncertain_continues() {
+        let s = state(0, 3); // streak 0
+        let step = StepOutcome::judged(true, Verdict::Uncertain, "unsure");
+        assert!(matches!(next_action(&s, &step), LoopAction::Continue { .. }));
     }
     #[test]
     fn two_uncertain_in_a_row_stops() {
