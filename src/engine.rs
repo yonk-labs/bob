@@ -177,6 +177,16 @@ pub async fn run(
             }
         };
 
+        let verdict_label = match &step {
+            StepOutcome::EmptyDiff => "empty-diff".to_string(),
+            StepOutcome::ScopeExceeded { detail } => format!("scope-exceeded: {detail}"),
+            StepOutcome::VerifyFailed { .. } => "verify-failed".to_string(),
+            StepOutcome::Judged { verdict, .. } => format!("{verdict:?}"),
+        };
+        let _ = crate::report::write_artifacts(
+            std::path::Path::new(&cfg.artifacts.dir), &opts.run_id, state.index,
+            &prompt, &final_diff, &verdict_label);
+
         let action = next_action(&state, &step);
 
         // update streaks AFTER deciding

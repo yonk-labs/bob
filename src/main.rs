@@ -5,6 +5,7 @@ mod config;
 mod doctor;
 mod engine;
 mod judge;
+mod report;
 mod safety;
 mod scope;
 mod verify;
@@ -36,7 +37,10 @@ async fn main() -> anyhow::Result<()> {
             let run_id = format!("{}", std::process::id());
             let opts = engine::RunOpts { spec: spec_text, context_files: files, apply, keep, run_id };
             let res = engine::run(&cfg, opts, &builder, &judge).await?;
-            println!("{:?} iters={}", res.status, res.iterations);
+            crate::report::print(&res);
+            if !res.applied {
+                println!("{}", res.final_diff);
+            }
             Ok(())
         }
         Command::Mcp => { anyhow::bail!("mcp not yet implemented") }
