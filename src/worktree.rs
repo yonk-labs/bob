@@ -95,6 +95,7 @@ mod tests {
 
     #[test]
     fn captures_diff_including_untracked() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir_unique();
         init_repo(&tmp);
         let prev = std::env::current_dir().unwrap();
@@ -114,6 +115,7 @@ mod tests {
 
     #[test]
     fn apply_to_main_applies_when_base_unchanged() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir_unique();
         init_repo(&tmp);
         let prev = std::env::current_dir().unwrap();
@@ -134,6 +136,7 @@ mod tests {
 
     #[test]
     fn apply_to_main_detects_base_moved() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir_unique();
         init_repo(&tmp);
         let prev = std::env::current_dir().unwrap();
