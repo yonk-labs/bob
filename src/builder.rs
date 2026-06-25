@@ -17,6 +17,7 @@ impl Builder for Opencode {
             .arg("run")
             .arg(prompt)
             .current_dir(workdir)
+            .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawning builder '{}': {e}", self.cmd))?;
@@ -29,7 +30,9 @@ impl Builder for Opencode {
                 Ok(())
             }
             Err(_) => {
-                let _ = child.start_kill();
+                if let Err(e) = child.start_kill() {
+                    eprintln!("warning: failed to kill builder on timeout: {e}");
+                }
                 anyhow::bail!("builder timed out after {:?}", self.timeout);
             }
         }
