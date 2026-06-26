@@ -78,10 +78,13 @@ Searched as `./bob.yaml` then `~/.config/bob/config.yaml` (override with `--conf
 
 ```yaml
 builder:
-  cmd: opencode           # builder CLI; invoked as: <cmd> run --dir <worktree> <args> <prompt>
+  cmd: opencode           # builder CLI; invoked as: <cmd> run --dir <wt> --model <id> <args> <prompt>
   timeout_secs: 600       # per build-step wall-clock timeout
-  args: []                # extra builder flags — choose the model here, e.g.
-                          #   ["--model", "anthropic/claude-...", "--variant", "high"]
+  model: qwen             # default model: a name from `models`, or a raw provider/model id
+  models:                 # named roster — switch with `bob build --model <name>`, list with `bob models`
+    qwen:    ollama/Intel/Qwen3-Coder-Next-int4-AutoRound
+    minimax: minimax/MiniMax-M3
+  args: []                # extra opencode flags (not the model), e.g. ["--variant", "high"]
 judge:
   cmd: abe                # judge CLI; invoked as: <cmd> validate --json -- <statement>
   mode: validate          # validate | debate
@@ -101,9 +104,11 @@ artifacts:
   dir: .bob/runs          # per-iteration prompt/diff/verdict (gitignore this)
 ```
 
-**Choosing the builder's model.** Set `builder.args` (forwarded to opencode before the
-prompt): `args: ["--model", "anthropic/claude-...", "--variant", "high"]`. The *judge's*
-models are configured in abe's own config (`abe.yaml`), not here.
+**Choosing the builder's model.** Keep a named roster in `builder.models` (name → `provider/model`
+id, from `opencode models`) and set the default with `builder.model`. Switch per run with
+`bob build --model <name-or-id>` (MCP: a `model` param), and list the roster with `bob models`.
+A `--model` value that isn't a roster name is passed through as a raw id. Omit `builder.model`
+entirely to use opencode's own default. The *judge's* models live in abe's config (`abe.yaml`), not here.
 
 **Guardrails.** bob enforces several, all from `bob.yaml`:
 - **Verify gates** (`verify.cmds`) are your extensible guardrail — *any* shell command that

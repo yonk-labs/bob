@@ -33,6 +33,9 @@ pub struct BuildParams {
     /// Defaults to false (propose only) — never auto-applies unless explicitly set true.
     #[serde(default)]
     pub apply: Option<bool>,
+    /// Model to build with: a name from builder.models, or a raw provider/model id.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[tool_router]
@@ -71,7 +74,7 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
     let b = builder::Opencode {
         cmd: cfg.builder.cmd.clone(),
         timeout: std::time::Duration::from_secs(cfg.builder.timeout_secs),
-        args: cfg.builder.args.clone(),
+        args: cfg.builder.opencode_args(p.model.as_deref()),
     };
     let j = judge::Abe {
         cmd: cfg.judge.cmd.clone(),

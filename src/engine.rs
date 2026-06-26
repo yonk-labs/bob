@@ -372,7 +372,7 @@ mod flow_tests {
         std::env::set_current_dir(&tmp).unwrap();
 
         let cfg = crate::config::Config {
-            builder: crate::config::BuilderCfg { cmd: "opencode".into(), timeout_secs: 5, args: vec![] },
+            builder: crate::config::BuilderCfg { cmd: "opencode".into(), timeout_secs: 5, args: vec![], model: None, models: Default::default() },
             judge: crate::config::JudgeCfg { cmd: "abe".into(), mode: crate::config::JudgeMode::Validate, timeout_secs: 600 },
             verify: crate::config::VerifyCfg { cmds: vec!["true".into()] }, // gate that passes
             loop_cfg: crate::config::LoopCfg { max_iterations: 3, max_walltime_secs: 60 },

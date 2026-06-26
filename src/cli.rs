@@ -23,6 +23,9 @@ pub enum Command {
         files: Vec<PathBuf>,
         #[arg(long)]
         max_iters: Option<u32>,
+        /// Model to build with: a name from builder.models, or a raw provider/model id.
+        #[arg(long)]
+        model: Option<String>,
         /// Apply the candidate to the working tree on pass (default: propose only).
         #[arg(long)]
         apply: bool,
@@ -36,4 +39,6 @@ pub enum Command {
     Init,
     /// Check git/opencode/abe presence and config validity.
     Doctor,
+    /// List the builder model roster (builder.models) and the default.
+    Models,
 }

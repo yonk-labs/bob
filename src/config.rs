@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -22,12 +23,39 @@ pub struct BuilderCfg {
     pub cmd: String,
     #[serde(default = "default_builder_timeout")]
     pub timeout_secs: u64,
-    /// Extra args passed to the builder before the prompt, e.g.
-    /// ["--model", "anthropic/claude-...", "--variant", "high"].
+    /// Default model: a name from `models`, or a raw provider/model id.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Named roster of models the builder can use (name -> provider/model id).
+    #[serde(default)]
+    pub models: BTreeMap<String, String>,
+    /// Extra builder flags before the prompt, e.g. ["--variant", "high"].
     #[serde(default)]
     pub args: Vec<String>,
 }
 fn default_builder_timeout() -> u64 { 600 }
+
+impl BuilderCfg {
+    /// Resolve a model selection (CLI/MCP override, else the config `model`) to a
+    /// concrete id: a key in `models` maps to its value; anything else is used as a
+    /// raw id. `None` => no `--model` flag (opencode uses its own default).
+    pub fn resolved_model(&self, override_sel: Option<&str>) -> Option<String> {
+        let sel = override_sel.or(self.model.as_deref())?;
+        Some(self.models.get(sel).cloned().unwrap_or_else(|| sel.to_string()))
+    }
+
+    /// Args for `opencode run` before the prompt: the resolved `--model` (if any)
+    /// followed by `args`.
+    pub fn opencode_args(&self, override_sel: Option<&str>) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(id) = self.resolved_model(override_sel) {
+            out.push("--model".to_string());
+            out.push(id);
+        }
+        out.extend(self.args.iter().cloned());
+        out
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct JudgeCfg {
@@ -114,6 +142,34 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_roster_resolves_name_default_and_override() {
+        let yaml = r#"
+builder:
+  cmd: opencode
+  model: qwen
+  models:
+    qwen: ollama/Intel/Qwen3-Coder
+    m3: minimax/MiniMax-M3
+  args: ["--variant", "high"]
+judge:
+  cmd: abe
+"#;
+        let b = serde_yaml::from_str::<Config>(yaml).unwrap().builder;
+        // default `model: qwen` resolves via the roster
+        assert_eq!(b.resolved_model(None).as_deref(), Some("ollama/Intel/Qwen3-Coder"));
+        // per-run override by name
+        assert_eq!(b.resolved_model(Some("m3")).as_deref(), Some("minimax/MiniMax-M3"));
+        // override with a raw id not in the roster passes through
+        assert_eq!(b.resolved_model(Some("foo/bar")).as_deref(), Some("foo/bar"));
+        // opencode args: --model <resolved> then the extra args
+        assert_eq!(b.opencode_args(None), vec!["--model", "ollama/Intel/Qwen3-Coder", "--variant", "high"]);
+        // no default + no override => no --model (opencode's own default)
+        let b2 = serde_yaml::from_str::<Config>("builder: { cmd: opencode }\njudge: { cmd: abe }").unwrap().builder;
+        assert!(b2.resolved_model(None).is_none());
+        assert!(b2.opencode_args(None).is_empty());
+    }
 
     #[test]
     fn parses_minimal_config_with_defaults() {
