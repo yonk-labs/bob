@@ -78,8 +78,10 @@ Searched as `./bob.yaml` then `~/.config/bob/config.yaml` (override with `--conf
 
 ```yaml
 builder:
-  cmd: opencode           # builder CLI; invoked as: <cmd> run --dir <worktree> <prompt>
+  cmd: opencode           # builder CLI; invoked as: <cmd> run --dir <worktree> <args> <prompt>
   timeout_secs: 600       # per build-step wall-clock timeout
+  args: []                # extra builder flags — choose the model here, e.g.
+                          #   ["--model", "anthropic/claude-...", "--variant", "high"]
 judge:
   cmd: abe                # judge CLI; invoked as: <cmd> validate --json -- <statement>
   mode: validate          # validate | debate
@@ -98,6 +100,19 @@ apply: false              # propose by default; CLI --apply overrides
 artifacts:
   dir: .bob/runs          # per-iteration prompt/diff/verdict (gitignore this)
 ```
+
+**Choosing the builder's model.** Set `builder.args` (forwarded to opencode before the
+prompt): `args: ["--model", "anthropic/claude-...", "--variant", "high"]`. The *judge's*
+models are configured in abe's own config (`abe.yaml`), not here.
+
+**Guardrails.** bob enforces several, all from `bob.yaml`:
+- **Verify gates** (`verify.cmds`) are your extensible guardrail — *any* shell command that
+  must pass. Add lints/scanners/policy checks: `["cargo test", "cargo clippy -- -D warnings",
+  "./check-policy.sh"]`. If any fails, bob doesn't converge.
+- **Scope** — `scope.max_changed_files` / `max_changed_lines` cap blast radius;
+  `scope.allow_paths: ["src/"]` restricts *which* paths may change (anything outside stops the run).
+- **Secret scan** on inputs + the diff, **propose-by-default** (no `--apply` = no writes),
+  and bounded iteration (`max_iterations` / `max_walltime_secs`).
 
 ## CLI
 
