@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod doctor;
 mod engine;
+mod init;
 mod judge;
 mod mcp;
 mod report;
@@ -59,6 +60,6 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Mcp => mcp::serve().await,
-        Command::Init => { anyhow::bail!("init not yet implemented") }
+        Command::Init => init::run(),
     }
 }

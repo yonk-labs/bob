@@ -32,7 +32,7 @@ pub enum Command {
     },
     /// Run the stdio MCP server.
     Mcp,
-    /// Interactive config wizard.
+    /// Write a starter bob.yaml into the current directory.
     Init,
     /// Check git/opencode/abe presence and config validity.
     Doctor,
