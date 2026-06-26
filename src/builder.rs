@@ -13,8 +13,14 @@ pub struct Opencode {
 
 impl Builder for Opencode {
     async fn build(&self, prompt: &str, workdir: &Path) -> anyhow::Result<()> {
+        // `--dir <workdir>` is REQUIRED, not just cosmetic: without it opencode
+        // resolves its project root back to the main checkout of a git worktree
+        // and edits the real tree instead of the isolated worktree, defeating
+        // bob's isolation. `--dir` pins opencode inside the worktree.
         let mut child = Command::new(&self.cmd)
             .arg("run")
+            .arg("--dir")
+            .arg(workdir)
             .arg(prompt)
             .current_dir(workdir)
             .stdin(std::process::Stdio::null())
