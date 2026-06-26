@@ -7,12 +7,12 @@ fn builds_and_converges_on_a_trivial_task() {
         return;
     }
 
-    // Place the fixture repo as a sibling of the crate (not under /tmp) so the
-    // opencode sandbox doesn't auto-reject it.
+    // Place the fixture repo inside the crate's gitignored .bob/ dir: not under
+    // /tmp (so opencode's sandbox accepts it) and not external to the crate (so
+    // it needs no out-of-tree write permission).
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join(format!("bob-it-fixture-{}", std::process::id()));
+        .join(".bob")
+        .join(format!("it-fixture-{}", std::process::id()));
 
     // Clean up any previous run.
     let _ = std::fs::remove_dir_all(&dir);
