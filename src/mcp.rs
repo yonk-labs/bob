@@ -71,6 +71,7 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
     let b = builder::Opencode {
         cmd: cfg.builder.cmd.clone(),
         timeout: std::time::Duration::from_secs(cfg.builder.timeout_secs),
+        args: cfg.builder.args.clone(),
     };
     let j = judge::Abe {
         cmd: cfg.judge.cmd.clone(),

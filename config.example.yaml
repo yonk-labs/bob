@@ -1,20 +1,23 @@
 builder:
   cmd: opencode
   timeout_secs: 600
+  args: []                # extra builder flags before the prompt, e.g.
+                          #   ["--model", "anthropic/claude-...", "--variant", "high"]
 judge:
   cmd: abe
   mode: validate          # validate | debate
   timeout_secs: 600       # judge call timeout; abe debate can be slower than a build
 verify:
-  cmds:                   # objective gates; empty = abe-only (warned)
-    - cargo test
+  cmds:                   # objective gate(s) — your guardrails. ALL must pass.
+    - cargo test          #   add lints/scanners here too, e.g. "cargo clippy -- -D warnings"
+                          # empty list = no gate (converges on first diff; warned)
 loop:
   max_iterations: 3
   max_walltime_secs: 1800
 scope:
-  max_changed_files: 20
+  max_changed_files: 20   # guardrail: cap blast radius
   max_changed_lines: 800
-  allow_paths: []
+  allow_paths: []         # guardrail: [] = anywhere; else only these path prefixes may change
 apply: false
 artifacts:
   dir: .bob/runs

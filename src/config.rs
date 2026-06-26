@@ -22,6 +22,10 @@ pub struct BuilderCfg {
     pub cmd: String,
     #[serde(default = "default_builder_timeout")]
     pub timeout_secs: u64,
+    /// Extra args passed to the builder before the prompt, e.g.
+    /// ["--model", "anthropic/claude-...", "--variant", "high"].
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 fn default_builder_timeout() -> u64 { 600 }
 

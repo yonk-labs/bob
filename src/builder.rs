@@ -9,6 +9,8 @@ pub trait Builder {
 pub struct Opencode {
     pub cmd: String,
     pub timeout: Duration,
+    /// Extra args inserted before the prompt (e.g. ["--model", "provider/model"]).
+    pub args: Vec<String>,
 }
 
 impl Builder for Opencode {
@@ -21,6 +23,7 @@ impl Builder for Opencode {
             .arg("run")
             .arg("--dir")
             .arg(workdir)
+            .args(&self.args)
             .arg(prompt)
             .current_dir(workdir)
             .stdin(std::process::Stdio::null())

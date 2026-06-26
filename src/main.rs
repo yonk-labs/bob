@@ -40,7 +40,8 @@ async fn main() -> anyhow::Result<()> {
             };
             let apply = apply || cfg.apply;
             let builder = builder::Opencode { cmd: cfg.builder.cmd.clone(),
-                timeout: std::time::Duration::from_secs(cfg.builder.timeout_secs) };
+                timeout: std::time::Duration::from_secs(cfg.builder.timeout_secs),
+                args: cfg.builder.args.clone() };
             let judge = judge::Abe { cmd: cfg.judge.cmd.clone(), mode: cfg.judge.mode,
                 timeout: std::time::Duration::from_secs(cfg.judge.timeout_secs) };
             let run_id = format!("{}-{}", std::process::id(),
