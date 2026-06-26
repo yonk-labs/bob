@@ -30,6 +30,7 @@ fn builds_and_converges_on_a_trivial_task() {
     g(&["config", "user.email", "t@t"]);
     g(&["config", "user.name", "t"]);
 
+    // A real failing task: add() returns 0, so the test fails until the builder fixes it.
     std::fs::write(
         dir.join("src/lib.rs"),
         "pub fn add(a: i32, b: i32) -> i32 { 0 }\n\
@@ -41,6 +42,9 @@ fn builds_and_converges_on_a_trivial_task() {
         "[package]\nname=\"it\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
     )
     .unwrap();
+    // Gitignore build output so opencode's `cargo test` (and bob's worktree) don't
+    // pollute the captured diff with target/ artifacts.
+    std::fs::write(dir.join(".gitignore"), "/target\n/.bob\n").unwrap();
 
     // Write bob.yaml so the verify gate and tool config are present.
     std::fs::write(
@@ -58,7 +62,7 @@ fn builds_and_converges_on_a_trivial_task() {
     g(&["add", "."]);
     g(&["commit", "-qm", "init"]);
 
-    // Act: run bob with a verify gate of `cargo test`.
+    // Act: run bob with a verify gate of `cargo test`. bob exits non-zero unless it converges.
     let bob = env!("CARGO_BIN_EXE_bob");
     let status = Command::new(bob)
         .args(["build", "Implement add() so the test passes", "--max-iters", "3", "--apply"])
@@ -66,7 +70,7 @@ fn builds_and_converges_on_a_trivial_task() {
         .status()
         .unwrap();
 
-    // Assert: bob exited 0 and the test now passes in the real tree.
+    // Assert: bob converged (exit 0) and the test now passes in the real tree.
     assert!(status.success(), "bob should converge");
     let test_status = Command::new("cargo")
         .arg("test")
