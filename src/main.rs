@@ -50,6 +50,12 @@ async fn main() -> anyhow::Result<()> {
             if !res.applied {
                 println!("{}", res.final_diff);
             }
+            // Exit non-zero when the loop did not converge so automation/CI can detect it.
+            if res.status != engine::RunStatus::Converged {
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                std::process::exit(1);
+            }
             Ok(())
         }
         Command::Mcp => mcp::serve().await,
