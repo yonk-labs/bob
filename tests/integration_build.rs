@@ -7,17 +7,24 @@ fn builds_and_converges_on_a_trivial_task() {
         return;
     }
 
-    // Arrange: a tiny git repo with a failing test the builder must make pass.
-    let dir = std::env::temp_dir().join("bob-it");
+    // Place the fixture repo as a sibling of the crate (not under /tmp) so the
+    // opencode sandbox doesn't auto-reject it.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join(format!("bob-it-fixture-{}", std::process::id()));
+
+    // Clean up any previous run.
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).unwrap();
 
     let g = |a: &[&str]| {
-        Command::new("git")
+        let s = Command::new("git")
             .args(a)
             .current_dir(&dir)
             .status()
             .unwrap();
+        assert!(s.success(), "git {:?} failed", a);
     };
     g(&["init", "-q"]);
     g(&["config", "user.email", "t@t"]);
@@ -25,8 +32,8 @@ fn builds_and_converges_on_a_trivial_task() {
 
     std::fs::write(
         dir.join("src/lib.rs"),
-        "pub fn add(a:i32,b:i32)->i32{ unimplemented!() }\n\
-         #[test] fn t(){ assert_eq!(add(2,2),4); }\n",
+        "pub fn add(a: i32, b: i32) -> i32 { 0 }\n\
+         #[test] fn t() { assert_eq!(add(2, 2), 4); }\n",
     )
     .unwrap();
     std::fs::write(
@@ -67,4 +74,7 @@ fn builds_and_converges_on_a_trivial_task() {
         .status()
         .unwrap();
     assert!(test_status.success(), "applied code should pass the test");
+
+    // Clean up the fixture.
+    let _ = std::fs::remove_dir_all(&dir);
 }

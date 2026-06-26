@@ -29,6 +29,7 @@ impl Judge for Abe {
             args.push(statement.clone());
         }
         let child = Command::new(&self.cmd).args(&args)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn()
             .map_err(|e| anyhow::anyhow!("spawning judge '{}': {e}", self.cmd))?;
         let out = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {

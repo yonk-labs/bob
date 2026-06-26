@@ -1,6 +1,8 @@
 //! MCP stdio server exposing a `build` tool so agents can invoke the
 //! build-verify-judge loop inline. Thin wrapper over engine::run.
 
+static MCP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 use crate::{builder, config::Config, engine, judge, report};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -80,7 +82,8 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
         context_files: files,
         apply,
         keep: false,
-        run_id: format!("mcp-{}", std::process::id()),
+        run_id: format!("mcp-{}-{}", std::process::id(),
+            MCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
     };
     let res = engine::run(&cfg, opts, &b, &j).await?;
     Ok(report::to_json(&res))

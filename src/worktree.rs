@@ -23,9 +23,15 @@ impl Workspace {
         let cwd = std::env::current_dir()?;
         let base_sha = git(&["rev-parse", "HEAD"], &cwd)?;
         let branch = format!("bob/{run_id}");
-        let dir = std::env::temp_dir().join(format!("bob-wt-{run_id}"));
+        // Place the worktree inside the repo under .bob/worktrees/<run_id> so the
+        // opencode sandbox (which rejects /tmp/*) can operate on it.
+        let wt_parent = cwd.join(".bob").join("worktrees");
+        std::fs::create_dir_all(&wt_parent)?;
+        let dir = wt_parent.join(run_id);
         // Remove any leftover directory from a prior run so `git worktree add` can create it fresh.
         let _ = std::fs::remove_dir_all(&dir);
+        // Prune stale registrations so accumulated preserved worktrees don't block new ones.
+        let _ = git(&["worktree", "prune"], &cwd);
         let dir_str = dir.to_string_lossy().to_string();
         git(&["worktree", "add", "-b", &branch, &dir_str, &base_sha], &cwd)?;
         Ok(Workspace { repo: cwd, dir, branch, base_sha })

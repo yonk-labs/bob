@@ -15,6 +15,8 @@ mod worktree;
 use clap::Parser;
 use cli::{Cli, Command};
 
+static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(test)]
 pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -27,7 +29,12 @@ async fn main() -> anyhow::Result<()> {
             let mut cfg = config::Config::load(args.config.as_deref())?;
             if let Some(m) = max_iters { cfg.loop_cfg.max_iterations = m; }
             let spec_text = match spec {
-                Some(p) => std::fs::read_to_string(p)?,
+                Some(ref p) => {
+                    if crate::safety::risky_filename(&p.to_string_lossy()) {
+                        anyhow::bail!("refusing: spec path looks sensitive: {}", p.display());
+                    }
+                    std::fs::read_to_string(p)?
+                }
                 None => task.clone(),
             };
             let apply = apply || cfg.apply;
@@ -35,7 +42,8 @@ async fn main() -> anyhow::Result<()> {
                 timeout: std::time::Duration::from_secs(cfg.builder.timeout_secs) };
             let judge = judge::Abe { cmd: cfg.judge.cmd.clone(), mode: cfg.judge.mode,
                 timeout: std::time::Duration::from_secs(cfg.judge.timeout_secs) };
-            let run_id = format!("{}", std::process::id());
+            let run_id = format!("{}-{}", std::process::id(),
+                BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
             let opts = engine::RunOpts { spec: spec_text, context_files: files, apply, keep, run_id };
             let res = engine::run(&cfg, opts, &builder, &judge).await?;
             crate::report::print(&res);

@@ -125,6 +125,10 @@ pub async fn run(
         eprintln!("warning: no verify gates configured — abe is the sole gate");
     }
     // Secret-scan inputs before anything enters a prompt.
+    let spec_hits = crate::safety::scan(&opts.spec);
+    if !spec_hits.is_empty() {
+        anyhow::bail!("secret-scan flagged the spec/task body: {:?}", spec_hits);
+    }
     for f in &opts.context_files {
         if crate::safety::risky_filename(&f.to_string_lossy()) {
             anyhow::bail!("refusing: context file looks sensitive: {}", f.display());
