@@ -1,5 +1,6 @@
 ---
 description: Delegate an implementation task to bob — it builds the change in an isolated worktree, gates on your tests, and returns a verified diff (or applies it)
+argument-hint: "<implementation task>"
 ---
 
 Use the `bob` `build` MCP tool to delegate the implementation task below. bob drives a coding CLI in an isolated git worktree, runs the project's verify gate (e.g. its tests), and converges only when that gate passes.
