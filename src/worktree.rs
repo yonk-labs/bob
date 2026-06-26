@@ -54,6 +54,11 @@ impl Workspace {
     }
 
     /// Apply the candidate commit to the main checkout only if HEAD is unchanged.
+    ///
+    /// Applies by checking out each changed path from the candidate commit (which
+    /// force-overwrites the working tree) rather than `git cherry-pick`, so it is
+    /// robust against untracked files in the main tree — e.g. a generated
+    /// `Cargo.lock` — that cherry-pick would refuse to overwrite.
     pub fn apply_to_main(&self) -> anyhow::Result<ApplyOutcome> {
         let main = &self.repo;
         let current = git(&["rev-parse", "HEAD"], main)?;
@@ -61,7 +66,21 @@ impl Workspace {
             return Ok(ApplyOutcome::BaseMoved);
         }
         let candidate = git(&["rev-parse", "HEAD"], &self.dir)?;
-        git(&["cherry-pick", "--no-commit", &candidate], &main)?;
+        let status = git(
+            &["-c", "core.quotePath=false", "diff", "--no-renames", "--name-status",
+              &self.base_sha, &candidate],
+            main,
+        )?;
+        for line in status.lines() {
+            let mut parts = line.splitn(2, '\t');
+            let st = parts.next().unwrap_or("");
+            let path = match parts.next() { Some(p) => p, None => continue };
+            match st.chars().next() {
+                Some('D') => { git(&["rm", "-q", "--", path], main)?; }
+                Some(_) => { git(&["checkout", &candidate, "--", path], main)?; }
+                None => {}
+            }
+        }
         Ok(ApplyOutcome::Applied)
     }
 
@@ -162,5 +181,30 @@ mod tests {
         std::env::set_current_dir(prev).unwrap();
 
         assert!(matches!(outcome, ApplyOutcome::BaseMoved), "expected BaseMoved");
+    }
+
+    #[test]
+    fn apply_overwrites_untracked_collision() {
+        // Candidate adds a file that already exists UNTRACKED in main (e.g. a
+        // generated Cargo.lock). cherry-pick refused this; checkout-based apply must not.
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir_unique();
+        init_repo(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let ws = Workspace::create("test4").unwrap();
+        std::fs::write(ws.path().join("gen.lock"), "from-candidate\n").unwrap();
+        ws.commit_candidate("adds gen.lock").unwrap();
+        // main has an untracked gen.lock that would block a cherry-pick
+        std::fs::write(tmp.join("gen.lock"), "stale-untracked\n").unwrap();
+
+        let outcome = ws.apply_to_main().unwrap();
+        ws.cleanup().unwrap();
+        let content = std::fs::read_to_string(tmp.join("gen.lock")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        assert!(matches!(outcome, ApplyOutcome::Applied), "expected Applied despite untracked collision");
+        assert!(content.contains("from-candidate"), "candidate version must overwrite the untracked file");
     }
 }
