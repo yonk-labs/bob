@@ -56,6 +56,13 @@ pub fn parse_abe_validate(json: &str) -> anyhow::Result<JudgeOutcome> {
         return Ok(JudgeOutcome { verdict, critique });
     }
 
+    // abe `validate` returns {reviewer, take:<prose>} with no structured verdict.
+    // Surface the prose as the (advisory) critique; verdict is Uncertain since
+    // there's no machine-readable pass/fail (the verify gate is the authority).
+    if let Some(take) = v.get("take").and_then(|x| x.as_str()) {
+        return Ok(JudgeOutcome { verdict: Verdict::Uncertain, critique: take.to_string() });
+    }
+
     let disagreements = v.get("disagreements").and_then(|d| d.as_array());
     let critique = collect_disagreements(&v);
     let verdict = match disagreements {
@@ -108,6 +115,13 @@ mod tests {
     #[test]
     fn errors_on_garbage() {
         assert!(parse_abe_validate("not json").is_err());
+    }
+
+    #[test]
+    fn extracts_validate_take_prose() {
+        let json = r#"{"reviewer":"gemma","take":"Correct, but watch for i32 overflow."}"#;
+        let o = parse_abe_validate(json).unwrap();
+        assert!(o.critique.contains("watch for i32 overflow"));
     }
     #[test]
     fn debate_shape_fallback_is_bulleted() {

@@ -175,8 +175,17 @@ pub async fn run(
                 if !vr.passed {
                     StepOutcome::VerifyFailed { output: vr.output }
                 } else {
-                    let outcome = judge.judge(&opts.spec, &diff, &vr.output).await?;
-                    StepOutcome::Judged { verdict: outcome.verdict, critique: outcome.critique }
+                    // Verify gate is the authority: a passing objective gate means
+                    // converged. abe runs as a NON-BLOCKING advisory second opinion
+                    // (it's adversarial and returns no structured pass/fail), so its
+                    // take is surfaced but never gates convergence or fails the run.
+                    match judge.judge(&opts.spec, &diff, &vr.output).await {
+                        Ok(o) if !o.critique.trim().is_empty() =>
+                            eprintln!("abe advisory (non-blocking):\n{}\n", o.critique),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("abe advisory unavailable (non-blocking): {e}"),
+                    }
+                    StepOutcome::Judged { verdict: Verdict::Pass, critique: String::new() }
                 }
             }
         };
@@ -328,24 +337,27 @@ mod flow_tests {
     use std::path::Path;
     use std::cell::Cell;
 
-    struct FakeBuilder;
-    impl Builder for FakeBuilder {
+    // Makes NO change on the first call, then a real change — exercises the
+    // empty-diff retry path (the retry trigger under the verify-authority model).
+    struct FlakyBuilder { calls: Cell<u32> }
+    impl Builder for FlakyBuilder {
         async fn build(&self, _p: &str, workdir: &Path) -> anyhow::Result<()> {
-            std::fs::write(workdir.join("out.txt"), "change\n")?; Ok(())
+            let n = self.calls.get(); self.calls.set(n + 1);
+            if n >= 1 { std::fs::write(workdir.join("out.txt"), "change\n")?; }
+            Ok(())
         }
     }
-    // Fails once, then passes — proves the loop iterates and converges.
-    struct FlakyJudge { calls: Cell<u32> }
-    impl Judge for FlakyJudge {
+    // Always Uncertain. Under verify-authority this verdict is advisory and must
+    // NOT block convergence — the test asserts exactly that.
+    struct UncertainJudge;
+    impl Judge for UncertainJudge {
         async fn judge(&self, _s: &str, _d: &str, _v: &str) -> anyhow::Result<JudgeOutcome> {
-            let n = self.calls.get(); self.calls.set(n + 1);
-            let verdict = if n == 0 { Verdict::Fail } else { Verdict::Pass };
-            Ok(JudgeOutcome { verdict, critique: "try again".into() })
+            Ok(JudgeOutcome { verdict: Verdict::Uncertain, critique: "advisory only".into() })
         }
     }
 
     #[tokio::test]
-    async fn converges_after_one_rejection() {
+    async fn empty_diff_retries_then_verify_pass_converges() {
         let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // requires running inside a temp git repo; see worktree::tests helper.
         let tmp = std::env::temp_dir().join(format!("bob-flow-{}", std::process::id()));
@@ -362,15 +374,17 @@ mod flow_tests {
         let cfg = crate::config::Config {
             builder: crate::config::BuilderCfg { cmd: "opencode".into(), timeout_secs: 5 },
             judge: crate::config::JudgeCfg { cmd: "abe".into(), mode: crate::config::JudgeMode::Validate, timeout_secs: 600 },
-            verify: crate::config::VerifyCfg { cmds: vec![] },
+            verify: crate::config::VerifyCfg { cmds: vec!["true".into()] }, // gate that passes
             loop_cfg: crate::config::LoopCfg { max_iterations: 3, max_walltime_secs: 60 },
             scope: Default::default(), apply: false, artifacts: Default::default(),
         };
         let opts = RunOpts { spec: "do the thing".into(), context_files: vec![],
                              apply: false, keep: false, run_id: "flow".into() };
-        let res = run(&cfg, opts, &FakeBuilder, &FlakyJudge { calls: Cell::new(0) }).await.unwrap();
+        let res = run(&cfg, opts, &FlakyBuilder { calls: Cell::new(0) }, &UncertainJudge).await.unwrap();
 
         std::env::set_current_dir(prev).unwrap();
+        // iter-0: empty diff -> continue; iter-1: change -> verify gate passes ->
+        // converge, despite the judge returning Uncertain (now advisory only).
         assert_eq!(res.status, RunStatus::Converged);
         assert_eq!(res.iterations, 2);
     }
