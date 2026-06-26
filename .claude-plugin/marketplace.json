@@ -1,0 +1,24 @@
+{
+  "name": "yonk-labs",
+  "owner": {
+    "name": "yonk-labs",
+    "email": "matt@theyonk.com"
+  },
+  "description": "Yonk Labs Claude Code plugins.",
+  "plugins": [
+    {
+      "name": "bob",
+      "source": "./",
+      "description": "Delegate verified build tasks to bob (build→verify→judge loop over opencode + abe). MCP `build` tool, /bob:build, and a delegation skill.",
+      "version": "0.1.0",
+      "author": {
+        "name": "yonk-labs",
+        "email": "matt@theyonk.com"
+      },
+      "homepage": "https://github.com/yonk-labs/bob",
+      "repository": "https://github.com/yonk-labs/bob",
+      "license": "MIT",
+      "keywords": ["build", "agent", "verify", "codegen", "mcp", "delegation"]
+    }
+  ]
+}

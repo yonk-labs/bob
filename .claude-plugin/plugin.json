@@ -1,0 +1,15 @@
+{
+  "name": "bob",
+  "displayName": "Bob",
+  "version": "0.1.0",
+  "description": "Delegate a build task to bob — an autonomous build→verify→judge loop that drives opencode + abe in an isolated worktree, gated on your tests. Exposes a `build` MCP tool, /bob:build, and a delegation skill.",
+  "author": {
+    "name": "yonk-labs",
+    "email": "matt@theyonk.com"
+  },
+  "homepage": "https://github.com/yonk-labs/bob",
+  "repository": "https://github.com/yonk-labs/bob",
+  "license": "MIT",
+  "keywords": ["build", "agent", "verify", "codegen", "mcp", "delegation"],
+  "mcpServers": "./.mcp.json"
+}

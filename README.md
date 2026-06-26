@@ -138,6 +138,23 @@ bob mcp               # run the stdio MCP server
 `apply` defaults to **false** over MCP — a host agent can never trigger an auto-apply by
 omitting the field. Register it like any stdio MCP server (command `bob`, arg `mcp`).
 
+## Use it from Claude Code / Codex (plugin)
+
+bob ships as a Claude Code plugin: the `build` MCP tool, a `/bob:build` command, and a
+**delegation skill** (`delegating-to-bob`) that teaches the host agent when and how to hand
+implementation work to bob.
+
+```
+/plugin marketplace add yonk-labs/bob      # or: /plugin marketplace add /path/to/bob (local)
+/plugin install bob@yonk-labs
+```
+
+A coding agent can then delegate a verified build — `/bob:build make the failing auth test pass`,
+or (once the skill triggers) call the `build` tool directly and get back a `RunResult`
+(status, applied, final_diff). The plugin runs `bob mcp`, so `bob` must be installed and on PATH
+first (see Install). Non-Claude MCP clients (Codex, opencode) register the stdio server directly:
+command `bob`, arg `mcp`.
+
 ---
 
 ## Use cases
