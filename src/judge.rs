@@ -22,12 +22,10 @@ impl Judge for Abe {
              ## SPEC\n{spec}\n\n## VERIFY OUTPUT\n{verify_output}\n\n## DIFF\n{diff}"
         );
         let sub = match self.mode { JudgeMode::Validate => "validate", JudgeMode::Debate => "debate" };
-        let mut args = vec![sub.to_string(), "--json".to_string()];
-        if matches!(self.mode, JudgeMode::Validate) {
-            args.push("--statement".into()); args.push(statement.clone());
-        } else {
-            args.push(statement.clone());
-        }
+        // abe takes the statement/prompt as a POSITIONAL arg (both `validate` and
+        // `debate`), not a `--statement` flag. `--` ends option parsing so a
+        // statement that happens to start with a dash isn't read as a flag.
+        let args = vec![sub.to_string(), "--json".to_string(), "--".to_string(), statement.clone()];
         let child = Command::new(&self.cmd).args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn()
