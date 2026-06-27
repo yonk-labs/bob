@@ -1,0 +1,26 @@
+builder:
+  cmd: opencode
+  timeout_secs: 600
+  model: qwen-193
+  models:
+    qwen-193: ollama/Intel/Qwen3-Coder-Next-int4-AutoRound
+    qwen-140: mlx140/mlx-community/Qwen3-Coder-Next-4bit
+    minimax-m3: minimax/MiniMax-M3
+  args: []
+judge:
+  cmd: abe
+  mode: validate
+  timeout_secs: 600
+verify:
+  cmds:
+    - cargo test
+loop:
+  max_iterations: 3
+  max_walltime_secs: 1800
+scope:
+  max_changed_files: 20
+  max_changed_lines: 1200
+  allow_paths: []
+apply: false
+artifacts:
+  dir: .bob/runs

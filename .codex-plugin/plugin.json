@@ -1,0 +1,31 @@
+{
+  "name": "bob",
+  "version": "0.1.0",
+  "description": "Delegate verified build tasks to bob, a build-verify loop over opencode with abe as an advisory judge.",
+  "author": {
+    "name": "yonk-labs",
+    "email": "matt@theyonk.com",
+    "url": "https://github.com/yonk-labs"
+  },
+  "homepage": "https://github.com/yonk-labs/bob",
+  "repository": "https://github.com/yonk-labs/bob",
+  "license": "MIT",
+  "keywords": ["build", "agent", "verify", "codegen", "mcp", "delegation"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Bob",
+    "shortDescription": "Verified code delegation",
+    "longDescription": "Run implementation tasks through bob's isolated build-verify loop, using opencode to edit and abe as a non-blocking second opinion.",
+    "developerName": "yonk-labs",
+    "category": "Productivity",
+    "capabilities": ["MCP tools", "Skills"],
+    "websiteURL": "https://github.com/yonk-labs/bob",
+    "defaultPrompt": [
+      "Use bob to fix the failing tests.",
+      "Delegate this implementation to bob.",
+      "Have bob propose a verified diff."
+    ],
+    "brandColor": "#111111"
+  }
+}

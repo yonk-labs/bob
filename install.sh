@@ -25,3 +25,4 @@ done
 
 echo
 echo "Next:  cd your-project && bob init && \$EDITOR bob.yaml && bob doctor"
+echo "Agents: Codex loads .codex-plugin/plugin.json + .mcp.json; opencode loads opencode.json."

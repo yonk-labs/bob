@@ -3,6 +3,10 @@
     "bob": {
       "command": "bob",
       "args": ["mcp"]
+    },
+    "abe": {
+      "command": "abe",
+      "args": ["mcp"]
     }
   }
 }

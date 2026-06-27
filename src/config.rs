@@ -1,8 +1,8 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub builder: BuilderCfg,
     pub judge: JudgeCfg,
@@ -18,7 +18,7 @@ pub struct Config {
     pub artifacts: ArtifactsCfg,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BuilderCfg {
     pub cmd: String,
     #[serde(default = "default_builder_timeout")]
@@ -57,7 +57,7 @@ impl BuilderCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JudgeCfg {
     pub cmd: String,
     #[serde(default)]
@@ -67,7 +67,7 @@ pub struct JudgeCfg {
 }
 fn default_judge_timeout() -> u64 { 600 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum JudgeMode {
     #[default]
@@ -75,13 +75,13 @@ pub enum JudgeMode {
     Debate,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct VerifyCfg {
     #[serde(default)]
     pub cmds: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoopCfg {
     #[serde(default = "default_max_iters")]
     pub max_iterations: u32,
@@ -94,7 +94,7 @@ impl Default for LoopCfg {
 fn default_max_iters() -> u32 { 3 }
 fn default_max_walltime() -> u64 { 1800 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScopeCfg {
     #[serde(default = "default_max_files")]
     pub max_changed_files: usize,
@@ -109,7 +109,7 @@ impl Default for ScopeCfg {
 fn default_max_files() -> usize { 20 }
 fn default_max_lines() -> usize { 800 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ArtifactsCfg {
     #[serde(default = "default_artifacts_dir")]
     pub dir: String,

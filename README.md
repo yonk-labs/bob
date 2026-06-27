@@ -55,7 +55,31 @@ cargo install --path .          # installs `bob` to ~/.cargo/bin
 bob doctor                      # checks git / opencode / abe / config
 ```
 
-## Quick start
+**Opencode installation** (opencode must be available to bob):
+```bash
+# Official installer
+curl -fsSL https://opencode.ai/install | bash
+
+# Alternative: npm
+npm install -g opencode-ai
+
+# Alternative: Homebrew
+brew install anomalyco/tap/opencode
+```
+
+If `bob doctor` reports opencode missing, the installer suggests the above options.
+
+## Quick start — interactive installer
+
+```bash
+cd your-project
+bob init                        # interactive wizard: detect tools, prompt for config
+  # prompts for: builder cmd/model, judge cmd/mode, verify cmds, loop limits,
+  # scope caps, apply default, artifacts dir — then writes bob.yaml
+bob doctor                      # confirm tools + config
+```
+
+## Quick start — manual config
 
 ```bash
 cd your-project
@@ -177,6 +201,38 @@ command `bob`, arg `mcp`.
   via opencode (e.g. a local coder model) — bob orchestrates the hand-off and verification.
 - **Safe "propose" review.** Run without `--apply` to get a verified candidate diff to review
   before it touches your tree — a tested suggestion, not a blind edit.
+
+## Interactive installer wizard
+
+When you run `bob init`, the installer:
+
+1. **Detects tools** — checks for `git`, `opencode`, `abe` on PATH
+2. **Prompts for configuration:**
+   - Builder command (default: opencode)
+   - Builder model roster (optional, named models with default)
+   - Builder timeout (default: 600s)
+   - Builder extra args (default: none)
+   - Judge command (default: abe)
+   - Judge mode: validate | debate (default: validate)
+   - Judge timeout (default: 600s)
+   - Verify commands (objective gates, all must pass)
+   - Max iterations (default: 3)
+   - Max walltime (default: 1800s)
+   - Max changed files (default: 20)
+   - Max changed lines (default: 800)
+   - Allow paths (restrict which paths may change; empty = anywhere)
+   - Apply by default (default: propose-only)
+   - Artifacts directory (default: .bob/runs)
+3. **Writes `bob.yaml`** — the complete configuration
+4. **Guides next steps** — `bob doctor` to verify
+
+Opencode missing? The wizard prints:
+
+```
+Official install: curl -fsSL https://opencode.ai/install | bash
+Alternative: npm install -g opencode-ai
+Alternative: brew install anomalyco/tap/opencode
+```
 
 ## Safety model
 
