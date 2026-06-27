@@ -71,6 +71,9 @@ Before handing a slice to Bob, Hector checks:
 - `editable_paths` cannot include the test file unless test writing is the task.
 - The task text is self-contained; Bob does not need conversation memory.
 - The slice is small enough for a local/smaller coding model.
+- The gate rejects dependency or lockfile churn unless the slice explicitly allows it.
+- The assertions pin the contract, not incidental implementation shape. For example, a GET helper may include `method: "GET"` unless the product contract forbids it.
+- Verify failures become the next spec detail. If Bob uses global state when the contract requires injection, say that explicitly in the next slice.
 
 ## Example
 
