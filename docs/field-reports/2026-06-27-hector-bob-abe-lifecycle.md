@@ -42,21 +42,15 @@ Abe does have decisive judge functionality:
 - `abe debate --protocol synthesis ...` uses the chairman to merge answers.
 - `abe validate ...` is a single-reviewer second opinion and may return prose without a structured pass/fail verdict.
 
-Bob currently calls Abe through `judge.mode: validate | debate`. In `debate` mode Bob does not pass `--protocol judge`; Abe uses whatever `debate.protocol` is configured in `abe.yaml`. So Bob can use Abe's decisive judge path today only if Abe config sets:
+Bob now calls Abe through `judge.mode: validate | debate`. In `debate` mode Bob forces Abe's decisive judge path:
 
-```yaml
-debate:
-  protocol: judge
+```text
+abe debate --json --protocol judge -- <statement>
 ```
 
-and Bob config sets:
+Use this Bob config when the reviewer should make a decisive model-mediated call:
 
 ```yaml
 judge:
   mode: debate
 ```
-
-## Next Small Fix
-
-Expose Abe's debate protocol in Bob config, e.g. `judge.protocol: validate|synthesis|majority|judge`, and pass `--protocol judge` when requested. That makes decisive Abe review explicit instead of hidden inside Abe config.
-

@@ -11,7 +11,7 @@ builder:
   args: []                # extra opencode flags (NOT the model), e.g. ["--variant", "high"]
 judge:
   cmd: abe
-  mode: validate          # validate | debate
+  mode: validate          # validate | debate; debate forces abe --protocol judge
   timeout_secs: 600       # judge call timeout; abe debate can be slower than a build
   policy: advisory        # advisory | blocking | retry_on_fail
 verify:

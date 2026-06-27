@@ -139,7 +139,7 @@ builder:
   fallback_models: []     # roster aliases or raw ids; example ["minimax"] resolves above
   args: []                # extra opencode flags (not the model), e.g. ["--variant", "high"]
 judge:
-  cmd: abe                # judge CLI; invoked as: <cmd> validate --json -- <statement>
+  cmd: abe                # judge CLI; validate = second opinion, debate = abe debate --protocol judge
   mode: validate          # validate | debate
   timeout_secs: 600
   policy: advisory        # advisory | blocking | retry_on_fail
