@@ -7,7 +7,8 @@ pub fn scan(text: &str) -> Vec<String> {
         ("xoxb-", "Slack bot token"),
         ("-----BEGIN", "private key block"),
     ];
-    markers.iter()
+    markers
+        .iter()
         .filter(|(m, _)| text.contains(m))
         .map(|(m, label)| format!("possible {label} (matched '{m}')"))
         .collect()
@@ -16,7 +17,8 @@ pub fn scan(text: &str) -> Vec<String> {
 pub fn risky_filename(name: &str) -> bool {
     let lower = name.to_lowercase();
     [".env", ".pem", ".key", "id_rsa", "credentials", "secret"]
-        .iter().any(|p| lower.contains(p))
+        .iter()
+        .any(|p| lower.contains(p))
 }
 
 #[cfg(test)]

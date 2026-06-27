@@ -3,7 +3,7 @@
 
 static MCP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-use crate::{builder, config::Config, engine, judge, report};
+use crate::{config::Config, engine, report};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -33,18 +33,38 @@ pub struct BuildParams {
     /// Defaults to false (propose only) — never auto-applies unless explicitly set true.
     #[serde(default)]
     pub apply: Option<bool>,
+    /// Keep the worktree after the run. Artifacts are always kept.
+    #[serde(default)]
+    pub keep_worktree: Option<bool>,
     /// Model to build with: a name from builder.models, or a raw provider/model id.
     #[serde(default)]
     pub model: Option<String>,
+    /// Fallback models to try if the selected model errors or stalls.
+    #[serde(default)]
+    pub fallback_models: Option<Vec<String>>,
+    /// Override verify gate commands for this run.
+    #[serde(default)]
+    pub verify_cmds: Option<Vec<String>>,
+    /// Restrict this run to paths with these prefixes.
+    #[serde(default)]
+    pub allow_paths: Option<Vec<String>>,
+    /// Override max changed files for this run.
+    #[serde(default)]
+    pub max_changed_files: Option<usize>,
+    /// Override max changed lines for this run.
+    #[serde(default)]
+    pub max_changed_lines: Option<usize>,
+    /// Judge behavior after verify passes: advisory, blocking, retry_on_fail.
+    #[serde(default)]
+    pub judge_policy: Option<String>,
 }
 
 #[tool_router]
 impl BobServer {
-    #[tool(
-        description = "Run the build-verify-judge loop on a task/spec; \
+    #[tool(description = "Run the build-verify-judge loop on a task/spec; \
 returns a RunResult JSON with fields: status, base_sha, iterations, applied, \
-stop_reason, final_diff. apply defaults to false (propose only)."
-    )]
+next_action, verify, judge, scope, changed_files, stop_reason, final_diff. \
+apply defaults to false (propose only); fallback_models retries builder errors/stalls.")]
     pub async fn build(&self, Parameters(p): Parameters<BuildParams>) -> String {
         json_or_error(run_build(p).await)
     }
@@ -63,6 +83,21 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
     if let Some(m) = p.max_iters {
         cfg.loop_cfg.max_iterations = m;
     }
+    if let Some(cmds) = p.verify_cmds {
+        cfg.verify.cmds = cmds;
+    }
+    if let Some(paths) = p.allow_paths {
+        cfg.scope.allow_paths = paths;
+    }
+    if let Some(n) = p.max_changed_files {
+        cfg.scope.max_changed_files = n;
+    }
+    if let Some(n) = p.max_changed_lines {
+        cfg.scope.max_changed_lines = n;
+    }
+    if let Some(policy) = p.judge_policy {
+        cfg.judge.policy = policy.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    }
     let spec = p.spec.unwrap_or_else(|| p.task.clone());
     let apply = p.apply.unwrap_or(false); // safety: never auto-apply over MCP without opt-in
     let files = p
@@ -71,25 +106,20 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
         .into_iter()
         .map(std::path::PathBuf::from)
         .collect();
-    let b = builder::Opencode {
-        cmd: cfg.builder.cmd.clone(),
-        timeout: std::time::Duration::from_secs(cfg.builder.timeout_secs),
-        args: cfg.builder.opencode_args(p.model.as_deref()),
-    };
-    let j = judge::Abe {
-        cmd: cfg.judge.cmd.clone(),
-        mode: cfg.judge.mode,
-        timeout: std::time::Duration::from_secs(cfg.judge.timeout_secs),
-    };
+    let fallback_models = p.fallback_models.unwrap_or_default();
     let opts = engine::RunOpts {
         spec,
         context_files: files,
         apply,
-        keep: false,
-        run_id: format!("mcp-{}-{}", std::process::id(),
-            MCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        keep_worktree: p.keep_worktree.unwrap_or(false),
+        run_id: format!(
+            "mcp-{}-{}",
+            std::process::id(),
+            MCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+        builder_model: None,
     };
-    let res = engine::run(&cfg, opts, &b, &j).await?;
+    let res = engine::run_opencode_with_fallbacks(&cfg, opts, p.model, fallback_models).await?;
     Ok(report::to_json(&res))
 }
 
@@ -111,7 +141,8 @@ fn json_or_error(r: anyhow::Result<String>) -> String {
         Ok(s) => s,
         Err(e) => format!(
             "{{\"error\":{}}}",
-            serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "{\"error\":\"internal serialization error\"}".to_string())
+            serde_json::to_string(&e.to_string())
+                .unwrap_or_else(|_| "{\"error\":\"internal serialization error\"}".to_string())
         ),
     }
 }

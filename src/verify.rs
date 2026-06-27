@@ -2,28 +2,56 @@ use std::path::Path;
 use std::process::Command;
 
 #[derive(Debug, Clone)]
-pub struct VerifyResult { pub passed: bool, pub output: String }
+pub struct VerifyResult {
+    pub passed: bool,
+    pub output: String,
+    pub cmd: Option<String>,
+}
 
 /// Run each gate as `sh -c <cmd>` in workdir. First failure stops and is reported.
 /// Empty cmds => pass (abe becomes sole gate; caller warns).
 pub fn run_gates(cmds: &[String], workdir: &Path) -> VerifyResult {
     if cmds.is_empty() {
-        return VerifyResult { passed: true, output: "no verify gates configured".into() };
+        return VerifyResult {
+            passed: true,
+            output: "no verify gates configured".into(),
+            cmd: None,
+        };
     }
     for cmd in cmds {
-        let out = Command::new("sh").arg("-c").arg(cmd).current_dir(workdir).output();
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(workdir)
+            .output();
         match out {
             Ok(o) if o.status.success() => continue,
             Ok(o) => {
                 let combined = format!(
                     "gate failed: {cmd}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-                    String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-                return VerifyResult { passed: false, output: combined };
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                return VerifyResult {
+                    passed: false,
+                    output: combined,
+                    cmd: Some(cmd.clone()),
+                };
             }
-            Err(e) => return VerifyResult { passed: false, output: format!("gate '{cmd}' could not run: {e}") },
+            Err(e) => {
+                return VerifyResult {
+                    passed: false,
+                    output: format!("gate '{cmd}' could not run: {e}"),
+                    cmd: Some(cmd.clone()),
+                }
+            }
         }
     }
-    VerifyResult { passed: true, output: "all gates passed".into() }
+    VerifyResult {
+        passed: true,
+        output: "all gates passed".into(),
+        cmd: Some(cmds.join(" && ")),
+    }
 }
 
 #[cfg(test)]

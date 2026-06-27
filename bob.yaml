@@ -5,12 +5,14 @@ builder:
   models:
     qwen-193: ollama/Intel/Qwen3-Coder-Next-int4-AutoRound
     qwen-140: mlx140/mlx-community/Qwen3-Coder-Next-4bit
-    minimax-m3: minimax/MiniMax-M3
+    # minimax: minimax/MiniMax-M3  # optional cloud fallback example
+  fallback_models: []              # e.g. ["minimax"] after enabling the alias above
   args: []
 judge:
   cmd: abe
   mode: validate
   timeout_secs: 600
+  policy: advisory
 verify:
   cmds:
     - cargo test

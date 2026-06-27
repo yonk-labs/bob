@@ -1,7 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub enum ApplyOutcome { Applied, BaseMoved }
+#[derive(Debug, Clone, Default)]
+pub struct GcReport {
+    pub dry_run: bool,
+    pub worktrees: Vec<PathBuf>,
+    pub branches: Vec<String>,
+}
+
+pub enum ApplyOutcome {
+    Applied,
+    BaseMoved,
+}
 
 pub struct Workspace {
     repo: PathBuf,
@@ -13,9 +23,72 @@ pub struct Workspace {
 fn git(args: &[&str], cwd: &Path) -> anyhow::Result<String> {
     let out = Command::new("git").args(args).current_dir(cwd).output()?;
     if !out.status.success() {
-        anyhow::bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn bob_worktrees(repo: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let root = repo.join(".bob").join("worktrees");
+    let mut out = Vec::new();
+    if root.is_dir() {
+        for entry in std::fs::read_dir(&root)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                out.push(path);
+            }
+        }
+    }
+    let listed = git(&["worktree", "list", "--porcelain"], repo).unwrap_or_default();
+    for line in listed.lines().filter_map(|l| l.strip_prefix("worktree ")) {
+        let path = PathBuf::from(line);
+        if path.starts_with(&root) && !out.iter().any(|p| p == &path) {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn bob_branches(repo: &Path) -> anyhow::Result<Vec<String>> {
+    let branches = git(&["branch", "--format=%(refname:short)"], repo)?;
+    let mut out = branches
+        .lines()
+        .map(str::trim)
+        .filter(|b| b.starts_with("bob/"))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    out.sort();
+    Ok(out)
+}
+
+pub fn gc(dry_run: bool) -> anyhow::Result<GcReport> {
+    let repo = std::env::current_dir()?;
+    let worktrees = bob_worktrees(&repo)?;
+    let branches = bob_branches(&repo)?;
+
+    if !dry_run {
+        for path in &worktrees {
+            let path_str = path.to_string_lossy().to_string();
+            if git(&["worktree", "remove", "--force", &path_str], &repo).is_err() && path.exists() {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+        let _ = git(&["worktree", "prune"], &repo);
+        for branch in &branches {
+            let _ = git(&["branch", "-D", branch], &repo);
+        }
+    }
+
+    Ok(GcReport {
+        dry_run,
+        worktrees,
+        branches,
+    })
 }
 
 impl Workspace {
@@ -33,17 +106,32 @@ impl Workspace {
         // Prune stale registrations so accumulated preserved worktrees don't block new ones.
         let _ = git(&["worktree", "prune"], &cwd);
         let dir_str = dir.to_string_lossy().to_string();
-        git(&["worktree", "add", "-b", &branch, &dir_str, &base_sha], &cwd)?;
-        Ok(Workspace { repo: cwd, dir, branch, base_sha })
+        git(
+            &["worktree", "add", "-b", &branch, &dir_str, &base_sha],
+            &cwd,
+        )?;
+        Ok(Workspace {
+            repo: cwd,
+            dir,
+            branch,
+            base_sha,
+        })
     }
 
-    pub fn path(&self) -> &Path { &self.dir }
-    pub fn base_sha(&self) -> &str { &self.base_sha }
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+    pub fn base_sha(&self) -> &str {
+        &self.base_sha
+    }
 
     /// Diff of all changes in the worktree vs base, including untracked files.
     pub fn capture_diff(&self) -> anyhow::Result<String> {
-        git(&["add", "-A"], &self.dir)?;            // stage incl. untracked
-        git(&["diff", "--cached", &self.base_sha], &self.dir)
+        git(&["add", "-A"], &self.dir)?; // stage incl. untracked
+        git(
+            &["diff", "--cached", "--no-renames", &self.base_sha],
+            &self.dir,
+        )
     }
 
     pub fn commit_candidate(&self, msg: &str) -> anyhow::Result<()> {
@@ -67,17 +155,31 @@ impl Workspace {
         }
         let candidate = git(&["rev-parse", "HEAD"], &self.dir)?;
         let status = git(
-            &["-c", "core.quotePath=false", "diff", "--no-renames", "--name-status",
-              &self.base_sha, &candidate],
+            &[
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--no-renames",
+                "--name-status",
+                &self.base_sha,
+                &candidate,
+            ],
             main,
         )?;
         for line in status.lines() {
             let mut parts = line.splitn(2, '\t');
             let st = parts.next().unwrap_or("");
-            let path = match parts.next() { Some(p) => p, None => continue };
+            let path = match parts.next() {
+                Some(p) => p,
+                None => continue,
+            };
             match st.chars().next() {
-                Some('D') => { git(&["rm", "-q", "--", path], main)?; }
-                Some(_) => { git(&["checkout", &candidate, "--", path], main)?; }
+                Some('D') => {
+                    git(&["rm", "-q", "--", path], main)?;
+                }
+                Some(_) => {
+                    git(&["checkout", &candidate, "--", path], main)?;
+                }
                 None => {}
             }
         }
@@ -101,7 +203,13 @@ mod tests {
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn init_repo(dir: &std::path::Path) {
-        let run = |args: &[&str]| { Command::new("git").args(args).current_dir(dir).output().unwrap(); };
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+        };
         run(&["init", "-q"]);
         run(&["config", "user.email", "t@t"]);
         run(&["config", "user.name", "t"]);
@@ -156,7 +264,10 @@ mod tests {
         std::env::set_current_dir(prev).unwrap();
 
         assert!(matches!(outcome, ApplyOutcome::Applied), "expected Applied");
-        assert!(content.contains("changed"), "change landed in main checkout");
+        assert!(
+            content.contains("changed"),
+            "change landed in main checkout"
+        );
     }
 
     #[test]
@@ -171,7 +282,13 @@ mod tests {
         ws.commit_candidate("candidate").unwrap();
 
         // Advance main HEAD after Workspace::create
-        let run = |args: &[&str]| { Command::new("git").args(args).current_dir(&tmp).output().unwrap(); };
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&tmp)
+                .output()
+                .unwrap();
+        };
         std::fs::write(tmp.join("b.txt"), "new\n").unwrap();
         run(&["add", "."]);
         run(&["commit", "-qm", "advance"]);
@@ -180,7 +297,10 @@ mod tests {
         ws.cleanup().unwrap();
         std::env::set_current_dir(prev).unwrap();
 
-        assert!(matches!(outcome, ApplyOutcome::BaseMoved), "expected BaseMoved");
+        assert!(
+            matches!(outcome, ApplyOutcome::BaseMoved),
+            "expected BaseMoved"
+        );
     }
 
     #[test]
@@ -204,7 +324,56 @@ mod tests {
         let content = std::fs::read_to_string(tmp.join("gen.lock")).unwrap();
         std::env::set_current_dir(prev).unwrap();
 
-        assert!(matches!(outcome, ApplyOutcome::Applied), "expected Applied despite untracked collision");
-        assert!(content.contains("from-candidate"), "candidate version must overwrite the untracked file");
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied),
+            "expected Applied despite untracked collision"
+        );
+        assert!(
+            content.contains("from-candidate"),
+            "candidate version must overwrite the untracked file"
+        );
+    }
+
+    #[test]
+    fn gc_dry_run_reports_without_deleting() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir_unique();
+        init_repo(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let ws = Workspace::create("gc-dry").unwrap();
+        let report = gc(true).unwrap();
+        assert!(report
+            .worktrees
+            .iter()
+            .any(|p| p.ends_with(".bob/worktrees/gc-dry")));
+        assert!(report.branches.contains(&"bob/gc-dry".to_string()));
+        assert!(ws.path().exists(), "dry-run must not remove the worktree");
+
+        ws.cleanup().unwrap();
+        std::env::set_current_dir(prev).unwrap();
+    }
+
+    #[test]
+    fn gc_removes_bob_worktree_and_branch() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir_unique();
+        init_repo(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let ws = Workspace::create("gc-real").unwrap();
+        let path = ws.path().to_path_buf();
+        let report = gc(false).unwrap();
+        assert!(report
+            .worktrees
+            .iter()
+            .any(|p| p.ends_with(".bob/worktrees/gc-real")));
+        assert!(!path.exists(), "gc must remove the worktree directory");
+        let branches = git(&["branch", "--format=%(refname:short)"], &tmp).unwrap();
+        assert!(!branches.lines().any(|b| b == "bob/gc-real"));
+
+        std::env::set_current_dir(prev).unwrap();
     }
 }

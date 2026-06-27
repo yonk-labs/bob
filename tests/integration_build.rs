@@ -65,7 +65,13 @@ fn builds_and_converges_on_a_trivial_task() {
     // Act: run bob with a verify gate of `cargo test`. bob exits non-zero unless it converges.
     let bob = env!("CARGO_BIN_EXE_bob");
     let status = Command::new(bob)
-        .args(["build", "Implement add() so the test passes", "--max-iters", "3", "--apply"])
+        .args([
+            "build",
+            "Implement add() so the test passes",
+            "--max-iters",
+            "3",
+            "--apply",
+        ])
         .current_dir(&dir)
         .status()
         .unwrap();

@@ -1,3 +1,4 @@
+use crate::config::JudgePolicy;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -26,12 +27,33 @@ pub enum Command {
         /// Model to build with: a name from builder.models, or a raw provider/model id.
         #[arg(long)]
         model: Option<String>,
+        /// Fallback model to try if the selected model errors or stalls. Repeat for a chain.
+        #[arg(long = "fallback-model")]
+        fallback_models: Vec<String>,
+        /// Override verify gate command for this run. Repeat for multiple gates.
+        #[arg(long = "verify")]
+        verify_cmds: Vec<String>,
+        /// Restrict this run to paths with this prefix. Repeat for multiple paths.
+        #[arg(long = "allow-path")]
+        allow_paths: Vec<String>,
+        /// Override max changed files for this run.
+        #[arg(long)]
+        max_changed_files: Option<usize>,
+        /// Override max changed lines for this run.
+        #[arg(long)]
+        max_changed_lines: Option<usize>,
+        /// Judge behavior after verify passes: advisory, blocking, retry_on_fail.
+        #[arg(long)]
+        judge_policy: Option<JudgePolicy>,
         /// Apply the candidate to the working tree on pass (default: propose only).
         #[arg(long)]
         apply: bool,
-        /// Keep the worktree + artifacts even on success.
+        /// Keep the worktree even after the run ends. Artifacts are always kept.
         #[arg(long)]
         keep: bool,
+        /// Keep the worktree even after the run ends. Artifacts are always kept.
+        #[arg(long)]
+        keep_worktree: bool,
     },
     /// Run the stdio MCP server.
     Mcp,
@@ -41,4 +63,16 @@ pub enum Command {
     Doctor,
     /// List the builder model roster (builder.models) and the default.
     Models,
+    /// Remove stale bob worktrees and bob/* branches.
+    Gc {
+        /// Show what would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Run a serial campaign file made of Bob-sized slices.
+    Campaign {
+        /// YAML or JSON campaign file.
+        #[arg(long)]
+        file: PathBuf,
+    },
 }

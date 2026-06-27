@@ -52,7 +52,7 @@ name = "bob"
 version = "0.1.0"
 edition = "2021"
 description = "Autonomous build-verify-judge loop over opencode + abe"
-license = "MIT"
+license = "Apache-2.0"
 
 [[bin]]
 name = "bob"

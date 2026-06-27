@@ -29,11 +29,16 @@ pub struct BuilderCfg {
     /// Named roster of models the builder can use (name -> provider/model id).
     #[serde(default)]
     pub models: BTreeMap<String, String>,
+    /// Ordered fallback model names/raw ids to try when the selected model stalls or errors.
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
     /// Extra builder flags before the prompt, e.g. ["--variant", "high"].
     #[serde(default)]
     pub args: Vec<String>,
 }
-fn default_builder_timeout() -> u64 { 600 }
+fn default_builder_timeout() -> u64 {
+    600
+}
 
 impl BuilderCfg {
     /// Resolve a model selection (CLI/MCP override, else the config `model`) to a
@@ -41,7 +46,12 @@ impl BuilderCfg {
     /// raw id. `None` => no `--model` flag (opencode uses its own default).
     pub fn resolved_model(&self, override_sel: Option<&str>) -> Option<String> {
         let sel = override_sel.or(self.model.as_deref())?;
-        Some(self.models.get(sel).cloned().unwrap_or_else(|| sel.to_string()))
+        Some(
+            self.models
+                .get(sel)
+                .cloned()
+                .unwrap_or_else(|| sel.to_string()),
+        )
     }
 
     /// Args for `opencode run` before the prompt: the resolved `--model` (if any)
@@ -55,6 +65,36 @@ impl BuilderCfg {
         out.extend(self.args.iter().cloned());
         out
     }
+
+    pub fn model_sequence(
+        &self,
+        override_sel: Option<&str>,
+        override_fallbacks: &[String],
+    ) -> Vec<Option<String>> {
+        let mut out = vec![override_sel
+            .map(str::to_string)
+            .or_else(|| self.model.clone())];
+        let fallbacks = if override_fallbacks.is_empty() {
+            &self.fallback_models
+        } else {
+            override_fallbacks
+        };
+        out.extend(fallbacks.iter().cloned().map(Some));
+        out.dedup();
+        out
+    }
+
+    pub fn unresolved_aliases(&self) -> Vec<String> {
+        let mut refs = Vec::new();
+        if let Some(model) = &self.model {
+            refs.push(model);
+        }
+        refs.extend(self.fallback_models.iter());
+        refs.into_iter()
+            .filter(|name| !self.models.contains_key(name.as_str()) && !name.contains('/'))
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -64,8 +104,12 @@ pub struct JudgeCfg {
     pub mode: JudgeMode,
     #[serde(default = "default_judge_timeout")]
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub policy: JudgePolicy,
 }
-fn default_judge_timeout() -> u64 { 600 }
+fn default_judge_timeout() -> u64 {
+    600
+}
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -73,6 +117,38 @@ pub enum JudgeMode {
     #[default]
     Validate,
     Debate,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgePolicy {
+    #[default]
+    Advisory,
+    Blocking,
+    RetryOnFail,
+}
+
+impl JudgePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JudgePolicy::Advisory => "advisory",
+            JudgePolicy::Blocking => "blocking",
+            JudgePolicy::RetryOnFail => "retry_on_fail",
+        }
+    }
+}
+
+impl std::str::FromStr for JudgePolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "advisory" => Ok(JudgePolicy::Advisory),
+            "blocking" => Ok(JudgePolicy::Blocking),
+            "retry_on_fail" => Ok(JudgePolicy::RetryOnFail),
+            _ => Err("expected advisory, blocking, or retry_on_fail".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -89,10 +165,19 @@ pub struct LoopCfg {
     pub max_walltime_secs: u64,
 }
 impl Default for LoopCfg {
-    fn default() -> Self { Self { max_iterations: default_max_iters(), max_walltime_secs: default_max_walltime() } }
+    fn default() -> Self {
+        Self {
+            max_iterations: default_max_iters(),
+            max_walltime_secs: default_max_walltime(),
+        }
+    }
 }
-fn default_max_iters() -> u32 { 3 }
-fn default_max_walltime() -> u64 { 1800 }
+fn default_max_iters() -> u32 {
+    3
+}
+fn default_max_walltime() -> u64 {
+    1800
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScopeCfg {
@@ -104,10 +189,20 @@ pub struct ScopeCfg {
     pub allow_paths: Vec<String>,
 }
 impl Default for ScopeCfg {
-    fn default() -> Self { Self { max_changed_files: default_max_files(), max_changed_lines: default_max_lines(), allow_paths: vec![] } }
+    fn default() -> Self {
+        Self {
+            max_changed_files: default_max_files(),
+            max_changed_lines: default_max_lines(),
+            allow_paths: vec![],
+        }
+    }
 }
-fn default_max_files() -> usize { 20 }
-fn default_max_lines() -> usize { 800 }
+fn default_max_files() -> usize {
+    20
+}
+fn default_max_lines() -> usize {
+    800
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ArtifactsCfg {
@@ -115,9 +210,15 @@ pub struct ArtifactsCfg {
     pub dir: String,
 }
 impl Default for ArtifactsCfg {
-    fn default() -> Self { Self { dir: default_artifacts_dir() } }
+    fn default() -> Self {
+        Self {
+            dir: default_artifacts_dir(),
+        }
+    }
 }
-fn default_artifacts_dir() -> String { ".bob/runs".to_string() }
+fn default_artifacts_dir() -> String {
+    ".bob/runs".to_string()
+}
 
 impl Config {
     /// Load from an explicit path, else ./bob.yaml, else ~/.config/bob/config.yaml.
@@ -131,9 +232,13 @@ impl Config {
     }
 
     fn resolve_path(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
-        if let Some(p) = explicit { return Ok(p.to_path_buf()); }
+        if let Some(p) = explicit {
+            return Ok(p.to_path_buf());
+        }
         let local = PathBuf::from("bob.yaml");
-        if local.exists() { return Ok(local); }
+        if local.exists() {
+            return Ok(local);
+        }
         let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
         Ok(PathBuf::from(home).join(".config/bob/config.yaml"))
     }
@@ -149,6 +254,7 @@ mod tests {
 builder:
   cmd: opencode
   model: qwen
+  fallback_models: [m3]
   models:
     qwen: ollama/Intel/Qwen3-Coder
     m3: minimax/MiniMax-M3
@@ -158,15 +264,41 @@ judge:
 "#;
         let b = serde_yaml::from_str::<Config>(yaml).unwrap().builder;
         // default `model: qwen` resolves via the roster
-        assert_eq!(b.resolved_model(None).as_deref(), Some("ollama/Intel/Qwen3-Coder"));
+        assert_eq!(
+            b.resolved_model(None).as_deref(),
+            Some("ollama/Intel/Qwen3-Coder")
+        );
         // per-run override by name
-        assert_eq!(b.resolved_model(Some("m3")).as_deref(), Some("minimax/MiniMax-M3"));
+        assert_eq!(
+            b.resolved_model(Some("m3")).as_deref(),
+            Some("minimax/MiniMax-M3")
+        );
         // override with a raw id not in the roster passes through
-        assert_eq!(b.resolved_model(Some("foo/bar")).as_deref(), Some("foo/bar"));
+        assert_eq!(
+            b.resolved_model(Some("foo/bar")).as_deref(),
+            Some("foo/bar")
+        );
         // opencode args: --model <resolved> then the extra args
-        assert_eq!(b.opencode_args(None), vec!["--model", "ollama/Intel/Qwen3-Coder", "--variant", "high"]);
+        assert_eq!(
+            b.opencode_args(None),
+            vec!["--model", "ollama/Intel/Qwen3-Coder", "--variant", "high"]
+        );
+        assert_eq!(
+            b.model_sequence(None, &[]),
+            vec![Some("qwen".into()), Some("m3".into())]
+        );
+        assert_eq!(
+            b.model_sequence(Some("raw/model"), &["m3".into()]),
+            vec![Some("raw/model".into()), Some("m3".into())]
+        );
+        assert!(b.unresolved_aliases().is_empty());
+        let mut b3 = b.clone();
+        b3.fallback_models = vec!["typo".into(), "raw/model".into()];
+        assert_eq!(b3.unresolved_aliases(), vec!["typo"]);
         // no default + no override => no --model (opencode's own default)
-        let b2 = serde_yaml::from_str::<Config>("builder: { cmd: opencode }\njudge: { cmd: abe }").unwrap().builder;
+        let b2 = serde_yaml::from_str::<Config>("builder: { cmd: opencode }\njudge: { cmd: abe }")
+            .unwrap()
+            .builder;
         assert!(b2.resolved_model(None).is_none());
         assert!(b2.opencode_args(None).is_empty());
     }
@@ -184,6 +316,7 @@ judge:
         assert_eq!(cfg.builder.timeout_secs, 600);
         assert_eq!(cfg.judge.timeout_secs, 600);
         assert_eq!(cfg.judge.mode, JudgeMode::Validate);
+        assert_eq!(cfg.judge.policy, JudgePolicy::Advisory);
         assert_eq!(cfg.loop_cfg.max_iterations, 3);
         assert_eq!(cfg.scope.max_changed_files, 20);
         assert!(cfg.verify.cmds.is_empty());
@@ -194,7 +327,7 @@ judge:
     fn parses_full_config() {
         let yaml = r#"
 builder: { cmd: opencode, timeout_secs: 900 }
-judge: { cmd: abe, mode: debate }
+judge: { cmd: abe, mode: debate, policy: retry_on_fail }
 verify: { cmds: ["cargo test"] }
 loop: { max_iterations: 5, max_walltime_secs: 60 }
 scope: { max_changed_files: 2, max_changed_lines: 50, allow_paths: ["src/"] }
@@ -202,6 +335,7 @@ apply: true
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.judge.mode, JudgeMode::Debate);
+        assert_eq!(cfg.judge.policy, JudgePolicy::RetryOnFail);
         assert_eq!(cfg.verify.cmds, vec!["cargo test"]);
         assert_eq!(cfg.loop_cfg.max_iterations, 5);
         assert_eq!(cfg.scope.allow_paths, vec!["src/"]);

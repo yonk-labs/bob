@@ -6,12 +6,14 @@ builder:
   models:                 # named roster — switch per run with `bob build --model <name>`,
                           # list with `bob models`. (Model ids come from `opencode models`.)
     qwen:    ollama/Intel/Qwen3-Coder-Next-int4-AutoRound   # local, free — solid default for code
-    minimax: minimax/MiniMax-M3                             # cloud, stronger (costs tokens)
+    minimax: minimax/MiniMax-M3                             # alias -> real provider/model id
+  fallback_models: []      # roster aliases or raw ids; example ["minimax"] resolves above
   args: []                # extra opencode flags (NOT the model), e.g. ["--variant", "high"]
 judge:
   cmd: abe
   mode: validate          # validate | debate
   timeout_secs: 600       # judge call timeout; abe debate can be slower than a build
+  policy: advisory        # advisory | blocking | retry_on_fail
 verify:
   cmds:                   # objective gate(s) — your guardrails. ALL must pass.
     - cargo test          #   add lints/scanners here too, e.g. "cargo clippy -- -D warnings"

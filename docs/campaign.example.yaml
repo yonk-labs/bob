@@ -1,0 +1,12 @@
+name: example-campaign
+auto_commit: true
+slices:
+  - name: focused behavior
+    task: Implement the smallest change that makes the focused test pass.
+    verify_cmds:
+      - cargo test focused_test_name
+    editable_paths:
+      - src/
+    reference_paths:
+      - tests/
+    judge_policy: retry_on_fail

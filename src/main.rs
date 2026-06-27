@@ -1,5 +1,6 @@
 #![allow(dead_code)] // interface stubs consumed by later tasks
 mod builder;
+mod campaign;
 mod cli;
 mod config;
 mod doctor;
@@ -35,7 +36,11 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("Builder model roster (builder.models):");
                 for (name, id) in &cfg.builder.models {
-                    let star = if Some(name.as_str()) == default { "  *default" } else { "" };
+                    let star = if Some(name.as_str()) == default {
+                        "  *default"
+                    } else {
+                        ""
+                    };
                     println!("  {name:<14} {id}{star}");
                 }
                 if let Some(d) = default {
@@ -46,11 +51,59 @@ async fn main() -> anyhow::Result<()> {
                     println!("No default set (builder.model) — opencode uses its own default.");
                 }
             }
+            if cfg.builder.fallback_models.is_empty() {
+                println!("Fallbacks: none");
+            } else {
+                println!("Fallbacks:");
+                for name in &cfg.builder.fallback_models {
+                    let resolved = cfg
+                        .builder
+                        .resolved_model(Some(name))
+                        .unwrap_or_else(|| name.clone());
+                    if cfg.builder.models.contains_key(name) {
+                        println!("  {name:<14} {resolved}");
+                    } else {
+                        println!("  {name:<14} {resolved}  (raw id)");
+                    }
+                }
+            }
             Ok(())
         }
-        Command::Build { task, spec, files, max_iters, model, apply, keep } => {
+        Command::Build {
+            task,
+            spec,
+            files,
+            max_iters,
+            model,
+            fallback_models,
+            verify_cmds,
+            allow_paths,
+            max_changed_files,
+            max_changed_lines,
+            judge_policy,
+            apply,
+            keep,
+            keep_worktree,
+        } => {
             let mut cfg = config::Config::load(args.config.as_deref())?;
-            if let Some(m) = max_iters { cfg.loop_cfg.max_iterations = m; }
+            if let Some(m) = max_iters {
+                cfg.loop_cfg.max_iterations = m;
+            }
+            if !verify_cmds.is_empty() {
+                cfg.verify.cmds = verify_cmds;
+            }
+            if !allow_paths.is_empty() {
+                cfg.scope.allow_paths = allow_paths;
+            }
+            if let Some(n) = max_changed_files {
+                cfg.scope.max_changed_files = n;
+            }
+            if let Some(n) = max_changed_lines {
+                cfg.scope.max_changed_lines = n;
+            }
+            if let Some(p) = judge_policy {
+                cfg.judge.policy = p;
+            }
             let spec_text = match spec {
                 Some(ref p) => {
                     if crate::safety::risky_filename(&p.to_string_lossy()) {
@@ -61,15 +114,21 @@ async fn main() -> anyhow::Result<()> {
                 None => task.clone(),
             };
             let apply = apply || cfg.apply;
-            let builder = builder::Opencode { cmd: cfg.builder.cmd.clone(),
-                timeout: std::time::Duration::from_secs(cfg.builder.timeout_secs),
-                args: cfg.builder.opencode_args(model.as_deref()) };
-            let judge = judge::Abe { cmd: cfg.judge.cmd.clone(), mode: cfg.judge.mode,
-                timeout: std::time::Duration::from_secs(cfg.judge.timeout_secs) };
-            let run_id = format!("{}-{}", std::process::id(),
-                BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-            let opts = engine::RunOpts { spec: spec_text, context_files: files, apply, keep, run_id };
-            let res = engine::run(&cfg, opts, &builder, &judge).await?;
+            let run_id = format!(
+                "{}-{}",
+                std::process::id(),
+                BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            let opts = engine::RunOpts {
+                spec: spec_text,
+                context_files: files,
+                apply,
+                keep_worktree: keep || keep_worktree,
+                run_id,
+                builder_model: None,
+            };
+            let res =
+                engine::run_opencode_with_fallbacks(&cfg, opts, model, fallback_models).await?;
             crate::report::print(&res);
             if !res.applied {
                 println!("{}", res.final_diff);
@@ -84,5 +143,32 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Mcp => mcp::serve().await,
         Command::Init => init::run(),
+        Command::Gc { dry_run } => {
+            let report = worktree::gc(dry_run)?;
+            let verb = if report.dry_run {
+                "would remove"
+            } else {
+                "removed"
+            };
+            for path in &report.worktrees {
+                println!("{verb} worktree {}", path.display());
+            }
+            for branch in &report.branches {
+                println!("{verb} branch {branch}");
+            }
+            if report.worktrees.is_empty() && report.branches.is_empty() {
+                println!("bob gc: nothing to clean");
+            }
+            Ok(())
+        }
+        Command::Campaign { file } => {
+            let cfg = config::Config::load(args.config.as_deref())?;
+            let report = campaign::run_file(&file, &cfg).await?;
+            println!("{}", campaign::to_json(&report));
+            if report.status != "completed" {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
 }

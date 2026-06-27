@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::config::JudgeMode;
+use crate::config::{JudgeMode, JudgePolicy};
 
 fn which(cmd: &str) -> bool {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
@@ -45,7 +45,11 @@ fn ask(prompt: &str, default: &str) -> String {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).ok();
     let trimmed = line.trim();
-    if trimmed.is_empty() { default.to_string() } else { trimmed.to_string() }
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn ask_bool(prompt: &str, default: bool) -> bool {
@@ -55,7 +59,11 @@ fn ask_bool(prompt: &str, default: bool) -> bool {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).ok();
     let trimmed = line.trim().to_lowercase();
-    if trimmed.is_empty() { default } else { trimmed == "y" || trimmed == "yes" }
+    if trimmed.is_empty() {
+        default
+    } else {
+        trimmed == "y" || trimmed == "yes"
+    }
 }
 
 fn detect_git() -> bool {
@@ -107,18 +115,28 @@ pub fn run() -> anyhow::Result<()> {
             let mut models = BTreeMap::new();
             loop {
                 let name = ask("Model name (e.g. qwen, gpt-4)", "");
-                if name.is_empty() { break; }
+                if name.is_empty() {
+                    break;
+                }
                 let id = ask("Model ID (e.g. ollama/Intel/Qwen3-Coder)", "");
-                if id.is_empty() { break; }
+                if id.is_empty() {
+                    break;
+                }
                 models.insert(name, id);
-                if !ask_bool("Add another model", false) { break; }
+                if !ask_bool("Add another model", false) {
+                    break;
+                }
             }
             if models.is_empty() {
                 println!("No models configured.");
                 None
             } else {
                 let default = ask("Default model name (from roster above)", "");
-                if default.is_empty() { None } else { Some((default, models)) }
+                if default.is_empty() {
+                    None
+                } else {
+                    Some((default, models))
+                }
             }
         }
     };
@@ -170,7 +188,9 @@ pub fn run() -> anyhow::Result<()> {
         let mut cmds = Vec::new();
         loop {
             let s = ask("  Add verify command (empty to finish)", "");
-            if s.is_empty() { break; }
+            if s.is_empty() {
+                break;
+            }
             cmds.push(s);
         }
         if cmds.is_empty() {
@@ -209,7 +229,9 @@ pub fn run() -> anyhow::Result<()> {
         let mut paths = Vec::new();
         loop {
             let s = ask("  Add allow path (empty to finish)", "");
-            if s.is_empty() { break; }
+            if s.is_empty() {
+                break;
+            }
             paths.push(s);
         }
         paths
@@ -220,7 +242,11 @@ pub fn run() -> anyhow::Result<()> {
     let artifacts_dir = {
         let d = ".bob/runs";
         let s = ask("Artifacts directory (default: .bob/runs)", d);
-        if s.is_empty() { d.to_string() } else { s }
+        if s.is_empty() {
+            d.to_string()
+        } else {
+            s
+        }
     };
 
     // Build config struct, then serialize
@@ -229,17 +255,20 @@ pub fn run() -> anyhow::Result<()> {
             cmd: builder_cmd,
             timeout_secs: builder_timeout,
             model: builder_model.as_ref().map(|(d, _)| d.clone()),
-            models: builder_model.as_ref().map(|(_, m)| m.clone()).unwrap_or_default(),
+            models: builder_model
+                .as_ref()
+                .map(|(_, m)| m.clone())
+                .unwrap_or_default(),
+            fallback_models: vec![],
             args: builder_args,
         },
         judge: crate::config::JudgeCfg {
             cmd: judge_cmd,
             mode: judge_mode,
             timeout_secs: judge_timeout,
+            policy: JudgePolicy::Advisory,
         },
-        verify: crate::config::VerifyCfg {
-            cmds: verify_cmds,
-        },
+        verify: crate::config::VerifyCfg { cmds: verify_cmds },
         loop_cfg: crate::config::LoopCfg {
             max_iterations,
             max_walltime_secs: max_walltime,
@@ -250,9 +279,7 @@ pub fn run() -> anyhow::Result<()> {
             allow_paths,
         },
         apply: apply_default,
-        artifacts: crate::config::ArtifactsCfg {
-            dir: artifacts_dir,
-        },
+        artifacts: crate::config::ArtifactsCfg { dir: artifacts_dir },
     };
 
     let yaml = serde_yaml::to_string(&cfg).expect("config serializes");
@@ -299,10 +326,12 @@ builder:
   models:
     qwen: ollama/Intel/Qwen3-Coder
     minimax: minimax/MiniMax-M3
+  fallback_models: ["minimax"]
 judge:
   cmd: abe
   mode: validate
   timeout_secs: 600
+  policy: advisory
 verify:
   cmds: ["cargo test", "cargo clippy"]
 loop:
@@ -322,9 +351,11 @@ artifacts:
         assert_eq!(cfg.builder.args, vec!["--variant", "high"]);
         assert_eq!(cfg.builder.model, Some("qwen".to_string()));
         assert_eq!(cfg.builder.models.len(), 2);
+        assert_eq!(cfg.builder.fallback_models, vec!["minimax"]);
         assert_eq!(cfg.judge.cmd, "abe");
         assert_eq!(cfg.judge.mode, JudgeMode::Validate);
         assert_eq!(cfg.judge.timeout_secs, 600);
+        assert_eq!(cfg.judge.policy, JudgePolicy::Advisory);
         assert_eq!(cfg.verify.cmds, vec!["cargo test", "cargo clippy"]);
         assert_eq!(cfg.loop_cfg.max_iterations, 3);
         assert_eq!(cfg.loop_cfg.max_walltime_secs, 1800);
@@ -342,16 +373,24 @@ artifacts:
                 cmd: "opencode".to_string(),
                 timeout_secs: 600,
                 model: Some("test".to_string()),
-                models: BTreeMap::from([("qwen".to_string(), "ollama/Intel/Qwen3-Coder".to_string())]),
+                models: BTreeMap::from([(
+                    "qwen".to_string(),
+                    "ollama/Intel/Qwen3-Coder".to_string(),
+                )]),
+                fallback_models: vec![],
                 args: vec!["--variant".to_string(), "high".to_string()],
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".to_string(),
                 mode: JudgeMode::Validate,
                 timeout_secs: 600,
+                policy: JudgePolicy::Advisory,
             },
             verify: crate::config::VerifyCfg {
-                cmds: vec!["cargo test".to_string(), "echo ' special \" chars ".to_string()],
+                cmds: vec![
+                    "cargo test".to_string(),
+                    "echo ' special \" chars ".to_string(),
+                ],
             },
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,
