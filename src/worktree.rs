@@ -32,6 +32,18 @@ fn git(args: &[&str], cwd: &Path) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+fn git_stdout(args: &[&str], cwd: &Path) -> anyhow::Result<String> {
+    let out = Command::new("git").args(args).current_dir(cwd).output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
 fn bob_worktrees(repo: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let root = repo.join(".bob").join("worktrees");
     let mut out = Vec::new();
@@ -128,7 +140,7 @@ impl Workspace {
     /// Diff of all changes in the worktree vs base, including untracked files.
     pub fn capture_diff(&self) -> anyhow::Result<String> {
         git(&["add", "-A"], &self.dir)?; // stage incl. untracked
-        git(
+        git_stdout(
             &["diff", "--cached", "--no-renames", &self.base_sha],
             &self.dir,
         )
@@ -244,6 +256,7 @@ mod tests {
         std::env::set_current_dir(prev).unwrap();
         assert!(diff.contains("world"), "modified file in diff");
         assert!(diff.contains("new.txt"), "untracked file in diff");
+        assert!(diff.ends_with('\n'), "artifact patches must apply cleanly");
     }
 
     #[test]

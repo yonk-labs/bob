@@ -131,6 +131,7 @@ pub async fn run(campaign: Campaign, base_cfg: &Config) -> anyhow::Result<Campai
             name: slice_name,
             status: match res.status {
                 RunStatus::Converged => "converged".into(),
+                RunStatus::NeedsReview => "needs_review".into(),
                 RunStatus::NotConverged => "not_converged".into(),
                 RunStatus::Error => "error".into(),
             },

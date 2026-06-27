@@ -4,6 +4,7 @@ use std::path::Path;
 pub fn to_json(res: &RunResult) -> String {
     let status = match res.status {
         RunStatus::Converged => "converged",
+        RunStatus::NeedsReview => "needs_review",
         RunStatus::NotConverged => "not_converged",
         RunStatus::Error => "error",
     };
@@ -54,6 +55,7 @@ pub fn to_json(res: &RunResult) -> String {
 pub fn print(res: &RunResult) {
     let s = match res.status {
         RunStatus::Converged => "CONVERGED",
+        RunStatus::NeedsReview => "NEEDS REVIEW",
         RunStatus::NotConverged => "NOT CONVERGED",
         RunStatus::Error => "ERROR",
     };
@@ -100,15 +102,15 @@ mod tests {
     #[test]
     fn json_has_status_and_iterations() {
         let res = RunResult {
-            status: RunStatus::Converged,
-            next_action: NextAction::Done,
+            status: RunStatus::NeedsReview,
+            next_action: NextAction::ReviewCandidate,
             run_id: "r1".into(),
             base_sha: "abc".into(),
             worktree: ".bob/worktrees/r1".into(),
             artifact_dir: ".bob/runs/r1".into(),
             iterations: 2,
             final_diff: "diff".into(),
-            applied: true,
+            applied: false,
             stop_reason: None,
             changed_files: vec!["src/lib.rs".into()],
             scope: None,
@@ -127,8 +129,8 @@ mod tests {
             },
         };
         let j = to_json(&res);
-        assert!(j.contains("\"status\":\"converged\""));
-        assert!(j.contains("\"next_action\":\"done\""));
+        assert!(j.contains("\"status\":\"needs_review\""));
+        assert!(j.contains("\"next_action\":\"review_candidate\""));
         assert!(j.contains("\"iterations\":2"));
         assert!(j.contains("\"changed_files\":[\"src/lib.rs\"]"));
         assert!(j.contains("\"fallbacks_tried\":[\"qwen: EmptyDiffAfterCritique\"]"));

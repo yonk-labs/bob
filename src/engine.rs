@@ -164,6 +164,7 @@ impl Clone for RunOpts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
     Converged,
+    NeedsReview,
     NotConverged,
     Error,
 }
@@ -307,6 +308,9 @@ fn result_next_action(
         } else {
             NextAction::ReviewCandidate
         };
+    }
+    if status == RunStatus::NeedsReview {
+        return NextAction::ReviewCandidate;
     }
     match stop_reason {
         Some(StopReason::ScopeExceeded) => NextAction::SplitTask,
@@ -533,7 +537,13 @@ pub async fn run(
             StepOutcome::ScopeExceeded { detail } => format!("scope-exceeded: {detail}"),
             StepOutcome::VerifyFailed { .. } => "verify-failed".to_string(),
             StepOutcome::JudgeUnavailable { detail } => format!("judge-unavailable: {detail}"),
-            StepOutcome::Judged { verdict, .. } => format!("{verdict:?}"),
+            StepOutcome::Judged { verdict, critique } => {
+                if critique.trim().is_empty() {
+                    format!("{verdict:?}")
+                } else {
+                    format!("{verdict:?}\n\n{critique}")
+                }
+            }
         };
         let _ = crate::report::write_artifacts(
             std::path::Path::new(&cfg.artifacts.dir),
@@ -594,6 +604,11 @@ pub async fn run(
                 state.index += 1;
             }
             LoopAction::Stop { reason } => {
+                if reason == StopReason::RepeatedUncertain
+                    && last_verify.as_ref().is_some_and(|v| v.passed)
+                {
+                    status = RunStatus::NeedsReview;
+                }
                 stop_reason = Some(reason);
                 break;
             }
@@ -826,6 +841,18 @@ mod decision_tests {
         assert!(should_try_next_model(&res));
         res.stop_reason = Some(StopReason::ScopeExceeded);
         assert!(!should_try_next_model(&res));
+    }
+
+    #[test]
+    fn needs_review_points_to_candidate_review() {
+        assert_eq!(
+            result_next_action(
+                RunStatus::NeedsReview,
+                false,
+                Some(StopReason::RepeatedUncertain)
+            ),
+            NextAction::ReviewCandidate
+        );
     }
 }
 
