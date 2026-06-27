@@ -1,3 +1,9 @@
+//! Serial campaign runner for Hector-style Bob slices.
+//!
+//! Campaigns are stricter than one-off `bob build` runs: multi-slice campaigns
+//! require `auto_commit` so every converged slice becomes the next slice's real
+//! git base. That keeps longer autonomous runs understandable and recoverable.
+
 use crate::config::{Config, JudgePolicy};
 use crate::engine::{self, RunOpts, RunStatus};
 use serde::{Deserialize, Serialize};
@@ -76,6 +82,8 @@ pub async fn run_file(path: &Path, base_cfg: &Config) -> anyhow::Result<Campaign
 pub async fn run(campaign: Campaign, base_cfg: &Config) -> anyhow::Result<CampaignReport> {
     validate(&campaign)?;
     if campaign.auto_commit {
+        // Auto-commit campaigns build a serial history. Starting dirty would
+        // make it impossible to tell Bob's changes from the operator's changes.
         require_clean_tree()?;
     }
 
@@ -206,6 +214,8 @@ fn slice_spec(s: &Slice) -> String {
 }
 
 fn context_files(s: &Slice) -> Vec<PathBuf> {
+    // Bob receives both editable and reference paths as context, but the scope
+    // guard only permits edits under editable_paths/allow_paths.
     let mut paths = BTreeSet::new();
     paths.extend(s.files.iter().cloned());
     paths.extend(s.editable_paths.iter().cloned());

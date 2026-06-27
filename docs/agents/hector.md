@@ -6,6 +6,16 @@ Hector turns a feature request or bug report into Bob-sized executable slices. H
 
 Hector does not implement production code.
 
+Use the standalone Hector repo/CLI when available:
+
+```bash
+hector frontier-brief
+hector plan ... --out campaign.yaml
+hector check --file campaign.yaml
+bob campaign --file campaign.yaml > result.json
+hector review --campaign campaign.yaml --bob-result result.json
+```
+
 ## Inputs
 
 - User intent or feature plan
@@ -16,28 +26,31 @@ Hector does not implement production code.
 
 ## Outputs
 
-Hector emits a campaign plan:
+Hector emits Bob-compatible campaign YAML:
 
-```json
-{
-  "campaign": "short-name",
-  "summary": "what this campaign proves",
-  "slices": [
-    {
-      "name": "focused behavior",
-      "task": "Implement the smallest code change that makes the focused gate pass.",
-      "acceptance": ["observable behavior"],
-      "test_files": ["tests/path.test.js"],
-      "verify_cmds": ["npx jest tests/path.test.js"],
-      "editable_paths": ["src/routes/"],
-      "reference_paths": ["src/routes/existing.js"],
-      "judge_policy": "retry_on_fail",
-      "expected_complexity": "single_file"
-    }
-  ],
-  "human_questions": []
-}
+```yaml
+name: short-name
+auto_commit: true
+slices:
+  - name: focused behavior
+    task: Implement the smallest code change that makes the focused gate pass.
+    spec: |
+      Exact behavior contract, edge cases, formulas, and invalid states.
+    verify_cmds:
+      - npx jest tests/path.test.js
+    editable_paths:
+      - src/routes/
+    reference_paths:
+      - tests/path.test.js
+      - src/routes/existing.js
+    judge_policy: retry_on_fail
+    max_iters: 4
+    max_changed_files: 2
+    max_changed_lines: 160
 ```
+
+When required proof or scope is missing, Hector returns `needs_input` with `human_questions`
+instead of guessing.
 
 ## Refusal Boundaries
 
@@ -55,10 +68,11 @@ For each slice, Hector passes:
 
 - `task`
 - `verify_cmds`
-- `allow_paths` from `editable_paths`
-- `files` containing both editable and reference paths
+- `editable_paths` as Bob's allowed edit scope
+- `reference_paths` as files Bob may read but not edit
+- `max_changed_files` and `max_changed_lines`
 - `judge_policy: retry_on_fail` unless the orchestrator says otherwise
-- `apply: false` by default
+- `auto_commit: true` for multi-slice campaigns so each slice becomes the next base
 
 Bob may edit only `editable_paths`. Test files are reference unless the slice is explicitly "write the test."
 
@@ -74,22 +88,30 @@ Before handing a slice to Bob, Hector checks:
 - The gate rejects dependency or lockfile churn unless the slice explicitly allows it.
 - The assertions pin the contract, not incidental implementation shape. For example, a GET helper may include `method: "GET"` unless the product contract forbids it.
 - Verify failures become the next spec detail. If Bob uses global state when the contract requires injection, say that explicitly in the next slice.
+- Rules-heavy features specify modifier order, stacking, rounding, target classes, and invalid states before Bob runs.
 
 ## Example
 
-```json
-{
-  "name": "roster summary endpoint",
-  "task": "Implement GET /api/roster-plan so the focused summary endpoint test passes. Follow the existing route helper conventions.",
-  "acceptance": [
-    "GET /api/roster-plan returns summary and shortfall JSON",
-    "Existing auth and ownership helpers are reused"
-  ],
-  "test_files": ["tests/routes/roster-plan-summary.test.js"],
-  "verify_cmds": ["npx jest tests/routes/roster-plan-summary.test.js"],
-  "editable_paths": ["src/routes/api/", "src/app.js"],
-  "reference_paths": ["src/routes/api/existing-route.js", "tests/routes/example.test.js"],
-  "judge_policy": "retry_on_fail",
-  "expected_complexity": "single_file_plus_mount"
-}
+```yaml
+name: roster-summary-endpoint
+auto_commit: true
+slices:
+  - name: roster summary endpoint
+    task: Implement GET /api/roster-plan so the focused summary endpoint test passes.
+    spec: |
+      Return summary and shortfall JSON.
+      Reuse existing auth and ownership helpers.
+      Follow existing route helper conventions.
+    verify_cmds:
+      - npx jest tests/routes/roster-plan-summary.test.js
+    editable_paths:
+      - src/routes/api/
+      - src/app.js
+    reference_paths:
+      - src/routes/api/existing-route.js
+      - tests/routes/example.test.js
+    judge_policy: retry_on_fail
+    max_iters: 4
+    max_changed_files: 2
+    max_changed_lines: 160
 ```

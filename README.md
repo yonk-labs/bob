@@ -29,6 +29,33 @@ back into the builder.
 
 ---
 
+## Agent Lifecycle
+
+Bob is intentionally narrow: it builds one bounded slice and reports exactly what happened.
+It works best when another agent or human has already turned the request into a precise
+behavior contract.
+
+- **Frontier orchestrator** decides product behavior, sequencing, risk, and when to stop.
+- **Greta** should settle UX and usability criteria before test/spec work starts.
+- **Hector** turns the decision into Bob-sized slices with verify commands, editable paths,
+  reference paths, and scope caps.
+- **Bob** implements each slice in an isolated worktree and returns structured results.
+- **Abe** reviews or blocks depending on `judge.policy`; `needs_review` is handed back to
+  the orchestrator rather than silently accepted.
+
+The practical loop is:
+
+```bash
+hector frontier-brief
+hector plan ... --out campaign.yaml
+hector check --file campaign.yaml
+bob campaign --file campaign.yaml > result.json
+hector review --campaign campaign.yaml --bob-result result.json
+```
+
+If Hector says `split_task`, split the behavior before invoking Bob again. If Bob reports
+`needs_review`, compare Abe's critique and the final diff against Hector's original contract.
+
 ## Why not just run `opencode` directly?
 
 Running a coding agent once gives you an *unverified* edit straight into your working tree.
@@ -194,7 +221,9 @@ For JS/Jest repos, `bob doctor` warns if `.gitignore` does not ignore `/.bob`.
 
 `bob campaign --file campaign.yaml` drains a serial list of Bob-sized slices. Multi-slice
 campaigns require `auto_commit: true`, so each slice becomes the next slice's real git base.
-The working tree must be clean before an auto-commit campaign starts.
+The working tree must be clean before an auto-commit campaign starts. This is the preferred
+surface for Hector output: tests/specs go in `reference_paths`, production files go in
+`editable_paths`, and each slice carries its own verify command and scope caps.
 
 ```yaml
 name: roster-plan-api
@@ -214,7 +243,8 @@ slices:
 
 Each slice may override `verify_cmds`, `editable_paths`/`allow_paths`, scope caps,
 `judge_policy`, `model`, and `fallback_models`. Campaign output is JSON with per-slice status,
-changed files, artifact directory, and final diff.
+changed files, artifact directory, and final diff. Feed that JSON to `hector review` when
+Hector created the campaign.
 
 ## MCP server
 
@@ -311,7 +341,6 @@ Alternative: brew install anomalyco/tap/opencode
 
 ## Known limitations
 
-- `bob init` writes a starter config; it is not yet an interactive wizard.
 - Builder/judge invocation assumes `opencode`/`abe` conventions (`run --dir`, positional
   statement); other CLIs need a shim.
 - abe `validate` can return prose-only `uncertain` output; `advisory` treats that as advice,

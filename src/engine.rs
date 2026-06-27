@@ -346,6 +346,9 @@ pub async fn run_opencode_with_fallbacks(
     model_override: Option<String>,
     fallback_overrides: Vec<String>,
 ) -> anyhow::Result<RunResult> {
+    // Fallbacks are escalation, not load balancing. Bob only advances when the
+    // builder is stuck or errored before producing a usable candidate; verify
+    // and scope failures remain evidence for the orchestrator/Hector.
     let sequence = cfg
         .builder
         .model_sequence(model_override.as_deref(), &fallback_overrides);
