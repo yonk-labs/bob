@@ -1,0 +1,80 @@
+   Compiling bench-fixture v0.1.0 (/home/yonk/yonk-tools/bob/bench-results/20260627-203944/wt-zai_GLM-5.2)
+warning: unused variable: `s`
+ --> src/lib.rs:1:22
+  |
+1 | pub fn is_valid_ipv4(s: &str) -> bool {
+  |                      ^ help: if this is intentional, prefix it with an underscore: `_s`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `bench-fixture` (lib) generated 1 warning (1 duplicate)
+warning: `bench-fixture` (lib test) generated 1 warning (run `cargo fix --lib -p bench-fixture --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/bench_fixture-626c43b3067d5f03)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/test_ipv4.rs (target/debug/deps/test_ipv4-75f1ccd93664c9b6)
+
+running 7 tests
+test accepts_valid_addresses ... FAILED
+test rejects_few_octets ... FAILED
+test rejects_leading_zeros ... FAILED
+test rejects_non_numeric ... FAILED
+test rejects_empty_and_garbage ... FAILED
+test rejects_out_of_range ... FAILED
+test rejects_too_many_octets ... FAILED
+
+failures:
+
+---- accepts_valid_addresses stdout ----
+
+thread 'accepts_valid_addresses' (2384128) panicked at src/lib.rs:2:5:
+not yet implemented: implement
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- rejects_few_octets stdout ----
+
+thread 'rejects_few_octets' (2384130) panicked at src/lib.rs:2:5:
+not yet implemented: implement
+
+---- rejects_leading_zeros stdout ----
+
+thread 'rejects_leading_zeros' (2384131) panicked at src/lib.rs:2:5:
+not yet implemented: implement
+
+---- rejects_non_numeric stdout ----
+
+thread 'rejects_non_numeric' (2384132) panicked at src/lib.rs:2:5:
+not yet implemented: implement
+
+---- rejects_empty_and_garbage stdout ----
+
+thread 'rejects_empty_and_garbage' (2384129) panicked at src/lib.rs:2:5:
+not yet implemented: implement
+
+---- rejects_out_of_range stdout ----
+
+thread 'rejects_out_of_range' (2384133) panicked at src/lib.rs:2:5:
+not yet implemented: implement
+
+---- rejects_too_many_octets stdout ----
+
+thread 'rejects_too_many_octets' (2384134) panicked at src/lib.rs:2:5:
+not yet implemented: implement
+
+
+failures:
+    accepts_valid_addresses
+    rejects_empty_and_garbage
+    rejects_few_octets
+    rejects_leading_zeros
+    rejects_non_numeric
+    rejects_out_of_range
+    rejects_too_many_octets
+
+test result: FAILED. 0 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test test_ipv4`

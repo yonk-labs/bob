@@ -1,0 +1,1 @@
+{"model": "ollama/Intel/Qwen3-Coder-Next-int4-AutoRound", "wall_secs": 18, "exit_code": 0, "verify": "pass", "files_changed": 1, "lines_added": 26, "lines_deleted": 1, "tokens_in": 82593, "tokens_out": 545, "tokens_reasoning": 0, "tokens_total": 83138}

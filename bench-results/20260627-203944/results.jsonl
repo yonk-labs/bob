@@ -1,0 +1,3 @@
+{"model": "ollama/Intel/Qwen3-Coder-Next-int4-AutoRound", "wall_secs": 27, "exit_code": 0, "verify": "pass", "files_changed": 1, "lines_added": 19, "lines_deleted": 1, "tokens_in": 125937, "tokens_out": 1056, "tokens_reasoning": 0, "tokens_total": 126993}
+{"model": "192.168.1.133/cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit", "wall_secs": 17, "exit_code": 0, "verify": "pass", "files_changed": 1, "lines_added": 6, "lines_deleted": 1, "tokens_in": 79881, "tokens_out": 365, "tokens_reasoning": 0, "tokens_total": 80246}
+{"model": "zai/GLM-5.2", "wall_secs": 120, "exit_code": 0, "verify": "fail", "files_changed": 0, "lines_added": 0, "lines_deleted": 0, "tokens_in": 0, "tokens_out": 0, "tokens_reasoning": 0, "tokens_total": 0}
