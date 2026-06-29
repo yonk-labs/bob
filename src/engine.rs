@@ -1,4 +1,4 @@
-use crate::builder::{Builder, BuilderOutcome, Opencode};
+use crate::builder::{Builder, BuilderOutcome};
 use crate::config::{Config, JudgePolicy};
 use crate::judge::{Abe, Judge, Verdict};
 use crate::scope;
@@ -380,12 +380,8 @@ fn build_judge_spec(
         // are reference material that lives in the user's workspace, not
         // necessarily committed or present in the isolated worktree.
         if let Ok(content) = std::fs::read_to_string(f) {
-            // Truncate large files to avoid context bloat
-            let truncated = if content.len() > 4000 {
-                format!("{}...\n(truncated)", &content[..4000])
-            } else {
-                content
-            };
+            // Truncate large files to avoid context bloat (char-safe).
+            let truncated = crate::builder::truncate_chars(&content, 4000);
             out.push_str(&format!(
                 "\n\n## REFERENCE FILE: {}\n```\n{}\n```",
                 f.display(),
@@ -501,7 +497,7 @@ fn extract_model_name(model_id: &str) -> String {
 /// "zai-coding-plan/glm-5.2" → (cloud, needs env-based URL)
 fn extract_base_url(model_id: &str) -> String {
     if model_id.starts_with("ollama/") {
-        "http://192.168.1.193:8000/v1".into()
+        crate::model_stats::vllm_url()
     } else if model_id.starts_with("192.168.1.") {
         let ip = model_id.split('/').next().unwrap_or("192.168.1.193");
         format!("http://{ip}:8000/v1")
@@ -510,9 +506,34 @@ fn extract_base_url(model_id: &str) -> String {
     } else if model_id.starts_with("zai") {
         "https://api.z.ai/api/paas/v4".into()
     } else {
-        // Fallback: assume local
-        "http://localhost:8000/v1".into()
+        // Fallback: assume local vLLM (env-overridable).
+        crate::model_stats::vllm_url()
     }
+}
+
+/// Resolve (base_url, api_model, api_key) for a thin/goose builder. An explicit
+/// roster entry (`models: { name: { base_url, ... } }`) wins; otherwise we fall
+/// back to deriving them from the model-id prefix (the legacy hardcoded map).
+/// This is what lets a configured model avoid the baked-in IPs entirely.
+fn resolve_endpoint(
+    cfg: &Config,
+    sel: Option<&str>,
+    model_id: &str,
+) -> (String, String, Option<String>) {
+    let base_url = cfg
+        .builder
+        .entry_base_url(sel)
+        .unwrap_or_else(|| extract_base_url(model_id));
+    let api_model = cfg
+        .builder
+        .entry_api_model(sel)
+        .unwrap_or_else(|| extract_model_name(model_id));
+    let api_key = cfg
+        .builder
+        .entry_api_key_env(sel)
+        .or_else(|| extract_api_key_env(model_id))
+        .and_then(|env| std::env::var(&env).ok());
+    (base_url, api_model, api_key)
 }
 
 /// Extract the env var name for the API key (if any) from a model id.
@@ -526,19 +547,71 @@ fn extract_api_key_env(model_id: &str) -> Option<String> {
     }
 }
 
+/// Combine the tier-derived model chain with explicit per-call overrides:
+/// `--model` leads, the tier chain follows, `--fallback-model` entries trail.
+/// Order-preserving dedup keeps the first occurrence so a forced model that
+/// also lives in a tier isn't attempted twice.
+fn apply_overrides(
+    base: Vec<Option<String>>,
+    model_override: Option<String>,
+    fallback_overrides: Vec<String>,
+) -> Vec<Option<String>> {
+    let mut chain: Vec<Option<String>> = Vec::new();
+    chain.extend(model_override.map(Some));
+    chain.extend(base);
+    chain.extend(fallback_overrides.into_iter().map(Some));
+    let mut seen: Vec<Option<String>> = Vec::new();
+    chain.retain(|item| {
+        if seen.contains(item) {
+            false
+        } else {
+            seen.push(item.clone());
+            true
+        }
+    });
+    chain
+}
+
+/// Resolve the ordered model-attempt sequence.
+/// - `skip_escalation`: exactly one attempt — the `--model` override, else the
+///   config default (`None` = the builder's own default). No tiers, no
+///   fallbacks; a single-entry sequence can't fail over.
+/// - otherwise: the tier-derived `tier_sequence` with overrides applied
+///   (`--model` leads, `--fallback-model` trails). If that's empty — a config
+///   with no tiers — fall back to one default attempt so bob still runs once.
+fn resolve_sequence(
+    skip_escalation: bool,
+    tier_sequence: Vec<Option<String>>,
+    model_override: Option<String>,
+    fallback_overrides: Vec<String>,
+    config_model: Option<String>,
+) -> Vec<Option<String>> {
+    if skip_escalation {
+        return vec![model_override.or(config_model)];
+    }
+    let seq = apply_overrides(tier_sequence, model_override, fallback_overrides);
+    if seq.is_empty() {
+        vec![None]
+    } else {
+        seq
+    }
+}
+
 pub async fn run_opencode_with_fallbacks(
     cfg: &Config,
     opts: RunOpts,
+    // An explicit `--model` (CLI/MCP) is tried FIRST, ahead of the tier chain.
+    // `--fallback-model` entries are appended after the tier chain.
     model_override: Option<String>,
     fallback_overrides: Vec<String>,
+    // When true, run exactly one model (the override or config default) — no
+    // tier escalation, no fallbacks.
+    skip_escalation: bool,
 ) -> anyhow::Result<RunResult> {
     // Fallbacks are escalation, not load balancing. Bob only advances when the
     // builder is stuck or errored before producing a usable candidate; verify
     // and scope failures remain evidence for the orchestrator/Hector.
-    let sequence = cfg
-        .builder
-        .model_sequence(model_override.as_deref(), &fallback_overrides);
-
+    //
     // TIER RESOLUTION: determine the starting tier for this slice, then build
     // an ordered tier list (starting tier → next tiers for escalation).
     // Within each tier, models are ranked by stats (success × speed).
@@ -588,12 +661,21 @@ pub async fn run_opencode_with_fallbacks(
         })
         .collect();
 
-    if sequence.is_empty() {
+    let tiers_configured = cfg.builder.tiers.any_configured();
+    // Warn on the genuinely-misconfigured case: tiers declared but none usable.
+    if !skip_escalation && tiers_configured && sequence.is_empty() {
         eprintln!(
             "bob: no models configured for tier '{}' (or any escalation tier). Check bob.yaml tiers config.",
             slice_tier
         );
     }
+    let sequence = resolve_sequence(
+        skip_escalation,
+        sequence,
+        model_override,
+        fallback_overrides,
+        cfg.builder.model.clone(),
+    );
 
     eprintln!(
         "bob: tier='{}' chain (ranked by stats): {:?}",
@@ -650,7 +732,16 @@ pub async fn run_opencode_with_fallbacks(
         let model_stats = stats.get(model_id);
         let adaptive = model_stats.adaptive_timeout();
         let configured = Duration::from_secs(cfg.builder.timeout_secs);
-        let builder_timeout = adaptive.min(configured); // never exceed configured cap
+        // Adaptive timing may EXTEND patience for known-slow models but must never
+        // shrink the user's configured budget — agentic builders (goose/opencode)
+        // legitimately need minutes, and min() silently capped 600s configs at ~90s.
+        let builder_timeout = adaptive.max(configured);
+        eprintln!(
+            "bob: timeout configured={}s adaptive={}s effective={}s",
+            configured.as_secs(),
+            adaptive.as_secs(),
+            builder_timeout.as_secs()
+        );
 
         let mut attempt_opts = opts.clone();
         attempt_opts.run_id = if idx == 0 {
@@ -666,15 +757,20 @@ pub async fn run_opencode_with_fallbacks(
         let tier_name = tiers_to_try.get(current_tier_idx)
             .map(|s| s.as_str())
             .unwrap_or("cheap");
-        let builder_kind = cfg.builder.tiers.builder_for(tier_name);
+        // Tier-less config → honor builder.cmd so `cmd: goose` / `cmd: thin`
+        // route to their builders instead of being forced through opencode.
+        // Unknown cmds (custom opencode wrappers) fall through to the `_` arm below.
+        let builder_kind = if tiers_configured {
+            cfg.builder.tiers.builder_for(tier_name)
+        } else {
+            cfg.builder.cmd.as_str()
+        };
         eprintln!("bob: builder='{}' for tier='{}'", builder_kind, tier_name);
 
         let builder: crate::builder::BuilderKind = match builder_kind {
             "thin" => {
-                let base_url = extract_base_url(model_id);
-                let api_model = extract_model_name(model_id);
-                let api_key = extract_api_key_env(model_id)
-                    .and_then(|env| std::env::var(&env).ok());
+                let (base_url, api_model, api_key) =
+                    resolve_endpoint(cfg, model_sel.as_deref(), model_id);
                 crate::builder::BuilderKind::Thin(crate::builder::ThinBuilder {
                     model_id: api_model,
                     base_url,
@@ -683,10 +779,8 @@ pub async fn run_opencode_with_fallbacks(
                 })
             }
             "goose" => {
-                let base_url = extract_base_url(model_id);
-                let api_model = extract_model_name(model_id);
-                let api_key = extract_api_key_env(model_id)
-                    .and_then(|env| std::env::var(&env).ok());
+                let (base_url, api_model, api_key) =
+                    resolve_endpoint(cfg, model_sel.as_deref(), model_id);
                 crate::builder::BuilderKind::Goose(crate::builder::GooseBuilder {
                     cmd: "goose".to_string(),
                     model: api_model,
@@ -714,9 +808,7 @@ pub async fn run_opencode_with_fallbacks(
             Ok(mut res) => {
                 let latency = run_start.elapsed().as_secs_f64();
                 let success = res.status == crate::engine::RunStatus::Converged;
-                let mut stats = crate::model_stats::StatsStore::load();
-                stats.record(model_id, latency, success);
-                stats.save();
+                crate::model_stats::StatsStore::record_run(model_id, latency, success);
                 res.builder.fallbacks_tried = fallback_history.clone();
                 if should_try_next_model(&res) && idx + 1 < sequence.len() {
                     fallback_history.push(format!(
@@ -731,9 +823,7 @@ pub async fn run_opencode_with_fallbacks(
             }
             Err(e) if should_try_next_model_after_error(&e) && idx + 1 < sequence.len() => {
                 let latency = run_start.elapsed().as_secs_f64();
-                let mut stats = crate::model_stats::StatsStore::load();
-                stats.record(model_id, latency, false);
-                stats.save();
+                crate::model_stats::StatsStore::record_run(model_id, latency, false);
                 fallback_history.push(format!("{}: {e}", model_label(&resolved_model)));
                 last_err = Some(e);
                 continue;
@@ -1169,6 +1259,66 @@ assert!(matches!(
                 reason: StopReason::ScopeExceeded
             }
         ));
+    }
+
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn override_model_leads_and_dedups_tier_chain() {
+        // base tier chain: cheap → large
+        let base = vec![s("qwen"), s("llama")];
+        let out = apply_overrides(base, Some("llama".into()), vec![]);
+        // forced llama leads; the tier's llama is deduped away (not run twice)
+        assert_eq!(out, vec![s("llama"), s("qwen")]);
+    }
+
+    #[test]
+    fn override_appends_extra_fallbacks_after_tier_chain() {
+        let base = vec![s("qwen")];
+        let out = apply_overrides(base, None, vec!["codex".into(), "qwen".into()]);
+        // tier chain first, extra fallback trails, duplicate qwen deduped
+        assert_eq!(out, vec![s("qwen"), s("codex")]);
+    }
+
+    #[test]
+    fn no_overrides_preserves_tier_chain() {
+        let base = vec![s("qwen"), s("llama")];
+        let out = apply_overrides(base.clone(), None, vec![]);
+        assert_eq!(out, base);
+    }
+
+    #[test]
+    fn skip_escalation_with_model_is_a_single_attempt() {
+        // A tier chain + fallbacks that would normally escalate...
+        let base = vec![s("qwen"), s("llama")];
+        let out = resolve_sequence(true, base, Some("codex".into()), vec!["fb".into()], Some("cfg".into()));
+        // ...is reduced to exactly the --model override. Length 1 ⇒ no fail-over.
+        assert_eq!(out, vec![s("codex")]);
+    }
+
+    #[test]
+    fn skip_escalation_without_model_uses_config_default_then_builder_default() {
+        // --skip-escalation alone: config default, still one attempt.
+        assert_eq!(
+            resolve_sequence(true, vec![s("qwen")], None, vec![], Some("cfg".into())),
+            vec![s("cfg")]
+        );
+        // no override and no config model ⇒ None (builder's own default), one attempt.
+        assert_eq!(
+            resolve_sequence(true, vec![s("qwen")], None, vec![], None),
+            vec![None]
+        );
+    }
+
+    #[test]
+    fn without_skip_escalation_keeps_full_chain() {
+        // Override leads, tier chain follows — the normal escalating sequence.
+        let out = resolve_sequence(false, vec![s("qwen")], Some("codex".into()), vec![], None);
+        assert_eq!(out, vec![s("codex"), s("qwen")]);
+        // Tier-less config falls back to one default attempt (legacy path).
+        assert_eq!(resolve_sequence(false, vec![], None, vec![], None), vec![None]);
     }
 
     #[test]

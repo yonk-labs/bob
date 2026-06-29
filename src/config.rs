@@ -26,9 +26,12 @@ pub struct BuilderCfg {
     /// Default model: a name from `models`, or a raw provider/model id.
     #[serde(default)]
     pub model: Option<String>,
-    /// Named roster of models the builder can use (name -> provider/model id).
+    /// Named roster of models the builder can use. Each entry is EITHER the
+    /// legacy `name: "provider/model"` string, OR the explicit form (matching
+    /// hector/abe) `name: { model, base_url, api_key_env }` — the latter lets the
+    /// thin/goose builders reach an endpoint without the hardcoded prefix guess.
     #[serde(default)]
-    pub models: BTreeMap<String, String>,
+    pub models: BTreeMap<String, ModelDef>,
     /// Ordered fallback model names/raw ids to try when the selected model stalls or errors.
     #[deprecated(note = "Use `tiers` and `escalation_policy: tier` instead")]
     #[serde(default)]
@@ -50,6 +53,33 @@ pub struct BuilderCfg {
     #[serde(default)]
     pub args: Vec<String>,
 }
+/// A roster entry: either a bare `provider/model` id (legacy) or the explicit
+/// shape shared with hector/abe. Untagged so both YAML forms just work.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ModelDef {
+    /// `qwen: "ollama/Intel/Qwen3-..."` — the opencode-style provider/model id.
+    Id(String),
+    /// `qwen: { model: "Intel/Qwen3-...", base_url: "http://...:8000/v1" }`.
+    Full {
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_env: Option<String>,
+    },
+}
+
+impl ModelDef {
+    /// The model id used for selection/display (and `--model` for opencode).
+    pub fn id(&self) -> &str {
+        match self {
+            ModelDef::Id(s) => s,
+            ModelDef::Full { model, .. } => model,
+        }
+    }
+}
+
 fn default_builder_timeout() -> u64 {
     600
 }
@@ -89,6 +119,24 @@ impl TierCfg {
     /// Escalation order: cheap(small) → medium → large → frontier(complex)
     pub fn escalation_order(&self) -> Vec<&str> {
         vec!["cheap", "medium", "large", "frontier"]
+    }
+
+    /// True if any tier has at least one model. When false, bob falls back to
+    /// the legacy single-attempt opencode path (run `builder.cmd` with its
+    /// default/overridden model) instead of the tier escalation chain.
+    pub fn any_configured(&self) -> bool {
+        !(self.cheap.is_empty()
+            && self.medium.is_empty()
+            && self.large.is_empty()
+            && self.frontier.is_empty())
+    }
+
+    /// True if any configured (non-empty) tier resolves to the goose builder.
+    /// `bob doctor` uses this to require goose only when the config needs it.
+    pub fn uses_goose(&self) -> bool {
+        ["cheap", "medium", "large", "frontier"]
+            .iter()
+            .any(|t| self.builder_for(t) == "goose" && !self.models_for(t).is_empty())
     }
 
     /// Models in the given tier, or empty if tier name unknown.
@@ -143,9 +191,41 @@ impl BuilderCfg {
         Some(
             self.models
                 .get(sel)
-                .cloned()
+                .map(|d| d.id().to_string())
                 .unwrap_or_else(|| sel.to_string()),
         )
+    }
+
+    /// The roster entry for a selection (alias or default), if listed.
+    fn entry(&self, sel: Option<&str>) -> Option<&ModelDef> {
+        let sel = sel.or(self.model.as_deref())?;
+        self.models.get(sel)
+    }
+
+    /// Explicit endpoint for a listed model (Full form). `None` → caller falls
+    /// back to the prefix-derived endpoint (extract_base_url).
+    pub fn entry_base_url(&self, sel: Option<&str>) -> Option<String> {
+        match self.entry(sel)? {
+            ModelDef::Full { base_url, .. } => base_url.clone(),
+            ModelDef::Id(_) => None,
+        }
+    }
+
+    /// Explicit API-key env var for a listed model (Full form).
+    pub fn entry_api_key_env(&self, sel: Option<&str>) -> Option<String> {
+        match self.entry(sel)? {
+            ModelDef::Full { api_key_env, .. } => api_key_env.clone(),
+            ModelDef::Id(_) => None,
+        }
+    }
+
+    /// The bare API model id for a listed Full-form model (no provider prefix to
+    /// strip). `None` for the legacy string form → caller uses extract_model_name.
+    pub fn entry_api_model(&self, sel: Option<&str>) -> Option<String> {
+        match self.entry(sel)? {
+            ModelDef::Full { model, .. } => Some(model.clone()),
+            ModelDef::Id(_) => None,
+        }
     }
 
     /// Args for `opencode run` before the prompt: the resolved `--model` (if any)
@@ -398,6 +478,31 @@ judge:
     }
 
     #[test]
+    fn explicit_model_form_carries_endpoint() {
+        // The shape shared with hector/abe: name -> { model, base_url, api_key_env }.
+        let yaml = r#"
+builder:
+  cmd: opencode
+  models:
+    qwen: { model: "Intel/Qwen3", base_url: "http://host:8000/v1" }
+    cloud: { model: "MiniMax-M3", base_url: "https://api.minimax.io/v1", api_key_env: MINIMAX_API_KEY }
+    legacy: ollama/Intel/Qwen3-Coder
+judge:
+  cmd: abe
+"#;
+        let b = serde_yaml::from_str::<Config>(yaml).unwrap().builder;
+        // resolved_model returns the bare model id for the Full form.
+        assert_eq!(b.resolved_model(Some("qwen")).as_deref(), Some("Intel/Qwen3"));
+        // explicit endpoint + key are exposed (no prefix guessing needed).
+        assert_eq!(b.entry_base_url(Some("qwen")).as_deref(), Some("http://host:8000/v1"));
+        assert_eq!(b.entry_api_model(Some("qwen")).as_deref(), Some("Intel/Qwen3"));
+        assert_eq!(b.entry_api_key_env(Some("cloud")).as_deref(), Some("MINIMAX_API_KEY"));
+        // legacy string form carries no explicit endpoint → caller falls back.
+        assert!(b.entry_base_url(Some("legacy")).is_none());
+        assert!(b.entry_api_model(Some("legacy")).is_none());
+    }
+
+    #[test]
     fn parses_minimal_config_with_defaults() {
         let yaml = r#"
 builder:
@@ -469,12 +574,30 @@ fn ordered_tiers_escalates_correctly() {
         large_builder: None,
         frontier_builder: None,
     };
-    // Starting at cheap → escalate through large → frontier
-    assert_eq!(cfg.ordered_tiers("cheap"), vec!["cheap", "large", "frontier"]);
-    // Starting at large → no cheap
+    // Starting at cheap → escalate through medium → large → frontier
+    assert_eq!(
+        cfg.ordered_tiers("cheap"),
+        vec!["cheap", "medium", "large", "frontier"]
+    );
+    // Starting at large → only higher tiers, no cheap/medium
     assert_eq!(cfg.ordered_tiers("large"), vec!["large", "frontier"]);
     // Starting at frontier → just frontier
     assert_eq!(cfg.ordered_tiers("frontier"), vec!["frontier"]);
+
+    assert!(cfg.any_configured());
+    assert!(!TierCfg::default().any_configured());
+
+    // medium tier has a model and defaults to the goose builder → goose needed.
+    assert!(cfg.uses_goose());
+    // No tiers configured → no builder needs goose.
+    assert!(!TierCfg::default().uses_goose());
+    // A tier with a model but a non-goose builder → goose not needed.
+    let thin_only = TierCfg {
+        cheap: vec!["qwen".into()],
+        default_tier: "cheap".into(),
+        ..Default::default()
+    };
+    assert!(!thin_only.uses_goose());
 }
 
 #[test]

@@ -7,6 +7,10 @@
     "abe": {
       "command": "abe",
       "args": ["mcp"]
+    },
+    "hector": {
+      "command": "hector",
+      "args": ["mcp"]
     }
   }
 }

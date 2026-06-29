@@ -257,7 +257,11 @@ pub fn run() -> anyhow::Result<()> {
             model: builder_model.as_ref().map(|(d, _)| d.clone()),
             models: builder_model
                 .as_ref()
-                .map(|(_, m)| m.clone())
+                .map(|(_, m)| {
+                    m.iter()
+                        .map(|(k, v)| (k.clone(), crate::config::ModelDef::Id(v.clone())))
+                        .collect()
+                })
                 .unwrap_or_default(),
             fallback_models: vec![],
                 tiers: Default::default(),
@@ -377,7 +381,7 @@ artifacts:
                 model: Some("test".to_string()),
                 models: BTreeMap::from([(
                     "qwen".to_string(),
-                    "ollama/Intel/Qwen3-Coder".to_string(),
+                    crate::config::ModelDef::Id("ollama/Intel/Qwen3-Coder".to_string()),
                 )]),
                 fallback_models: vec![],
                 tiers: Default::default(),

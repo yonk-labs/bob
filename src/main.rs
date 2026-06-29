@@ -39,13 +39,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("Default: {}", default.unwrap_or("(opencode's own default)"));
             } else {
                 println!("Builder model roster (builder.models):");
-                for (name, id) in &cfg.builder.models {
+                for (name, def) in &cfg.builder.models {
                     let star = if Some(name.as_str()) == default {
                         "  *default"
                     } else {
                         ""
                     };
-                    println!("  {name:<14} {id}{star}");
+                    println!("  {name:<14} {}{star}", def.id());
                 }
                 if let Some(d) = default {
                     if !cfg.builder.models.contains_key(d) {
@@ -87,6 +87,8 @@ async fn main() -> anyhow::Result<()> {
             judge_policy,
             judge_mode,
             tier,
+            skip_escalation,
+            json,
             apply,
             keep,
             keep_worktree,
@@ -139,10 +141,16 @@ async fn main() -> anyhow::Result<()> {
                 tier,
             };
             let res =
-                engine::run_opencode_with_fallbacks(&cfg, opts, model, fallback_models).await?;
-            crate::report::print(&res);
-            if !res.applied {
-                println!("{}", res.final_diff);
+                engine::run_opencode_with_fallbacks(&cfg, opts, model, fallback_models, skip_escalation)
+                    .await?;
+            if json {
+                // Machine contract: JSON only, diff is in `final_diff`.
+                println!("{}", crate::report::to_json(&res));
+            } else {
+                crate::report::print(&res);
+                if !res.applied {
+                    println!("{}", res.final_diff);
+                }
             }
             // Exit non-zero when the loop did not converge so automation/CI can detect it.
             if res.status != engine::RunStatus::Converged {

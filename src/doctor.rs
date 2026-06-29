@@ -117,6 +117,22 @@ pub fn run() -> anyhow::Result<()> {
                 );
                 println!("       Use roster aliases, or raw provider/model ids containing '/'.");
             }
+            // goose is the builder for medium/large tiers; required only when a
+            // tier is actually configured to use it.
+            let goose_present = which("goose");
+            if cfg.builder.tiers.uses_goose() {
+                println!(
+                    "{} goose (builder for medium/large tier)",
+                    if goose_present { "[ok]" } else { "[MISSING]" }
+                );
+                if !goose_present {
+                    println!("       Required by your tier config (medium_builder/large_builder: goose).");
+                    println!("       Install: curl -fsSL https://github.com/block/goose/releases/latest/download/install.sh | bash");
+                    ok = false;
+                }
+            } else if goose_present {
+                println!("[ok] goose (available; not used by current tier config)");
+            }
         }
         Err(e) => {
             println!("[MISSING] config: {e}");

@@ -10,6 +10,35 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Local vLLM endpoint base (`.../v1`). Overridable via `BOB_VLLM_URL` so a
+/// moved host doesn't require a recompile. The override is normalized so common
+/// typos still work (missing scheme, trailing slash, missing `/v1`).
+/// ponytail: single env knob, current default preserved.
+pub fn vllm_url() -> String {
+    match std::env::var("BOB_VLLM_URL") {
+        Ok(u) => normalize_vllm_url(&u),
+        Err(_) => "http://192.168.1.193:8000/v1".into(),
+    }
+}
+
+/// Tidy a user-supplied vLLM base URL: prepend `http://` if no scheme, drop a
+/// trailing slash, and append `/v1` (the OpenAI-compatible suffix) if absent.
+fn normalize_vllm_url(raw: &str) -> String {
+    let mut u = raw.trim().to_string();
+    if u.is_empty() {
+        return "http://192.168.1.193:8000/v1".into();
+    }
+    if !u.starts_with("http://") && !u.starts_with("https://") {
+        u = format!("http://{u}");
+    }
+    let u = u.trim_end_matches('/');
+    if u.ends_with("/v1") {
+        u.to_string()
+    } else {
+        format!("{u}/v1")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelStats {
     pub runs: u32,
@@ -110,6 +139,31 @@ impl StatsStore {
         stats.record(latency_secs, success);
     }
 
+    /// Atomically record one run: lock, reload, update, persist. An exclusive
+    /// flock on a sidecar lockfile serializes concurrent bob processes so they
+    /// don't clobber each other's stats (lost updates from load→record→save
+    /// interleaving). The critical section is a sub-millisecond file rewrite.
+    /// ponytail: coarse whole-file lock; fine until stats writes get hot.
+    pub fn record_run(model: &str, latency_secs: f64, success: bool) {
+        use std::os::unix::io::AsRawFd;
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .ok();
+        if let Some(f) = &lock {
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+        }
+        let mut store = Self::load();
+        store.record(model, latency_secs, success);
+        store.save();
+        // Lock releases when `lock` (the open File) drops here.
+    }
+
     /// Rank models by score (best first). Models with no history get neutral score.
     pub fn rank(&self, models: &[String]) -> Vec<String> {
         let mut scored: Vec<(String, f64)> = models
@@ -131,7 +185,7 @@ impl StatsStore {
         // a lightweight check: can opencode reach this model?
         // For now, check if it's a known-local endpoint.
         if model_id.starts_with("ollama/") {
-            return Self::curl_health("http://192.168.1.193:8000/v1/models");
+            return Self::curl_health(&format!("{}/models", vllm_url()));
         }
         if model_id.starts_with("192.168.1.") {
             let ip = model_id.split('/').next().unwrap_or("");
@@ -227,6 +281,41 @@ mod tests {
         store.record("slow", 100.0, true);
         let ranked = store.rank(&["slow".into(), "fast".into()]);
         assert_eq!(ranked[0], "fast");
+    }
+
+    #[test]
+    fn normalize_vllm_url_fixes_common_typos() {
+        // missing scheme
+        assert_eq!(normalize_vllm_url("192.168.1.50:8000/v1"), "http://192.168.1.50:8000/v1");
+        // missing /v1 suffix
+        assert_eq!(normalize_vllm_url("http://host:8000"), "http://host:8000/v1");
+        // trailing slash
+        assert_eq!(normalize_vllm_url("http://host:8000/v1/"), "http://host:8000/v1");
+        // missing scheme AND /v1
+        assert_eq!(normalize_vllm_url("host:8000"), "http://host:8000/v1");
+        // https preserved, already correct
+        assert_eq!(normalize_vllm_url("https://host/v1"), "https://host/v1");
+        // empty falls back to default
+        assert_eq!(normalize_vllm_url("   "), "http://192.168.1.193:8000/v1");
+    }
+
+    #[test]
+    fn record_run_persists_under_lock() {
+        let _g = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-stats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        StatsStore::record_run("m1", 30.0, true);
+        StatsStore::record_run("m1", 50.0, true);
+        let loaded = StatsStore::load();
+
+        std::env::set_current_dir(prev).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(loaded.get("m1").runs, 2);
+        assert_eq!(loaded.get("m1").successes, 2);
     }
 
     #[test]

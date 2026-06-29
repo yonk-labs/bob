@@ -12,8 +12,8 @@ Use the standalone Hector repo/CLI when available:
 hector frontier-brief
 hector plan ... --out campaign.yaml
 hector check --file campaign.yaml
-bob campaign --file campaign.yaml > result.json
-hector review --campaign campaign.yaml --bob-result result.json
+bob campaign --file campaign.yaml
+hector review --campaign campaign.yaml --bob-result .bob/runs/campaign-*-result.json
 ```
 
 ## Inputs

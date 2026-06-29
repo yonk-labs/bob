@@ -57,6 +57,9 @@ pub struct BuildParams {
     /// Judge behavior after verify passes: advisory, blocking, retry_on_fail.
     #[serde(default)]
     pub judge_policy: Option<String>,
+    /// Try only the selected `model`: no tier escalation, no fallback models.
+    #[serde(default)]
+    pub skip_escalation: Option<bool>,
 }
 
 #[tool_router]
@@ -122,7 +125,9 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
         builder_model: None,
         tier: None,
     };
-    let res = engine::run_opencode_with_fallbacks(&cfg, opts, p.model, fallback_models).await?;
+    let skip_escalation = p.skip_escalation.unwrap_or(false);
+    let res = engine::run_opencode_with_fallbacks(&cfg, opts, p.model, fallback_models, skip_escalation)
+        .await?;
     Ok(report::to_json(&res))
 }
 

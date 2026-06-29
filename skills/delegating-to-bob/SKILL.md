@@ -6,7 +6,7 @@ version: 0.1.0
 
 # Delegating build work to bob
 
-bob is an autonomous **build → verify → judge** loop. Hand it an implementation task and it drives a coding CLI (`opencode`) to make the change in an **isolated git worktree**, runs the project's **objective verify gate** (e.g. `cargo test`, `npm test`), then applies `judge.policy` (`advisory`, `blocking`, or `retry_on_fail`) before returning a verified diff or applying it. Delegating to bob turns "write this code" into "write this code *and prove the tests pass before it touches the tree*."
+bob is an autonomous **build → verify → judge** loop. Hand it an implementation task and it drives a builder CLI — **`goose`** (the agent-loop builder used for the cheap/medium/large tiers) or **`opencode`** (the heavier frontier-tier backend) — to make the change in an **isolated git worktree**, runs the project's **objective verify gate** (e.g. `cargo test`, `npm test`), then applies `judge.policy` (`advisory`, `blocking`, or `retry_on_fail`) before returning a verified diff or applying it. Which builder runs is decided by the tier config in `bob.yaml` (`*_builder` keys); set `cmd: goose` for a tier-less config to force goose. Delegating to bob turns "write this code" into "write this code *and prove the tests pass before it touches the tree*."
 
 ## When to delegate to bob
 
@@ -19,7 +19,7 @@ Do not delegate to bob for architectural decisions, research, code review, or an
 
 ## Check setup first
 
-bob needs `bob` on PATH plus `git`, `opencode`, and `abe`, and a `bob.yaml` in the target repo.
+bob needs `bob` on PATH plus `git`, a builder CLI (`goose` for the cheap/medium/large tiers, `opencode` for the frontier tier), and `abe`, and a `bob.yaml` in the target repo.
 - Run `bob doctor` — it reports any missing piece.
 - If there is no `bob.yaml`, run `bob init`, then set `verify.cmds` to the project's test/build command. This gate is what bob converges on — setting it correctly is the single most important step.
 
@@ -59,7 +59,7 @@ If `.bob/lessons.md` exists, bob includes it in builder and judge context. Keep 
 
 ## Tuning knobs (in the project's `bob.yaml`)
 
-- **Choose the builder's model:** `builder.args: ["--model", "provider/model"]` (forwarded to opencode).
+- **Choose the builder's model:** keep a named roster in `builder.models` and per-tier model lists in `builder.tiers`; set `builder.model` for the default. (Tier-less configs can still pass `builder.args: ["--model", "provider/model"]` to opencode.)
 - **Guardrails:** `verify.cmds` is an extensible gate — add lints, scanners, or policy scripts (all must pass). `scope.allow_paths: ["src/"]` restricts which paths may change; `scope.max_changed_files` / `max_changed_lines` cap the blast radius. Override these per run when handing Bob a frozen slice.
 - **Judge policy:** `judge.policy: advisory` keeps Abe non-blocking; `blocking` requires Abe to pass; `retry_on_fail` feeds Abe critique back into the next builder prompt.
 - **Model fallback:** `builder.fallback_models` or per-run `fallback_models` retries on builder errors and clear stuck results.

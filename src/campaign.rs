@@ -51,12 +51,17 @@ pub struct Slice {
     pub model: Option<String>,
     #[serde(default)]
     pub fallback_models: Vec<String>,
+    /// Tier override for this slice (cheap | medium | large | frontier).
+    /// Honored here the same way `hector dispatch` passes `--tier`.
+    #[serde(default)]
+    pub tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CampaignReport {
     pub name: String,
     pub status: String,
+    pub result_path: String,
     pub slices: Vec<SliceReport>,
 }
 
@@ -88,6 +93,8 @@ pub async fn run(campaign: Campaign, base_cfg: &Config) -> anyhow::Result<Campai
     }
 
     let name = campaign.name.clone().unwrap_or_else(|| "campaign".into());
+    let result_path = campaign_result_path(&base_cfg.artifacts.dir, &name);
+    let result_path_str = result_path.to_string_lossy().to_string();
     let mut reports = Vec::new();
     let mut completed = true;
     let limit = campaign.max_slices.unwrap_or(campaign.slices.len());
@@ -114,13 +121,14 @@ pub async fn run(campaign: Campaign, base_cfg: &Config) -> anyhow::Result<Campai
             run_id,
             builder_model: None,
             editable_paths: slice.editable_paths.clone(),
-            tier: None,
+            tier: slice.tier.clone(),
         };
         let res = engine::run_opencode_with_fallbacks(
             &cfg,
             opts,
             slice.model.clone(),
             slice.fallback_models.clone(),
+            false, // campaigns keep tier escalation
         )
         .await?;
 
@@ -159,11 +167,14 @@ pub async fn run(campaign: Campaign, base_cfg: &Config) -> anyhow::Result<Campai
         }
     }
 
-    Ok(CampaignReport {
+    let report = CampaignReport {
         name,
         status: if completed { "completed" } else { "stopped" }.into(),
+        result_path: result_path_str,
         slices: reports,
-    })
+    };
+    write_result_artifact(&result_path, &report)?;
+    Ok(report)
 }
 
 fn validate(c: &Campaign) -> anyhow::Result<()> {
@@ -283,6 +294,22 @@ pub fn to_json(report: &CampaignReport) -> String {
     serde_json::to_string(report).unwrap_or_else(|_| "{\"status\":\"error\"}".into())
 }
 
+fn campaign_result_path(artifacts_dir: &str, name: &str) -> PathBuf {
+    Path::new(artifacts_dir).join(format!(
+        "campaign-{}-{}-result.json",
+        slug(name),
+        std::process::id()
+    ))
+}
+
+fn write_result_artifact(path: &Path, report: &CampaignReport) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, to_json(report))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +324,25 @@ mod tests {
             slices: vec![slice("a"), slice("b")],
         };
         assert!(validate(&c).is_err());
+    }
+
+    #[test]
+    fn writes_campaign_result_json() {
+        let tmp = std::env::temp_dir().join(format!("bob-campaign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let path = tmp.join("result.json");
+        let report = CampaignReport {
+            name: "c".into(),
+            status: "completed".into(),
+            result_path: path.to_string_lossy().to_string(),
+            slices: vec![],
+        };
+
+        write_result_artifact(&path, &report).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"status\":\"completed\""));
+        assert!(saved.contains("\"result_path\""));
     }
 
     #[test]
@@ -327,6 +373,44 @@ mod tests {
         assert!(spec.contains("must return JSON"));
     }
 
+    /// CROSS-REPO CONTRACT: this is the campaign shape hector emits
+    /// (hector/src/schema.rs). Every field here must keep parsing — a rename in
+    /// bob's Slice silently drops the hector-supplied value (serde ignores
+    /// unknowns). If this fails, the field name diverged from hector; fix both.
+    /// The same YAML is asserted by hector's schema::parses_full_contract.
+    #[test]
+    fn campaign_field_name_contract() {
+        let yaml = r#"
+name: c
+auto_commit: true
+slices:
+  - name: s
+    task: do x
+    spec: the spec
+    verify_cmds: [cargo test x]
+    editable_paths: [src/x.rs]
+    reference_paths: [tests/x_test.rs]
+    judge_policy: blocking
+    max_iters: 3
+    max_changed_files: 5
+    max_changed_lines: 50
+    tier: medium
+"#;
+        let c: Campaign = serde_yaml::from_str(yaml).unwrap();
+        assert!(c.auto_commit);
+        let s = &c.slices[0];
+        assert_eq!(s.task, "do x");
+        assert_eq!(s.spec.as_deref(), Some("the spec"));
+        assert_eq!(s.verify_cmds, vec!["cargo test x"]);
+        assert_eq!(s.editable_paths, vec!["src/x.rs"]);
+        assert_eq!(s.reference_paths, vec!["tests/x_test.rs"]);
+        assert_eq!(s.max_iters, Some(3));
+        assert_eq!(s.max_changed_files, Some(5));
+        assert_eq!(s.max_changed_lines, Some(50));
+        assert_eq!(s.tier.as_deref(), Some("medium"));
+        assert!(matches!(s.judge_policy, Some(JudgePolicy::Blocking)));
+    }
+
     fn slice(task: &str) -> Slice {
         Slice {
             name: None,
@@ -343,6 +427,7 @@ mod tests {
             judge_policy: None,
             model: None,
             fallback_models: vec![],
+            tier: None,
         }
     }
 }

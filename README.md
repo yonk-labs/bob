@@ -1,7 +1,7 @@
 # bob
 
 **Autonomous build → verify → judge loop.** Give bob a task and a repo; it drives a
-coding CLI (`opencode`) to implement the change in an **isolated git worktree**, gates
+builder CLI (`goose` by default, `opencode` for the frontier tier) to implement the change in an **isolated git worktree**, gates
 the result on **your objective verify command** (e.g. `cargo test`), optionally uses
 `abe` critique according to `judge.policy`, and **applies the change only when it converges**.
 
@@ -13,7 +13,7 @@ bob produces it. It owns no model logic — it orchestrates two CLIs you already
       │
       ▼  (in an isolated git worktree, so your tree is never touched until it passes)
   ┌──────── loop, up to --max-iters ────────────────────────────┐
-  │  BUILD   opencode edits files in the worktree               │
+  │  BUILD   goose/opencode edits files in the worktree         │
   │  scope   changed files/lines within caps?                   │
   │  VERIFY  run your gate (cargo test / npm test / …)          │
   │            ├─ fail → feed the failure back → next iteration │
@@ -49,8 +49,8 @@ The practical loop is:
 hector frontier-brief
 hector plan ... --out campaign.yaml
 hector check --file campaign.yaml
-bob campaign --file campaign.yaml > result.json
-hector review --campaign campaign.yaml --bob-result result.json
+bob campaign --file campaign.yaml
+hector review --campaign campaign.yaml --bob-result .bob/runs/campaign-*-result.json
 ```
 
 If Hector says `split_task`, split the behavior before invoking Bob again. If Bob reports
@@ -70,7 +70,11 @@ value; the build step itself is just glue.
 
 **Prerequisites** (bob shells out to these):
 - `git`
-- [`opencode`](https://opencode.ai) — the builder CLI, configured with a model.
+- [`goose`](https://github.com/block/goose) — the default builder CLI, used for the
+  `cheap`/`medium`/`large` tiers (and any tier-less config with `cmd: goose`).
+- [`opencode`](https://opencode.ai) — the heavier builder CLI used for the `frontier`
+  tier. *(Optional — only required if your `bob.yaml` routes a tier to opencode.
+  `bob doctor` flags whichever builder your config actually needs.)*
 - [`abe`](../debator) — the judge CLI (`abe init` to configure). *(Optional when
   `judge.policy: advisory`; required for `blocking` or `retry_on_fail`.)*
 
@@ -80,7 +84,7 @@ cargo install --path .          # installs `bob` to ~/.cargo/bin
 # or
 ./install.sh                    # builds release + copies to ~/.local/bin
 
-bob doctor                      # checks git / opencode / abe / config
+bob doctor                      # checks git / opencode / abe / goose (if used) / config
 ```
 
 **Opencode installation** (opencode must be available to bob):
@@ -96,6 +100,15 @@ brew install anomalyco/tap/opencode
 ```
 
 If `bob doctor` reports opencode missing, the installer suggests the above options.
+
+**Tier builders & local endpoints.** Tiers pick the builder: `cheap` → thin
+(direct curl, single-shot), `medium`/`large` → goose (agent loop), `frontier` →
+opencode. The thin and goose builders talk to an OpenAI-compatible endpoint; for
+local models (model ids prefixed `ollama/` or a `192.168.x.x/…` host) the base URL
+defaults to a local vLLM server. Override it with `BOB_VLLM_URL` (e.g.
+`export BOB_VLLM_URL=http://your-host:8000/v1` — scheme and `/v1` are added if you
+omit them). Cloud ids (`minimax…`, `zai…`) use their provider URL and read the
+matching `*_API_KEY` env var.
 
 ## Quick start — interactive installer
 
@@ -134,15 +147,19 @@ builder:
   timeout_secs: 600       # per build-step wall-clock timeout
   model: qwen             # default model: a name from `models`, or a raw provider/model id
   models:                 # named roster — switch with `bob build --model <name>`, list with `bob models`
-    qwen:    ollama/Intel/Qwen3-Coder-Next-int4-AutoRound
-    minimax: minimax/MiniMax-M3  # alias -> real provider/model id
+    qwen:    ollama/Intel/Qwen3-Coder-Next-int4-AutoRound   # legacy form: provider/model id
+    # Explicit form (same shape as hector.yaml / abe.yaml) — gives the thin/goose
+    # builders an exact endpoint instead of guessing from the id prefix:
+    local:   { model: "Intel/Qwen3-...", base_url: "http://192.168.1.193:8000/v1" }
+    minimax: { model: "MiniMax-M3", base_url: "https://api.minimax.io/v1", api_key_env: MINIMAX_API_KEY }
   fallback_models: []     # roster aliases or raw ids; example ["minimax"] resolves above
   args: []                # extra opencode flags (not the model), e.g. ["--variant", "high"]
 judge:
-  cmd: abe                # judge CLI; validate = second opinion, debate = abe debate --protocol judge
-  mode: validate          # validate | debate
+  cmd: abe                # judge CLI. validate = one reviewer (light); debate = multi-model panel (heavy)
+  mode: validate          # validate | debate. Both yield a structured pass/fail/uncertain verdict.
   timeout_secs: 600
-  policy: advisory        # advisory | blocking | retry_on_fail
+  policy: advisory        # advisory (verify gate is authority; abe is a non-blocking second opinion)
+                          # | blocking (abe must pass) | retry_on_fail (feed abe critique back to builder)
 verify:
   cmds:                   # objective gate(s); run in order, stop at first failure.
     - cargo test          # empty list => no gate (bob warns; converges on first diff)
@@ -243,8 +260,8 @@ slices:
 
 Each slice may override `verify_cmds`, `editable_paths`/`allow_paths`, scope caps,
 `judge_policy`, `model`, and `fallback_models`. Campaign output is JSON with per-slice status,
-changed files, artifact directory, and final diff. Feed that JSON to `hector review` when
-Hector created the campaign.
+changed files, artifact directory, final diff, and `result_path`. Bob also writes the same JSON
+to that path under `.bob/runs/`; feed it to `hector review` when Hector created the campaign.
 
 ## MCP server
 
@@ -253,6 +270,8 @@ Hector created the campaign.
 max_changed_lines?, judge_policy?, model?, fallback_models?, apply?, keep_worktree? }`, returning the `RunResult` as JSON.
 `apply` defaults to **false** over MCP — a host agent can never trigger an auto-apply by
 omitting the field. Register it like any stdio MCP server (command `bob`, arg `mcp`).
+
+The bundled Codex/opencode plugin MCP config registers `bob mcp`, `abe mcp`, and `hector mcp`.
 
 ## Use it from Claude Code / Codex (plugin)
 

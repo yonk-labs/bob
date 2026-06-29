@@ -67,7 +67,13 @@ impl Judge for Abe {
 
 fn abe_args(mode: JudgeMode, statement: String) -> Vec<String> {
     let mut args = match mode {
-        JudgeMode::Validate => vec!["validate".to_string(), "--json".to_string()],
+        // --verdict: ask abe for a structured pass/fail/uncertain field instead of
+        // prose, so the judge produces a real verdict (not always Uncertain).
+        JudgeMode::Validate => vec![
+            "validate".to_string(),
+            "--json".to_string(),
+            "--verdict".to_string(),
+        ],
         JudgeMode::Debate => vec![
             "debate".to_string(),
             "--json".to_string(),
@@ -216,6 +222,6 @@ mod tests {
     #[test]
     fn validate_mode_stays_single_reviewer() {
         let args = abe_args(JudgeMode::Validate, "stmt".into());
-        assert_eq!(args, ["validate", "--json", "--", "stmt"]);
+        assert_eq!(args, ["validate", "--json", "--verdict", "--", "stmt"]);
     }
 }

@@ -202,11 +202,7 @@ fn enrich_with_file_contents(prompt: &str, workdir: &Path) -> String {
         let full = workdir.join(path);
         match std::fs::read_to_string(&full) {
             Ok(contents) => {
-                let truncated = if contents.len() > 4000 {
-                    format!("{}...\n(truncated)", &contents[..4000])
-                } else {
-                    contents
-                };
+                let truncated = truncate_chars(&contents, 4000);
                 enriched.push_str(&format!("\n--- {path} ---\n{truncated}\n"));
             }
             Err(_) => {
@@ -339,6 +335,13 @@ impl Builder for GooseBuilder {
             cmd.env("OPENAI_API_KEY", self.api_key.as_deref().unwrap_or("local"));
         }
 
+        // Point goose's rolling log file at a writable temp dir. We run with
+        // --no-profile and pass all config via flags/env, so goose reads nothing
+        // from XDG_CONFIG_HOME/HOME — only its logs use the state dir. Without this,
+        // goose panics ("failed to create log file") when ~/.local/state is read-only
+        // (containers, sandboxed CI), and it keeps log noise out of the worktree.
+        cmd.env("XDG_STATE_HOME", std::env::temp_dir().join("bob-goose-state"));
+
         // setsid for process group isolation
         unsafe {
             cmd.pre_exec(|| {
@@ -461,6 +464,18 @@ pub fn tail(s: &str, max_chars: usize) -> String {
     chars.into_iter().collect()
 }
 
+/// First `max_chars` characters, char-boundary safe, with a truncation marker
+/// appended if the input was longer. Used to cap context-file embeds without
+/// panicking on multibyte UTF-8 (a raw `&s[..n]` byte slice would).
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() > max_chars {
+        let head: String = s.chars().take(max_chars).collect();
+        format!("{head}...\n(truncated)")
+    } else {
+        s.to_string()
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -496,6 +511,17 @@ class Body { }
         let written = parse_and_write_files(content, &dir).unwrap();
         assert_eq!(written, vec!["src/body.js"]);
         assert!(std::fs::read_to_string(dir.join("src/body.js")).unwrap().contains("class Body"));
+    }
+
+    #[test]
+    fn truncate_chars_is_utf8_safe() {
+        // 4001 two-byte chars: a raw &s[..4000] byte slice would panic mid-char.
+        let s = "é".repeat(4001);
+        let out = truncate_chars(&s, 4000);
+        assert!(out.ends_with("(truncated)"));
+        assert!(out.starts_with('é'));
+        // Short input is returned unchanged, no marker.
+        assert_eq!(truncate_chars("hi", 4000), "hi");
     }
 
     #[test]

@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "bob", about = "Autonomous build-verify-judge loop")]
+#[command(name = "bob", version, about = "Autonomous build-verify-judge loop")]
 pub struct Cli {
     /// Path to config (default: ./bob.yaml then ~/.config/bob/config.yaml)
     #[arg(long, global = true)]
@@ -51,6 +51,14 @@ pub enum Command {
         /// Tier: cheap | large | frontier. Overrides bob.yaml default_tier.
         #[arg(long)]
         tier: Option<String>,
+        /// Try only the selected --model: no tier escalation, no fallback models.
+        #[arg(long)]
+        skip_escalation: bool,
+        /// Emit only the RunResult as JSON (for orchestrators like hector
+        /// dispatch). Suppresses the human summary and the appended diff —
+        /// the diff is in the JSON's `final_diff` field.
+        #[arg(long)]
+        json: bool,
         /// Apply the candidate to the working tree on pass (default: propose only).
         #[arg(long)]
         apply: bool,

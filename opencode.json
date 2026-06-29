@@ -8,6 +8,10 @@
     "abe": {
       "type": "local",
       "command": ["abe", "mcp"]
+    },
+    "hector": {
+      "type": "local",
+      "command": ["hector", "mcp"]
     }
   }
 }

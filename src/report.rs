@@ -136,6 +136,53 @@ mod tests {
         assert!(j.contains("\"fallbacks_tried\":[\"qwen: EmptyDiffAfterCritique\"]"));
     }
 
+    /// CROSS-REPO CONTRACT: hector::planner::review_text routes on these exact
+    /// strings from bob's JSON (it lowercases stop_reason). Renaming a
+    /// RunStatus / NextAction / StopReason variant silently breaks hector's
+    /// review — change both repos together. If this test fails, update
+    /// hector/src/planner.rs::review_text too.
+    #[test]
+    fn cross_repo_status_string_contract() {
+        use crate::engine::StopReason;
+        assert_eq!(NextAction::SplitTask.as_str(), "split_task");
+        assert_eq!(NextAction::ReviewCandidate.as_str(), "review_candidate");
+        assert_eq!(
+            NextAction::RetryWithVerifyFailure.as_str(),
+            "retry_with_verify_failure"
+        );
+        // stop_reason is emitted via {:?}; hector lowercases it → "scopeexceeded".
+        assert_eq!(
+            format!("{:?}", StopReason::ScopeExceeded).to_lowercase(),
+            "scopeexceeded"
+        );
+        let mk = |status, next| RunResult {
+            status,
+            next_action: next,
+            run_id: "r".into(),
+            base_sha: "b".into(),
+            worktree: "w".into(),
+            artifact_dir: "a".into(),
+            iterations: 1,
+            final_diff: String::new(),
+            applied: false,
+            stop_reason: None,
+            changed_files: vec![],
+            scope: None,
+            verify: None,
+            judge: None,
+            builder: BuilderSnapshot {
+                model: None,
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                failure_kind: "ok".into(),
+                fallbacks_tried: vec![],
+            },
+        };
+        assert!(to_json(&mk(RunStatus::Converged, NextAction::Done)).contains("\"status\":\"converged\""));
+        assert!(to_json(&mk(RunStatus::NeedsReview, NextAction::ReviewCandidate))
+            .contains("\"status\":\"needs_review\""));
+    }
+
     #[test]
     fn writes_artifact_files() {
         let tmp = std::env::temp_dir().join(format!("bob-art-{}", std::process::id()));

@@ -28,7 +28,13 @@ pub fn check(diff: &str, cfg: &ScopeCfg) -> ScopeReport {
     let mut detail = format!("{files} files, {lines} lines");
     if !cfg.allow_paths.is_empty() {
         for path in &changed_files {
-            if !cfg.allow_paths.iter().any(|p| path.starts_with(p.as_str())) {
+            // Boundary-aware prefix match: `src` allows `src/x` and `src` itself,
+            // but NOT `src2/x`. Matches hector's review check so the two agree on
+            // what's in scope.
+            if !cfg.allow_paths.iter().any(|p| {
+                let p = p.trim_end_matches('/');
+                path == p || path.starts_with(&format!("{p}/"))
+            }) {
                 within = false;
                 detail = format!("{detail}; path outside allowlist: {path}");
             }
@@ -72,6 +78,15 @@ diff --git a/src/b.rs b/src/b.rs\n+++ b/src/b.rs\n+x\n";
     #[test]
     fn path_outside_allowlist() {
         assert!(!check(DIFF, &cfg(10, 100, vec!["docs/"])).within);
+    }
+    #[test]
+    fn allowlist_is_boundary_aware() {
+        // DIFF changes src/a.rs and src/b.rs.
+        assert!(check(DIFF, &cfg(10, 100, vec!["src"])).within);
+        assert!(check(DIFF, &cfg(10, 100, vec!["src/"])).within);
+        // A sibling prefix must NOT be accepted by a bare-prefix match.
+        let sib = "diff --git a/src2/x.rs b/src2/x.rs\n+++ b/src2/x.rs\n+x\n";
+        assert!(!check(sib, &cfg(10, 100, vec!["src"])).within);
     }
     #[test]
     fn deleted_file_counts_as_changed_file() {
