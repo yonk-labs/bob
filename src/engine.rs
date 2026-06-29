@@ -471,7 +471,18 @@ pub fn should_try_next_model(res: &RunResult) -> bool {
 
 fn should_try_next_model_after_error(err: &anyhow::Error) -> bool {
     let s = err.to_string();
-    s.contains("builder ") || s.contains("spawning builder")
+    // A builder that timed out, crashed, failed to spawn, or errored at the model
+    // API is a *per-model* failure — escalate to the next model/tier rather than
+    // killing the whole run. Match every builder's error vocabulary, not just
+    // opencode's: goose ("goose timed out after", "goose exited with status",
+    // "spawning goose"), opencode ("builder timed out", "spawning builder"), and
+    // thin ("thin builder: model API error"). Orchestration errors (git/worktree)
+    // don't use these phrases, so they still fail fast.
+    s.contains("timed out")
+        || s.contains("exited with status")
+        || s.contains("spawning ")
+        || s.contains("builder")
+        || s.contains("model API error")
 }
 
 fn model_label(model: &Option<String>) -> String {
@@ -1115,6 +1126,21 @@ mod decision_tests {
             uncertain_streak: 0,
             walltime_exceeded: false,
         }
+    }
+
+    #[test]
+    fn builder_failures_escalate_orchestration_errors_dont() {
+        let esc = |m: &str| should_try_next_model_after_error(&anyhow::anyhow!("{m}"));
+        // every builder's timeout/crash/spawn vocabulary must escalate to next model
+        assert!(esc("goose timed out after 600s"));
+        assert!(esc("goose exited with status 1; stderr:\n..."));
+        assert!(esc("spawning goose 'goose': No such file"));
+        assert!(esc("builder timed out after 600s"));
+        assert!(esc("spawning builder 'opencode': No such file"));
+        assert!(esc("thin builder: model API error: 503"));
+        // orchestration failures should NOT escalate (next model won't help)
+        assert!(!esc("failed to create worktree"));
+        assert!(!esc("git checkout failed"));
     }
 
     #[test]
