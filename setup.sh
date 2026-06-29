@@ -208,10 +208,11 @@ debate:
 
 write_if_missing "abe.yaml" "$ABE_CONFIG"
 
-# ── Step 4: Register MCP servers in opencode (if opencode installed) ────────
+# ── Step 4: Register MCP servers in coding agents ───────────────────────────
 echo ""
 B "=== Registering MCP servers ==="
 
+# opencode
 if command -v opencode &>/dev/null; then
   OC_CONFIG="${HOME}/.config/opencode/config.json"
   if [ -f "$OC_CONFIG" ]; then
@@ -227,14 +228,38 @@ cfg.setdefault('mcp', {})
 cfg['mcp']['bob'] = {'type': 'local', 'command': ['bob', 'mcp']}
 cfg['mcp']['abe'] = {'type': 'local', 'command': ['abe', 'mcp']}
 json.dump(cfg, open(path, 'w'), indent=2)
-print('  done')
-" 2>/dev/null || Y "  opencode MCP: could not auto-register (add manually)"
+" 2>/dev/null || Y "  opencode MCP: could not auto-register"
     fi
-  else
-    Y "  opencode config not found at $OC_CONFIG — create it first"
   fi
+fi
+
+# claude (Claude Code CLI)
+if command -v claude &>/dev/null; then
+  if claude mcp list 2>&1 | grep -q "bob"; then
+    Y "  claude MCP: bob already registered"
+  else
+    G "  claude MCP: registering bob + abe"
+    claude mcp add bob -- bob mcp 2>/dev/null || Y "  claude MCP: manual add needed: claude mcp add bob -- bob mcp"
+    claude mcp add abe -- abe mcp 2>/dev/null || Y "  claude MCP: manual add needed: claude mcp add abe -- abe mcp"
+  fi
+fi
+
+# codex (OpenAI Codex CLI)
+if command -v codex &>/dev/null; then
+  if grep -q "bob@yonk-labs" ~/.codex/config.toml 2>/dev/null; then
+    Y "  codex plugin: bob already installed"
+  else
+    G "  codex: add bob MCP manually if needed:"
+    Y "    codex mcp add bob -- bob mcp  (or install via plugin system)"
+    Y "    Or add to ~/.codex/config.toml under [mcpServers]"
+  fi
+fi
+
+# Also check for project-level .mcp.json (works with all agents that read it)
+if [ -f ".mcp.json" ]; then
+  G "  .mcp.json: found in project root (auto-discovered by most agents)"
 else
-  Y "  opencode not installed — skipping MCP registration"
+  Y "  .mcp.json: not found — agents won't auto-discover bob/abe in this project"
 fi
 
 # ── Step 5: Verify PATH ─────────────────────────────────────────────────────
