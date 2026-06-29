@@ -260,6 +260,8 @@ pub fn run() -> anyhow::Result<()> {
                 .map(|(_, m)| m.clone())
                 .unwrap_or_default(),
             fallback_models: vec![],
+                tiers: Default::default(),
+                escalation_policy: "tier".into(),
             args: builder_args,
         },
         judge: crate::config::JudgeCfg {
@@ -378,6 +380,8 @@ artifacts:
                     "ollama/Intel/Qwen3-Coder".to_string(),
                 )]),
                 fallback_models: vec![],
+                tiers: Default::default(),
+                escalation_policy: "tier".into(),
                 args: vec!["--variant".to_string(), "high".to_string()],
             },
             judge: crate::config::JudgeCfg {

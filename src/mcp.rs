@@ -86,9 +86,10 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
     if let Some(cmds) = p.verify_cmds {
         cfg.verify.cmds = cmds;
     }
-    if let Some(paths) = p.allow_paths {
+    if let Some(paths) = p.allow_paths.clone() {
         cfg.scope.allow_paths = paths;
     }
+    let allow_paths_for_opts = p.allow_paths.unwrap_or_default();
     if let Some(n) = p.max_changed_files {
         cfg.scope.max_changed_files = n;
     }
@@ -112,12 +113,14 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
         context_files: files,
         apply,
         keep_worktree: p.keep_worktree.unwrap_or(false),
+        editable_paths: allow_paths_for_opts,
         run_id: format!(
             "mcp-{}-{}",
             std::process::id(),
             MCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ),
         builder_model: None,
+        tier: None,
     };
     let res = engine::run_opencode_with_fallbacks(&cfg, opts, p.model, fallback_models).await?;
     Ok(report::to_json(&res))

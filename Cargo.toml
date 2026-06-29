@@ -19,6 +19,7 @@ anyhow = "1"
 thiserror = "1"
 rmcp = { version = "0.16", features = ["server", "macros", "transport-io"] }
 schemars = "0.8"
+libc = "0.2"
 
 [profile.release]
 strip = true

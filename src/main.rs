@@ -7,6 +7,7 @@ mod doctor;
 mod engine;
 mod init;
 mod judge;
+mod model_stats;
 mod mcp;
 mod report;
 mod safety;
@@ -25,6 +26,9 @@ pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
+    // Reap orphans on every invocation. Fast (only scans /proc when stale pids
+    // exist). Catches opencode from prior runs whose parent bob was SIGKILLed.
+    let _ = builder::reap_orphans();
     match args.command {
         Command::Doctor => doctor::run(),
         Command::Models => {
@@ -81,6 +85,8 @@ async fn main() -> anyhow::Result<()> {
             max_changed_files,
             max_changed_lines,
             judge_policy,
+            judge_mode,
+            tier,
             apply,
             keep,
             keep_worktree,
@@ -93,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
                 cfg.verify.cmds = verify_cmds;
             }
             if !allow_paths.is_empty() {
-                cfg.scope.allow_paths = allow_paths;
+                cfg.scope.allow_paths = allow_paths.clone();
             }
             if let Some(n) = max_changed_files {
                 cfg.scope.max_changed_files = n;
@@ -103,6 +109,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(p) = judge_policy {
                 cfg.judge.policy = p;
+            }
+            if let Some(m) = judge_mode {
+                cfg.judge.mode = m;
             }
             let spec_text = match spec {
                 Some(ref p) => {
@@ -126,6 +135,8 @@ async fn main() -> anyhow::Result<()> {
                 keep_worktree: keep || keep_worktree,
                 run_id,
                 builder_model: None,
+                editable_paths: allow_paths.clone(),
+                tier,
             };
             let res =
                 engine::run_opencode_with_fallbacks(&cfg, opts, model, fallback_models).await?;
@@ -161,6 +172,14 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Reap => {
+            let report = builder::reap_orphans()?;
+            println!(
+                "reaper: killed {} orphan(s), cleaned {} stale pid file(s)",
+                report.orphans_killed, report.cleaned
+            );
+            Ok(())
+        }
         Command::Campaign { file } => {
             let cfg = config::Config::load(args.config.as_deref())?;
             let report = campaign::run_file(&file, &cfg).await?;
@@ -168,6 +187,11 @@ async fn main() -> anyhow::Result<()> {
             if report.status != "completed" {
                 std::process::exit(1);
             }
+            Ok(())
+        }
+        Command::Stats => {
+            let stats = model_stats::StatsStore::load();
+            stats.print_summary();
             Ok(())
         }
     }

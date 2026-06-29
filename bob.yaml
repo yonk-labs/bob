@@ -3,10 +3,14 @@ builder:
   timeout_secs: 600
   model: qwen-193
   models:
-    qwen-193: ollama/Intel/Qwen3-Coder-Next-int4-AutoRound
-    qwen-140: mlx140/mlx-community/Qwen3-Coder-Next-4bit
-    # minimax: minimax/MiniMax-M3  # optional cloud fallback example
-  fallback_models: []              # e.g. ["minimax"] after enabling the alias above
+    qwen-193:  ollama/Intel/Qwen3-Coder-Next-int4-AutoRound
+    gemma-133: 192.168.1.133/cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit
+    glm:       zai-coding-plan/glm-5.2
+    minimax:   minimax-coding-plan/MiniMax-M3
+  fallback_models:
+    - gemma-133
+    - glm
+    - minimax
   args: []
 judge:
   cmd: abe

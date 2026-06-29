@@ -30,14 +30,108 @@ pub struct BuilderCfg {
     #[serde(default)]
     pub models: BTreeMap<String, String>,
     /// Ordered fallback model names/raw ids to try when the selected model stalls or errors.
+    #[deprecated(note = "Use `tiers` and `escalation_policy: tier` instead")]
     #[serde(default)]
     pub fallback_models: Vec<String>,
+    /// Tiered model assignment. Models within a tier are tried in order (ranked
+    /// by model_stats); when a tier fails entirely, escalation moves to the next tier.
+    ///
+    /// Default tier used when slice.tier isn't set: `default_tier` (defaults to
+    /// "cheap"). Slices can override with `tier: frontier` in campaign YAML.
+    #[serde(default)]
+    pub tiers: TierCfg,
+    /// How to escalate when the current model/tier fails:
+    ///   "tier"   — exhaust all models in tier, then move to next tier (recommended)
+    ///   "model"  — try each next model in order across all tiers (legacy behavior)
+    ///   "none"   — try only the selected model, no escalation
+    #[serde(default = "default_escalation_policy")]
+    pub escalation_policy: String,
     /// Extra builder flags before the prompt, e.g. ["--variant", "high"].
     #[serde(default)]
     pub args: Vec<String>,
 }
 fn default_builder_timeout() -> u64 {
     600
+}
+fn default_escalation_policy() -> String {
+    "tier".into()
+}
+
+/// Three-tier model configuration: cheap → large → frontier.
+/// Within each tier, model_stats ranks models by success_rate × (1/avg_latency).
+/// Use aliases (from `models:` map) or raw provider/model ids.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TierCfg {
+    #[serde(default)]
+    pub cheap: Vec<String>,
+    #[serde(default)]
+    pub medium: Vec<String>,
+    #[serde(default)]
+    pub large: Vec<String>,
+    #[serde(default)]
+    pub frontier: Vec<String>,
+    #[serde(default = "default_default_tier")]
+    pub default_tier: String,
+    #[serde(default)]
+    pub cheap_builder: Option<String>,
+    #[serde(default)]
+    pub medium_builder: Option<String>,
+    #[serde(default)]
+    pub large_builder: Option<String>,
+    #[serde(default)]
+    pub frontier_builder: Option<String>,
+}
+fn default_default_tier() -> String {
+    "cheap".into()
+}
+
+impl TierCfg {
+    /// Escalation order: cheap(small) → medium → large → frontier(complex)
+    pub fn escalation_order(&self) -> Vec<&str> {
+        vec!["cheap", "medium", "large", "frontier"]
+    }
+
+    /// Models in the given tier, or empty if tier name unknown.
+    pub fn models_for(&self, tier: &str) -> &[String] {
+        match tier {
+            "cheap" => &self.cheap,
+            "medium" => &self.medium,
+            "large" => &self.large,
+            "frontier" => &self.frontier,
+            _ => &[],
+        }
+    }
+
+    /// Which builder backend to use for the given tier.
+    /// cheap=thin (single-shot), medium/large=goose (agent loop), frontier=opencode (full)
+    pub fn builder_for(&self, tier: &str) -> &str {
+        match tier {
+            "cheap" => self.cheap_builder.as_deref().unwrap_or("thin"),
+            "medium" => self.medium_builder.as_deref().unwrap_or("goose"),
+            "large" => self.large_builder.as_deref().unwrap_or("goose"),
+            "frontier" => self.frontier_builder.as_deref().unwrap_or("opencode"),
+            _ => "opencode",
+        }
+    }
+
+    /// Build the full ordered list of tiers for escalation. The first entry is
+    /// the slice's tier; subsequent entries are higher tiers in escalation
+    /// order. Within each tier, the caller ranks by model_stats.score.
+    pub fn ordered_tiers(&self, slice_tier: &str) -> Vec<String> {
+        let order = self.escalation_order();
+        let start_idx = order.iter().position(|t| *t == slice_tier).unwrap_or(0);
+        let mut out: Vec<String> = Vec::new();
+        for t in &order[start_idx..] {
+            if !out.contains(&t.to_string()) {
+                out.push(t.to_string());
+            }
+        }
+        // If slice_tier wasn't found in the order, prepend it as a starting point
+        if out.is_empty() {
+            out.push(slice_tier.to_string());
+        }
+        out
+    }
 }
 
 impl BuilderCfg {
@@ -111,7 +205,7 @@ fn default_judge_timeout() -> u64 {
     600
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum JudgeMode {
     #[default]
@@ -341,4 +435,64 @@ apply: true
         assert_eq!(cfg.scope.allow_paths, vec!["src/"]);
         assert!(cfg.apply);
     }
+}
+
+#[test]
+fn tier_models_for_returns_correct_slice() {
+    let cfg = TierCfg {
+        cheap: vec!["qwen".into(), "gemma".into()],
+        large: vec!["llama80b".into()],
+        frontier: vec!["codex".into()],
+        default_tier: "cheap".into(),
+        cheap_builder: None,
+        medium: vec![],
+        medium_builder: None,
+        large_builder: None,
+        frontier_builder: None,
+    };
+    assert_eq!(cfg.models_for("cheap"), &["qwen", "gemma"]);
+    assert_eq!(cfg.models_for("large"), &["llama80b"]);
+    assert_eq!(cfg.models_for("frontier"), &["codex"]);
+    assert!(cfg.models_for("unknown").is_empty());
+}
+
+#[test]
+fn ordered_tiers_escalates_correctly() {
+    let cfg = TierCfg {
+        cheap: vec!["qwen".into()],
+        large: vec!["llama".into()],
+        frontier: vec!["codex".into()],
+        default_tier: "cheap".into(),
+        cheap_builder: None,
+        medium: vec![],
+        medium_builder: None,
+        large_builder: None,
+        frontier_builder: None,
+    };
+    // Starting at cheap → escalate through large → frontier
+    assert_eq!(cfg.ordered_tiers("cheap"), vec!["cheap", "large", "frontier"]);
+    // Starting at large → no cheap
+    assert_eq!(cfg.ordered_tiers("large"), vec!["large", "frontier"]);
+    // Starting at frontier → just frontier
+    assert_eq!(cfg.ordered_tiers("frontier"), vec!["frontier"]);
+}
+
+#[test]
+fn parse_tier_config_from_yaml() {
+    let yaml = r#"
+cmd: opencode
+timeout_secs: 600
+tiers:
+  cheap: [qwen-193, gemma-133]
+  large: [llama-80b]
+  frontier: [codex, minimax]
+  default_tier: cheap
+escalation_policy: tier
+"#;
+    let cfg: BuilderCfg = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(cfg.tiers.cheap, vec!["qwen-193", "gemma-133"]);
+    assert_eq!(cfg.tiers.large, vec!["llama-80b"]);
+    assert_eq!(cfg.tiers.frontier, vec!["codex", "minimax"]);
+    assert_eq!(cfg.tiers.default_tier, "cheap");
+    assert_eq!(cfg.escalation_policy, "tier");
 }

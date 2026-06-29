@@ -5,7 +5,96 @@ use crate::scope;
 use crate::verify::run_gates;
 use crate::worktree::{ApplyOutcome, Workspace};
 use std::path::PathBuf;
+use std::path::{Component, Path};
 use std::time::{Duration, Instant};
+
+/// Check if a path looks like a test file. Matches common conventions:
+/// tests/, test/, __tests__/ dirs, and *_test.*, *.test.*, *.spec.* suffixes.
+fn is_test_path(path: &str) -> bool {
+    let p = Path::new(path);
+    p.components().any(|c| matches!(c, Component::Normal(s) if s == "tests" || s == "test" || s == "__tests__"))
+        || path.ends_with("_test.rs")
+        || path.ends_with("_test.js")
+        || path.ends_with("_test.py")
+        || path.ends_with(".test.js")
+        || path.ends_with(".test.ts")
+        || path.ends_with(".spec.js")
+        || path.ends_with(".spec.ts")
+}
+
+/// Discard any test-file changes (modified or new) in the worktree. Bob may
+/// only edit production code — test files are hector's frozen contract. If the
+/// model modified tests (common — models love "fixing" tests), those changes
+/// are reverted before the scope check runs. This prevents scope-exceeded stops
+/// that block the retry/abe feedback loop.
+fn freeze_untracked_test_files(workdir: &Path) {
+    // Commit untracked test files into the worktree base BEFORE the builder runs.
+    // These are hector's frozen contracts — they should be part of the base so
+    // capture_diff doesn't see them as "new files" (→ scope-exceeded).
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(workdir)
+        .output()
+    {
+        let untracked: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|f| is_test_path(f))
+            .map(|s| s.to_string())
+            .collect();
+        if !untracked.is_empty() {
+            eprintln!(
+                "bob: freezing {} untracked test file(s) into worktree base: {}",
+                untracked.len(),
+                untracked.join(", ")
+            );
+            let _ = std::process::Command::new("git")
+                .args(["add", "--"])
+                .args(&untracked)
+                .current_dir(workdir)
+                .status();
+            let _ = std::process::Command::new("git")
+                .args(["commit", "-q", "-m", "bob: freeze reference test files"])
+                .current_dir(workdir)
+                .status();
+        }
+    }
+}
+
+fn reset_test_files(workdir: &Path, base_sha: &str) {
+    let mut test_files: Vec<String> = Vec::new();
+
+    // Find tracked test files that differ from base_sha (the model modified them)
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["diff", "--name-only", base_sha])
+        .current_dir(workdir)
+        .output()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if is_test_path(line) {
+                test_files.push(line.to_string());
+            }
+        }
+    }
+
+    if test_files.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "bob: resetting {} test file(s) the model modified: {}",
+        test_files.len(),
+        test_files.join(", ")
+    );
+
+    // Restore each test file to its base_sha state
+    for f in &test_files {
+        let _ = std::process::Command::new("git")
+            .args(["checkout", base_sha, "--"])
+            .arg(f)
+            .current_dir(workdir)
+            .status();
+    }
+}
 
 #[derive(Debug)]
 pub enum LoopAction {
@@ -146,6 +235,9 @@ pub struct RunOpts {
     pub keep_worktree: bool,
     pub run_id: String,
     pub builder_model: Option<String>,
+    pub editable_paths: Vec<String>,
+    /// Tier for this run: cheap | large | frontier. Overrides config default_tier.
+    pub tier: Option<String>,
 }
 
 impl Clone for RunOpts {
@@ -157,6 +249,8 @@ impl Clone for RunOpts {
             keep_worktree: self.keep_worktree,
             run_id: self.run_id.clone(),
             builder_model: self.builder_model.clone(),
+            editable_paths: self.editable_paths.clone(),
+            tier: self.tier.clone(),
         }
     }
 }
@@ -270,10 +364,60 @@ fn spec_with_lessons(spec: &str, lessons: Option<&str>) -> String {
     }
 }
 
+/// Build the judge spec: task + lessons + context file contents. Giving abe the
+/// actual test code and spec lets it make a definitive verdict (Pass/Fail)
+/// instead of defaulting to Uncertain because it can't verify correctness from
+/// the diff alone.
+fn build_judge_spec(
+    spec: &str,
+    lessons: Option<&str>,
+    context_files: &[std::path::PathBuf],
+    _workdir: &std::path::Path,
+) -> String {
+    let mut out = spec_with_lessons(spec, lessons);
+    for f in context_files {
+        // Read from the main repo (bob's cwd), NOT the worktree — context files
+        // are reference material that lives in the user's workspace, not
+        // necessarily committed or present in the isolated worktree.
+        if let Ok(content) = std::fs::read_to_string(f) {
+            // Truncate large files to avoid context bloat
+            let truncated = if content.len() > 4000 {
+                format!("{}...\n(truncated)", &content[..4000])
+            } else {
+                content
+            };
+            out.push_str(&format!(
+                "\n\n## REFERENCE FILE: {}\n```\n{}\n```",
+                f.display(),
+                truncated
+            ));
+        }
+    }
+    out
+}
+
 fn build_prompt(opts: &RunOpts, critique: Option<&str>, lessons: Option<&str>) -> String {
-    let mut p = format!("## TASK / SPEC\n{}\n", opts.spec);
+    let mut p = format!(
+        "## TASK / SPEC\n{}\n\n\
+         ## RULES\n\
+         - Edit ONLY the paths in editable_paths. Any other path is rejected.\n\
+         - You are NOT authorized to modify test files. Tests are frozen contracts owned by hector.\n\
+         - If you believe a test is INCORRECT, do NOT modify it. Implement the code to match the SPEC.\n\
+         - After implementing, if you have concerns about the test, add a `## CONCERNS` section at the\n\
+           end of your response explaining what you think is wrong and why. This will be reported back.\n\
+         - Match the API signature the test expects exactly. The spec is the contract.\n\
+         - Do NOT modify test files (tests/, *_test.*, *.test.*). Tests are frozen.\n\
+         - Implement to make the test/gate pass — don't change the contract.\n",
+        opts.spec
+    );
+    if !opts.editable_paths.is_empty() {
+        p.push_str("\n## EDITABLE PATHS\n");
+        for path in &opts.editable_paths {
+            p.push_str(&format!("- {path}\n"));
+        }
+    }
     if !opts.context_files.is_empty() {
-        p.push_str("\n## CONTEXT FILES\n");
+        p.push_str("\n## CONTEXT FILES (read-only)\n");
         for f in &opts.context_files {
             p.push_str(&format!("- {}\n", f.display()));
         }
@@ -340,6 +484,48 @@ fn model_label(model: &Option<String>) -> String {
         .unwrap_or_else(|| "(opencode default)".to_string())
 }
 
+/// Extract the model name (without provider prefix) for API calls.
+/// "ollama/Intel/Qwen3..." → "Intel/Qwen3..."
+/// "192.168.1.133/cyankiwi/gemma..." → "cyankiwi/gemma..."
+fn extract_model_name(model_id: &str) -> String {
+    if let Some(pos) = model_id.find('/') {
+        model_id[pos + 1..].to_string()
+    } else {
+        model_id.to_string()
+    }
+}
+
+/// Extract base_url from a model id for the thin builder.
+/// "ollama/Intel/Qwen3..." → "http://192.168.1.193:8000/v1"
+/// "192.168.1.133/cyankiwi/..." → "http://192.168.1.133:8000/v1"
+/// "zai-coding-plan/glm-5.2" → (cloud, needs env-based URL)
+fn extract_base_url(model_id: &str) -> String {
+    if model_id.starts_with("ollama/") {
+        "http://192.168.1.193:8000/v1".into()
+    } else if model_id.starts_with("192.168.1.") {
+        let ip = model_id.split('/').next().unwrap_or("192.168.1.193");
+        format!("http://{ip}:8000/v1")
+    } else if model_id.starts_with("minimax") {
+        "https://api.minimax.io/v1".into()
+    } else if model_id.starts_with("zai") {
+        "https://api.z.ai/api/paas/v4".into()
+    } else {
+        // Fallback: assume local
+        "http://localhost:8000/v1".into()
+    }
+}
+
+/// Extract the env var name for the API key (if any) from a model id.
+fn extract_api_key_env(model_id: &str) -> Option<String> {
+    if model_id.starts_with("minimax") {
+        Some("MINIMAX_API_KEY".into())
+    } else if model_id.starts_with("zai") && !model_id.contains("coding-plan") {
+        Some("ZAI_API_KEY".into())
+    } else {
+        None // local models don't need keys
+    }
+}
+
 pub async fn run_opencode_with_fallbacks(
     cfg: &Config,
     opts: RunOpts,
@@ -352,27 +538,120 @@ pub async fn run_opencode_with_fallbacks(
     let sequence = cfg
         .builder
         .model_sequence(model_override.as_deref(), &fallback_overrides);
+
+    // TIER RESOLUTION: determine the starting tier for this slice, then build
+    // an ordered tier list (starting tier → next tiers for escalation).
+    // Within each tier, models are ranked by stats (success × speed).
+    //
+    // Tier selection: slice.tier (per-call override) > config default_tier > "cheap"
+    let slice_tier = opts.tier.as_deref()
+        .unwrap_or(&cfg.builder.tiers.default_tier);
+    let tiers_to_try = cfg.builder.tiers.ordered_tiers(slice_tier);
+
+    // ADAPTIVE: for each tier, rank models by historical performance.
+    // Dead/slow models sink to the bottom of their tier.
+    let stats = crate::model_stats::StatsStore::load();
+
+    let sequence: Vec<Option<String>> = tiers_to_try
+        .iter()
+        .flat_map(|tier| {
+            let models = cfg.builder.tiers.models_for(tier);
+            if models.is_empty() {
+                return Vec::new();
+            }
+            // Resolve aliases to ids, rank by stats, preserve first-position default.
+            let ids: Vec<String> = models
+                .iter()
+                .filter_map(|m| cfg.builder.resolved_model(Some(m)))
+                .collect();
+            let ranked = stats.rank(&ids);
+            // Map ranked ids back to aliases, preserve config-order for ties.
+            let mut ordered: Vec<String> = Vec::new();
+            for ranked_id in &ranked {
+                for m in models {
+                    let resolved = cfg.builder.resolved_model(Some(m));
+                    if resolved.as_deref() == Some(ranked_id.as_str())
+                        && !ordered.contains(m)
+                    {
+                        ordered.push(m.clone());
+                        break;
+                    }
+                }
+            }
+            // Default (first in config) leads within tier
+            if let Some(default) = models.first() {
+                if !ordered.iter().any(|x| x == default) {
+                    ordered.insert(0, default.clone());
+                }
+            }
+            ordered.into_iter().map(Some).collect::<Vec<_>>()
+        })
+        .collect();
+
+    if sequence.is_empty() {
+        eprintln!(
+            "bob: no models configured for tier '{}' (or any escalation tier). Check bob.yaml tiers config.",
+            slice_tier
+        );
+    }
+
+    eprintln!(
+        "bob: tier='{}' chain (ranked by stats): {:?}",
+        slice_tier,
+        sequence
+            .iter()
+            .map(|a| cfg.builder.resolved_model(a.as_deref()))
+            .collect::<Vec<_>>()
+    );
+
     let mut fallback_history = Vec::new();
     let mut last_err: Option<anyhow::Error> = None;
+    let mut current_tier_idx: usize = 0;
 
     for (idx, model_sel) in sequence.iter().enumerate() {
         let resolved_model = cfg.builder.resolved_model(model_sel.as_deref());
+        let model_id = resolved_model.as_deref().unwrap_or("default");
+
+        // HEALTH CHECK: skip dead endpoints instantly (3s probe, not 300s timeout)
+        if !crate::model_stats::StatsStore::health_check(model_id) {
+            eprintln!(
+                "bob: skipping {} — health check failed (endpoint unreachable)",
+                model_label(&resolved_model)
+            );
+            fallback_history.push(format!(
+                "{}: health_check_failed",
+                model_label(&resolved_model)
+            ));
+            continue;
+        }
+
+        // TIER ESCALATION: if escalation_policy=tier and we're about to move
+        // to a new tier, log the transition.
+        let alias = model_sel.as_deref().unwrap_or("");
+        let model_tier = tiers_to_try
+            .iter()
+            .position(|t| cfg.builder.tiers.models_for(t).iter().any(|m| m == alias))
+            .unwrap_or(0);
+        if model_tier > current_tier_idx {
+            let from_tier = tiers_to_try.get(current_tier_idx).cloned().unwrap_or_else(|| "?".into());
+            let to_tier = tiers_to_try.get(model_tier).cloned().unwrap_or_else(|| "?".into());
+            eprintln!("bob: escalating from tier '{from_tier}' to tier '{to_tier}'");
+            current_tier_idx = model_tier;
+        }
+
         if idx > 0 {
             eprintln!(
                 "bob: retrying with fallback model {}",
                 model_label(&resolved_model)
             );
         }
-        let builder = Opencode {
-            cmd: cfg.builder.cmd.clone(),
-            timeout: Duration::from_secs(cfg.builder.timeout_secs),
-            args: cfg.builder.opencode_args(model_sel.as_deref()),
-        };
-        let judge = Abe {
-            cmd: cfg.judge.cmd.clone(),
-            mode: cfg.judge.mode,
-            timeout: Duration::from_secs(cfg.judge.timeout_secs),
-        };
+
+        // ADAPTIVE TIMEOUT: use historical avg × 2, clamped [30s, 180s]
+        let model_stats = stats.get(model_id);
+        let adaptive = model_stats.adaptive_timeout();
+        let configured = Duration::from_secs(cfg.builder.timeout_secs);
+        let builder_timeout = adaptive.min(configured); // never exceed configured cap
+
         let mut attempt_opts = opts.clone();
         attempt_opts.run_id = if idx == 0 {
             opts.run_id.clone()
@@ -381,8 +660,63 @@ pub async fn run_opencode_with_fallbacks(
         };
         attempt_opts.builder_model = resolved_model.clone();
 
+        // Construct the right builder type for this tier.
+        // cheap → ThinBuilder (curl, minimal context) or whatever's configured
+        // frontier → Opencode (full agent loop) by default
+        let tier_name = tiers_to_try.get(current_tier_idx)
+            .map(|s| s.as_str())
+            .unwrap_or("cheap");
+        let builder_kind = cfg.builder.tiers.builder_for(tier_name);
+        eprintln!("bob: builder='{}' for tier='{}'", builder_kind, tier_name);
+
+        let builder: crate::builder::BuilderKind = match builder_kind {
+            "thin" => {
+                let base_url = extract_base_url(model_id);
+                let api_model = extract_model_name(model_id);
+                let api_key = extract_api_key_env(model_id)
+                    .and_then(|env| std::env::var(&env).ok());
+                crate::builder::BuilderKind::Thin(crate::builder::ThinBuilder {
+                    model_id: api_model,
+                    base_url,
+                    api_key,
+                    timeout: builder_timeout,
+                })
+            }
+            "goose" => {
+                let base_url = extract_base_url(model_id);
+                let api_model = extract_model_name(model_id);
+                let api_key = extract_api_key_env(model_id)
+                    .and_then(|env| std::env::var(&env).ok());
+                crate::builder::BuilderKind::Goose(crate::builder::GooseBuilder {
+                    cmd: "goose".to_string(),
+                    model: api_model,
+                    provider: "openai".to_string(),
+                    timeout: builder_timeout,
+                    base_url: Some(base_url),
+                    api_key,
+                })
+            }
+            _ => crate::builder::BuilderKind::Opencode(crate::builder::Opencode {
+                cmd: cfg.builder.cmd.clone(),
+                timeout: builder_timeout,
+                args: cfg.builder.opencode_args(model_sel.as_deref()),
+                run_id: Some(attempt_opts.run_id.clone()),
+            }),
+        };
+        let judge = Abe {
+            cmd: cfg.judge.cmd.clone(),
+            mode: cfg.judge.mode,
+            timeout: Duration::from_secs(cfg.judge.timeout_secs),
+        };
+
+        let run_start = std::time::Instant::now();
         match run(cfg, attempt_opts, &builder, &judge).await {
             Ok(mut res) => {
+                let latency = run_start.elapsed().as_secs_f64();
+                let success = res.status == crate::engine::RunStatus::Converged;
+                let mut stats = crate::model_stats::StatsStore::load();
+                stats.record(model_id, latency, success);
+                stats.save();
                 res.builder.fallbacks_tried = fallback_history.clone();
                 if should_try_next_model(&res) && idx + 1 < sequence.len() {
                     fallback_history.push(format!(
@@ -396,6 +730,10 @@ pub async fn run_opencode_with_fallbacks(
                 return Ok(res);
             }
             Err(e) if should_try_next_model_after_error(&e) && idx + 1 < sequence.len() => {
+                let latency = run_start.elapsed().as_secs_f64();
+                let mut stats = crate::model_stats::StatsStore::load();
+                stats.record(model_id, latency, false);
+                stats.save();
                 fallback_history.push(format!("{}: {e}", model_label(&resolved_model)));
                 last_err = Some(e);
                 continue;
@@ -434,9 +772,9 @@ pub async fn run(
         }
     }
     let lessons = load_project_lessons()?;
-    let judge_spec = spec_with_lessons(&opts.spec, lessons.as_deref());
     let ws = Workspace::create(&opts.run_id)?;
     let base_sha = ws.base_sha().to_string();
+    let judge_spec = build_judge_spec(&opts.spec, lessons.as_deref(), &opts.context_files, ws.path());
     let deadline = Instant::now() + Duration::from_secs(cfg.loop_cfg.max_walltime_secs);
 
     let mut state = LoopState {
@@ -463,6 +801,15 @@ pub async fn run(
         fallbacks_tried: vec![],
     };
 
+    // Freeze untracked test files BEFORE the builder loop starts. These files
+    // were created by hector but never committed. If we don't freeze them now,
+    // capture_diff's `git add -A` will stage the model's MODIFIED version of
+    // the test as a "new file" → scope-exceeded. By committing the original
+    // hector version before the builder runs, the test is part of the base and
+    // any model modifications show up as tracked changes (which reset_test_files
+    // handles inside the loop).
+    freeze_untracked_test_files(ws.path());
+
     loop {
         state.walltime_exceeded = Instant::now() >= deadline;
         let prompt = build_prompt(&opts, critique.as_deref(), lessons.as_deref());
@@ -480,6 +827,12 @@ pub async fn run(
         builder_snapshot.stdout_tail = builder_out.stdout_tail;
         builder_snapshot.stderr_tail = builder_out.stderr_tail;
         builder_snapshot.failure_kind = builder_out.failure_kind;
+
+        // Discard any test-file changes the model made. Bob may only edit
+        // production code. If the model modified or created test files, revert
+        // them so the scope check and verify gate see only src/ changes.
+        reset_test_files(ws.path(), ws.base_sha());
+
         let diff = ws.capture_diff()?;
         final_diff = diff.clone();
 
@@ -683,6 +1036,8 @@ mod decision_tests {
             keep_worktree: false,
             run_id: "r".into(),
             builder_model: None,
+            editable_paths: vec![],
+            tier: None,
         };
         let prompt = build_prompt(&opts, None, Some("- Do not edit focused tests."));
         assert!(prompt.contains("## PROJECT LESSONS"));
@@ -738,7 +1093,7 @@ mod decision_tests {
     fn advisory_fail_verdict_still_applies() {
         let s = state(0, 3);
         let step = StepOutcome::judged(true, Verdict::Fail, "missing X");
-        assert!(matches!(
+assert!(matches!(
             next_action(&s, &step, JudgePolicy::Advisory),
             LoopAction::Apply
         ));
@@ -809,7 +1164,7 @@ mod decision_tests {
         let s = state(0, 3);
         let step = StepOutcome::scope_exceeded("21 files");
         assert!(matches!(
-            next_action(&s, &step, JudgePolicy::RetryOnFail),
+            next_action(&s, &step, JudgePolicy::Advisory),
             LoopAction::Stop {
                 reason: StopReason::ScopeExceeded
             }
@@ -889,10 +1244,7 @@ mod flow_tests {
     struct NoopBuilder;
     impl Builder for NoopBuilder {
         async fn build(&self, _p: &str, _workdir: &Path) -> anyhow::Result<BuilderOutcome> {
-            Ok(BuilderOutcome {
-                failure_kind: "ok".into(),
-                ..Default::default()
-            })
+            Ok(BuilderOutcome::default())
         }
     }
     // Always Uncertain. Under verify-authority this verdict is advisory and must
@@ -977,6 +1329,8 @@ mod flow_tests {
                 model: None,
                 models: Default::default(),
                 fallback_models: vec![],
+                tiers: Default::default(),
+                escalation_policy: "tier".into(),
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -1001,6 +1355,8 @@ mod flow_tests {
             apply: false,
             keep_worktree: false,
             run_id: "flow".into(),
+            editable_paths: vec![],
+            tier: None,
             builder_model: None,
         };
         let res = run(
@@ -1052,6 +1408,8 @@ mod flow_tests {
                 model: None,
                 models: Default::default(),
                 fallback_models: vec![],
+                tiers: Default::default(),
+                escalation_policy: "tier".into(),
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -1075,6 +1433,8 @@ mod flow_tests {
             context_files: vec![],
             apply: false,
             keep_worktree: false,
+            editable_paths: vec![],
+            tier: None,
             run_id: "retry-flow".into(),
             builder_model: None,
         };
@@ -1133,6 +1493,8 @@ mod flow_tests {
                 model: None,
                 models: Default::default(),
                 fallback_models: vec![],
+                tiers: Default::default(),
+                escalation_policy: "tier".into(),
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -1153,6 +1515,8 @@ mod flow_tests {
             spec: "do the thing".into(),
             context_files: vec![],
             apply: false,
+            editable_paths: vec![],
+            tier: None,
             keep_worktree: false,
             run_id: "clean-flow".into(),
             builder_model: None,

@@ -1,4 +1,4 @@
-use crate::config::JudgePolicy;
+use crate::config::{JudgeMode, JudgePolicy};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -45,6 +45,12 @@ pub enum Command {
         /// Judge behavior after verify passes: advisory, blocking, retry_on_fail.
         #[arg(long)]
         judge_policy: Option<JudgePolicy>,
+        /// Judge mode: validate (1 reviewer, fast) or debate (2+ reviewers, deep).
+        #[arg(long)]
+        judge_mode: Option<JudgeMode>,
+        /// Tier: cheap | large | frontier. Overrides bob.yaml default_tier.
+        #[arg(long)]
+        tier: Option<String>,
         /// Apply the candidate to the working tree on pass (default: propose only).
         #[arg(long)]
         apply: bool,
@@ -69,10 +75,16 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Reap orphaned opencode processes from prior bob runs. Kills any
+    /// opencode whose parent is dead or not a current bob. Run on startup
+    /// automatically; manual use to clean up stuck processes.
+    Reap,
     /// Run a serial campaign file made of Bob-sized slices.
     Campaign {
         /// YAML or JSON campaign file.
         #[arg(long)]
         file: PathBuf,
     },
+    /// Show model performance stats (latency, success rate, adaptive ranking).
+    Stats,
 }

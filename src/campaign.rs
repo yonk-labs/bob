@@ -113,6 +113,8 @@ pub async fn run(campaign: Campaign, base_cfg: &Config) -> anyhow::Result<Campai
             keep_worktree: false,
             run_id,
             builder_model: None,
+            editable_paths: slice.editable_paths.clone(),
+            tier: None,
         };
         let res = engine::run_opencode_with_fallbacks(
             &cfg,
