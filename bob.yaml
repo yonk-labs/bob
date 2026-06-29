@@ -1,31 +1,50 @@
+# Bob — four-tier builder system
+# Each tier uses the thinnest viable builder for its model class.
+# Escalation: cheap(thin) → medium(goose) → large(goose+80B) → frontier(opencode+cloud)
+
 builder:
   cmd: opencode
-  timeout_secs: 600
-  model: qwen-193
+  timeout_secs: 120
   models:
-    qwen-193:  ollama/Intel/Qwen3-Coder-Next-int4-AutoRound
     gemma-133: 192.168.1.133/cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit
-    glm:       zai-coding-plan/glm-5.2
-    minimax:   minimax-coding-plan/MiniMax-M3
-  fallback_models:
-    - gemma-133
-    - glm
-    - minimax
+    qwen-193: ollama/Intel/Qwen3-Coder-Next-int4-AutoRound
+    glm: zai-coding-plan/glm-5.2
+    minimax: minimax-coding-plan/MiniMax-M3
+  tiers:
+    # Tier 1: tiny edits, single functions, <20 lines
+    # Thin builder: curl, ~200 token overhead, 10 concurrent per endpoint
+    cheap: [gemma-133, qwen-193]
+    # Tier 2: read files + wire modules, goose with 26B model
+    # Goose stripped: ~2-4K overhead, 4-6 concurrent per endpoint
+    medium: [gemma-133, qwen-193]
+    # Tier 3: multi-file features, goose with 80B model
+    # Same builder, smarter model — qwen-193 is 80B
+    large: [qwen-193]
+    # Tier 4: hard refactors, novel algorithms, frontier reasoning
+    # opencode --pure: ~16.8K overhead, only path to coding-plan subs
+    frontier: [glm, minimax]
+    default_tier: cheap
+    cheap_builder: thin
+    medium_builder: goose
+    large_builder: goose
+    frontier_builder: opencode
+  escalation_policy: tier
+  fallback_models: []
   args: []
 judge:
   cmd: abe
   mode: validate
-  timeout_secs: 600
+  timeout_secs: 60
   policy: advisory
 verify:
   cmds:
     - cargo test
 loop:
   max_iterations: 3
-  max_walltime_secs: 1800
+  max_walltime_secs: 600
 scope:
-  max_changed_files: 20
-  max_changed_lines: 1200
+  max_changed_files: 4
+  max_changed_lines: 200
   allow_paths: []
 apply: false
 artifacts:
