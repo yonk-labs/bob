@@ -54,6 +54,8 @@ echo ""
 B "=== Optional tools ==="
 check opencode "builder CLI (install: curl -fsSL https://opencode.ai/install | bash)" || true
 check goose "alternative builder (install: https://github.com/block/goose)" || true
+check codex "frontier reviewer for abe (OpenAI CLI)" || true
+check claude "frontier reviewer for abe (Anthropic CLI)" || true
 check abe "judge/debate CLI (will be installed below)" || true
 check bob "build-verify-judge loop (will be installed below)" || true
 check hector "TDD planner (will be installed below)" || true
@@ -172,7 +174,7 @@ judge:
 bob:
   campaign_auto_commit: true
 review:
-  deep_reviewer: null   # set to an abe reviewer name (e.g. "codex") for tier-2 review
+  deep_reviewer: null   # set to "codex" or "claude" for tier-2 frontier review
   deep_on_accept: false
 '
 write_if_missing "hector.yaml" "$HECTOR_CONFIG"
@@ -183,12 +185,27 @@ ABE_CONFIG='# Abe config — model debate/validation.
 defaults:
   timeout_secs: 60
   max_tokens: 1024
+
 models:
+  # CLI providers — frontier coding agents that make excellent reviewers.
+  # They catch bugs that cheap local models miss. At least one recommended.
+  # - { name: codex,  kind: cli, cli: codex }
+  # - { name: claude, kind: cli, cli: claude }
+  # OpenAI-compatible (local or cloud):
   # - { name: gemma, kind: openai-compatible, model: "your-model", base_url: "http://your-endpoint:8000/v1" }
-  # - { name: codex, kind: cli, cli: codex }
+  # - { name: minimax, kind: openai-compatible, model: "MiniMax-M3", base_url: "https://api.minimax.io/v1", api_key_env: MINIMAX_API_KEY }
+
 validate:
   reviewers: []
+  # reviewers: [codex]      # single frontier reviewer (fast, catches bugs)
+  # reviewers: [codex, claude]  # two reviewers for harder review
+
+debate:
+  rounds: 1
+  protocol: synthesis
+  chairman: codex           # strongest model judges
 '
+
 write_if_missing "abe.yaml" "$ABE_CONFIG"
 
 # ── Step 4: Register MCP servers in opencode (if opencode installed) ────────
@@ -250,27 +267,35 @@ B "=== Next steps ==="
 cat << 'NEXT'
 
 1. Edit configs for your model endpoints:
-   - bob.yaml    → add models + tiers
-   - hector.yaml → add model endpoints
-   - abe.yaml    → add reviewer models
+   - bob.yaml    → add models + tiers (cheap/medium/large/frontier)
+   - hector.yaml → add model endpoints for test-writing
+   - abe.yaml    → add reviewer models (codex/claude recommended)
 
-2. Create a .gitignore for your project:
+2. Set up abe reviewers (at least one frontier CLI):
+   # In abe.yaml:
+   models:
+     - { name: codex, kind: cli, cli: codex }       # OpenAI
+     - { name: claude, kind: cli, cli: claude }     # Anthropic
+   validate:
+     reviewers: [codex]   # single reviewer is sufficient (proven to catch all bugs)
+
+3. Create a .gitignore for your project:
    .bob/
    node_modules/
 
-3. Test the pipeline:
+4. Test the pipeline:
    # Write a spec, then:
    hector plan --task "implement X" --spec spec.md
    bob build "implement X" --files tests/x.test.js --verify "npx jest"
    hector review --campaign campaign.yaml --bob-result result.json
 
-4. Run a parallel campaign:
+5. Run a parallel campaign (swarm):
    hector dispatch --file campaign.yaml --jobs 4
 
-5. Check model performance:
+6. Check model performance stats:
    bob stats
 
-6. Clean up orphaned processes:
+7. Clean up orphaned processes:
    bob reap
 
 Docs: bob/docs/, hector/HECTOR_SPEC.md, debator/README.md
