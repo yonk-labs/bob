@@ -429,6 +429,52 @@ fn build_prompt(opts: &RunOpts, critique: Option<&str>, lessons: Option<&str>) -
     p
 }
 
+/// Pre-flight: estimate the on-disk size of the files Bob points the builder at,
+/// and warn when it's large. Agentic builders (goose/opencode) READ these files
+/// into their own context window mid-loop, so a single oversized file (e.g. a
+/// 223KB route file) silently blows the model's window and stalls the run for the
+/// full timeout. Surfacing the budget up front turns a mystery 600s hang into a
+/// one-line "context ≈ Nk tokens — trim it". Read-only; never blocks the run.
+fn warn_on_context_budget(opts: &RunOpts) {
+    let mut files: Vec<(String, u64)> = Vec::new();
+    for f in &opts.context_files {
+        if let Ok(m) = std::fs::metadata(f) {
+            files.push((f.display().to_string(), m.len()));
+        }
+    }
+    for p in &opts.editable_paths {
+        if let Ok(m) = std::fs::metadata(p) {
+            files.push((p.clone(), m.len()));
+        }
+    }
+    if files.is_empty() {
+        return;
+    }
+    let total: u64 = files.iter().map(|(_, n)| n).sum();
+    let est_tokens = total / 4; // ~4 bytes/token, standard rough estimate for code/text
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    let (biggest_name, biggest_bytes) = &files[0];
+    eprintln!(
+        "bob: context ≈ {}k tokens from {} file(s) ({} KB on disk; largest: {} @ {} KB)",
+        est_tokens / 1000,
+        files.len(),
+        total / 1024,
+        biggest_name,
+        biggest_bytes / 1024,
+    );
+    // Local vLLM models prefill slowly and agentic loops choke well before the
+    // model's nominal context limit. Above this, warn loudly.
+    const WARN_TOKENS: u64 = 32_000;
+    if est_tokens > WARN_TOKENS {
+        eprintln!(
+            "bob: ⚠️  context ~{}k tokens exceeds ~{}k — agentic builders read these files into \
+             their window and may stall/timeout. Trim large files or pass excerpts instead.",
+            est_tokens / 1000,
+            WARN_TOKENS / 1000,
+        );
+    }
+}
+
 fn verdict_name(v: Verdict) -> &'static str {
     match v {
         Verdict::Pass => "pass",
@@ -696,6 +742,7 @@ pub async fn run_opencode_with_fallbacks(
             .map(|a| cfg.builder.resolved_model(a.as_deref()))
             .collect::<Vec<_>>()
     );
+    warn_on_context_budget(&opts);
 
     let mut fallback_history = Vec::new();
     let mut last_err: Option<anyhow::Error> = None;
