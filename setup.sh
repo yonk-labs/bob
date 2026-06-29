@@ -246,12 +246,22 @@ fi
 
 # codex (OpenAI Codex CLI)
 if command -v codex &>/dev/null; then
-  if grep -q "bob@yonk-labs" ~/.codex/config.toml 2>/dev/null; then
+  if codex mcp list 2>&1 | grep -q "bob"; then
+    Y "  codex MCP: bob already registered"
+  else
+    G "  codex MCP: registering bob + abe"
+    codex mcp add bob -- bob mcp 2>/dev/null || Y "  codex MCP: manual: codex mcp add bob -- bob mcp"
+    codex mcp add abe -- abe mcp 2>/dev/null || Y "  codex MCP: manual: codex mcp add abe -- abe mcp"
+  fi
+
+  # Also install bob as a plugin (provides skills + /bob:build command)
+  if grep -q 'plugins."bob@yonk-labs"' ~/.codex/config.toml 2>/dev/null; then
     Y "  codex plugin: bob already installed"
   else
-    G "  codex: add bob MCP manually if needed:"
-    Y "    codex mcp add bob -- bob mcp  (or install via plugin system)"
-    Y "    Or add to ~/.codex/config.toml under [mcpServers]"
+    G "  codex plugin: installing bob from local source"
+    codex plugin marketplace add "$BOB_DIR" 2>/dev/null && \
+      codex plugin add bob@yonk-labs 2>/dev/null || \
+      Y "  codex plugin: manual: codex plugin marketplace add $BOB_DIR && codex plugin add bob@yonk-labs"
   fi
 fi
 
