@@ -743,6 +743,12 @@ pub async fn run_opencode_with_fallbacks(
             .collect::<Vec<_>>()
     );
     warn_on_context_budget(&opts);
+    // Pre-flight the verify gate on the unmodified base tree: catch a gate that
+    // already passes (too weak — bob converges on nothing) or errors on bad flags
+    // (unpassable — bob loops). Both otherwise look like "the model failed".
+    if let Some(msg) = crate::verify::preflight_diagnose(&cfg.verify.cmds, std::path::Path::new(".")) {
+        eprintln!("bob: {msg}");
+    }
 
     let mut fallback_history = Vec::new();
     let mut last_err: Option<anyhow::Error> = None;
