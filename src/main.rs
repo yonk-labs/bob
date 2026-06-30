@@ -204,7 +204,10 @@ async fn main() -> anyhow::Result<()> {
                     None => println!("nothing to reset (.bob/model-stats.json not found)"),
                 }
             } else {
-                model_stats::StatsStore::load().print_summary();
+                let weight = config::Config::load(args.config.as_deref())
+                    .map(|c| c.builder.reliability_weight)
+                    .unwrap_or(0.5);
+                model_stats::StatsStore::load().print_summary(weight);
             }
             Ok(())
         }

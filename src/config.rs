@@ -52,6 +52,23 @@ pub struct BuilderCfg {
     /// Extra builder flags before the prompt, e.g. ["--variant", "high"].
     #[serde(default)]
     pub args: Vec<String>,
+    /// Bias the within-tier ranking: 0.0 = pure speed, 0.5 = balanced (default,
+    /// = reliability × speed), 1.0 = pure reliability. Lets you say "I'd rather
+    /// wait for a model that succeeds" or "give me the fastest, flakiness aside".
+    #[serde(default = "default_reliability_weight")]
+    pub reliability_weight: f64,
+    /// Models (roster aliases or raw ids) to try FIRST, in this order, ahead of
+    /// stats ranking. A hard "always start here" override.
+    #[serde(default)]
+    pub pin: Vec<String>,
+    /// Models (roster aliases or raw ids) to NEVER attempt — dropped from every
+    /// tier chain. A hard "don't use this" override.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+fn default_reliability_weight() -> f64 {
+    0.5
 }
 /// A roster entry: either a bare `provider/model` id (legacy) or the explicit
 /// shape shared with hector/abe. Untagged so both YAML forms just work.
@@ -194,6 +211,15 @@ impl BuilderCfg {
                 .map(|d| d.id().to_string())
                 .unwrap_or_else(|| sel.to_string()),
         )
+    }
+
+    /// True if `alias` (or the concrete id it resolves to) is in the `exclude`
+    /// list. Matches whether the user listed the roster alias or the raw id.
+    pub fn is_excluded(&self, alias: &str) -> bool {
+        let target = self.resolved_model(Some(alias));
+        self.exclude
+            .iter()
+            .any(|e| e == alias || (target.is_some() && self.resolved_model(Some(e)) == target))
     }
 
     /// The roster entry for a selection (alias or default), if listed.
@@ -421,6 +447,31 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclude_matches_alias_or_resolved_id() {
+        let yaml = r#"
+builder:
+  cmd: opencode
+  models:
+    qwen: ollama/Intel/Qwen3-Coder
+  exclude: [qwen]
+judge: { cmd: abe }
+verify: { cmds: [] }
+"#;
+        let b = serde_yaml::from_str::<Config>(yaml).unwrap().builder;
+        assert!(b.is_excluded("qwen")); // by alias
+        assert!(b.is_excluded("ollama/Intel/Qwen3-Coder")); // by resolved id
+        assert!(!b.is_excluded("minimax/MiniMax-M3")); // unrelated model
+    }
+
+    #[test]
+    fn reliability_weight_defaults_to_balanced() {
+        let yaml = "builder: { cmd: opencode }\njudge: { cmd: abe }\nverify: { cmds: [] }";
+        let b = serde_yaml::from_str::<Config>(yaml).unwrap().builder;
+        assert_eq!(b.reliability_weight, 0.5);
+        assert!(b.pin.is_empty() && b.exclude.is_empty());
+    }
 
     #[test]
     fn model_roster_resolves_name_default_and_override() {

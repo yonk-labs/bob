@@ -242,10 +242,24 @@ ollama/Intel/Qwen3-Coder-Next-int4-AutoRound      10    90%    40.0s    38.2s   
 
 `bob stats --reset` deletes `.bob/model-stats.json` so rankings start cold again.
 
-**Steering it.** Priority is *learned*, not weighted — there's no per-model priority knob today.
-To influence it: set the *tier* a model lives in, put your preferred model *first* in the tier list
-(wins cold-start and ties), or `bob stats --reset` to wipe history (e.g. after fixing a flaky
-endpoint that unfairly tanked a model's score).
+**Steering it.** By default priority is *learned* (the score above), but three `builder` knobs
+let you override it:
+
+```yaml
+builder:
+  reliability_weight: 0.5   # 0.0 = pure speed · 0.5 = balanced (default) · 1.0 = pure reliability
+  pin: [gemma]              # always tried FIRST, in this order, ahead of stats ranking
+  exclude: [minimax]        # never attempted — dropped from every tier chain
+```
+
+- **`reliability_weight`** re-biases the score: `reliability^(2w) × speed^(2(1-w))`. At `0.5` it's
+  exactly the balanced formula (default, nothing changes); raise it toward `1.0` to prefer models
+  that *succeed* even if slower, lower it toward `0.0` to prefer the *fastest* regardless of flakiness.
+- **`pin`** / **`exclude`** are hard overrides (roster alias or raw id). `pin` forces models to the
+  front of the chain; `exclude` removes them entirely. `pin` wins if a model is in both.
+
+You can also `bob stats --reset` to wipe learned history (e.g. after fixing a flaky endpoint that
+unfairly tanked a model's score). `bob stats` shows scores under your configured `reliability_weight`.
 
 **Guardrails.** bob enforces several from `bob.yaml`, with task-local CLI/MCP overrides:
 - **Verify gates** (`verify.cmds`) are your extensible guardrail — *any* shell command that

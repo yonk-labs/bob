@@ -69,11 +69,20 @@ impl ModelStats {
         }
     }
 
-    /// Higher = better. Balances reliability vs speed.
+    /// Higher = better. Balanced reliability × speed (weight 0.5).
     pub fn score(&self) -> f64 {
+        self.score_weighted(0.5)
+    }
+
+    /// Ranking score with a tunable reliability/speed bias.
+    /// `weight` in [0,1]: 0.0 = pure speed, 0.5 = balanced (= reliability × speed,
+    /// the historical formula), 1.0 = pure reliability. Implemented as
+    /// `reliability^(2w) × speed^(2(1-w))` so w=0.5 reproduces the old score exactly.
+    pub fn score_weighted(&self, weight: f64) -> f64 {
+        let w = weight.clamp(0.0, 1.0);
         let reliability = self.success_rate();
         let speed = 1.0 / self.avg_latency_secs.max(1.0);
-        reliability * speed * 100.0
+        reliability.powf(2.0 * w) * speed.powf(2.0 * (1.0 - w)) * 100.0
     }
 
     /// Adaptive timeout: 2× historical avg, clamped to [30s, 180s].
@@ -177,12 +186,14 @@ impl StatsStore {
 
     /// Rank models by score (best first). Models with no history get neutral score.
     pub fn rank(&self, models: &[String]) -> Vec<String> {
+        self.rank_weighted(models, 0.5)
+    }
+
+    /// Rank models best-first by `score_weighted(weight)`.
+    pub fn rank_weighted(&self, models: &[String], weight: f64) -> Vec<String> {
         let mut scored: Vec<(String, f64)> = models
             .iter()
-            .map(|m| {
-                let stats = self.get(m);
-                (m.clone(), stats.score())
-            })
+            .map(|m| (m.clone(), self.get(m).score_weighted(weight)))
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.into_iter().map(|(m, _)| m).collect()
@@ -220,17 +231,25 @@ impl StatsStore {
     }
 
     /// Print a summary table of model performance.
-    pub fn print_summary(&self) {
+    pub fn print_summary(&self, weight: f64) {
         if self.models.is_empty() {
             println!("(no model stats yet)");
             return;
+        }
+        if (weight - 0.5).abs() > f64::EPSILON {
+            println!("(reliability_weight = {weight:.2}: scores biased toward {})",
+                if weight > 0.5 { "reliability" } else { "speed" });
         }
         println!(
             "{:<45} {:>5} {:>6} {:>8} {:>8} {:>6}",
             "model", "runs", "succ%", "avg_s", "last_s", "score"
         );
         let mut entries: Vec<_> = self.models.iter().collect();
-        entries.sort_by(|a, b| b.1.score().partial_cmp(&a.1.score()).unwrap_or(std::cmp::Ordering::Equal));
+        entries.sort_by(|a, b| {
+            b.1.score_weighted(weight)
+                .partial_cmp(&a.1.score_weighted(weight))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for (model, stats) in entries {
             println!(
                 "{:<45} {:>5} {:>5.0}% {:>7.1}s {:>7.1}s {:>6.1}",
@@ -239,7 +258,7 @@ impl StatsStore {
                 stats.success_rate() * 100.0,
                 stats.avg_latency_secs,
                 stats.last_latency_secs,
-                stats.score()
+                stats.score_weighted(weight)
             );
         }
     }
@@ -273,6 +292,19 @@ mod tests {
         let fast_unreliable = ModelStats { runs: 10, successes: 3, avg_latency_secs: 20.0, ..Default::default() };
         assert!(fast_reliable.score() > slow_reliable.score());
         assert!(fast_reliable.score() > fast_unreliable.score());
+    }
+
+    #[test]
+    fn reliability_weight_steers_ranking() {
+        // fast-but-flaky (90% would be... here 50%, 10s) vs slow-but-solid (100%, 60s)
+        let flaky_fast = ModelStats { runs: 10, successes: 5, avg_latency_secs: 10.0, ..Default::default() };
+        let solid_slow = ModelStats { runs: 10, successes: 10, avg_latency_secs: 60.0, ..Default::default() };
+        // weight 0.5 = exactly the old balanced score (no behavior change by default)
+        assert!((flaky_fast.score_weighted(0.5) - flaky_fast.score()).abs() < 1e-9);
+        // bias to speed -> the fast model wins
+        assert!(flaky_fast.score_weighted(0.0) > solid_slow.score_weighted(0.0));
+        // bias to reliability -> the solid model wins
+        assert!(solid_slow.score_weighted(1.0) > flaky_fast.score_weighted(1.0));
     }
 
     #[test]

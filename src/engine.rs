@@ -681,8 +681,9 @@ pub async fn run_opencode_with_fallbacks(
     // ADAPTIVE: for each tier, rank models by historical performance.
     // Dead/slow models sink to the bottom of their tier.
     let stats = crate::model_stats::StatsStore::load();
+    let weight = cfg.builder.reliability_weight;
 
-    let sequence: Vec<Option<String>> = tiers_to_try
+    let mut sequence: Vec<Option<String>> = tiers_to_try
         .iter()
         .flat_map(|tier| {
             let models = cfg.builder.tiers.models_for(tier);
@@ -694,7 +695,7 @@ pub async fn run_opencode_with_fallbacks(
                 .iter()
                 .filter_map(|m| cfg.builder.resolved_model(Some(m)))
                 .collect();
-            let ranked = stats.rank(&ids);
+            let ranked = stats.rank_weighted(&ids, weight);
             // Map ranked ids back to aliases, preserve config-order for ties.
             let mut ordered: Vec<String> = Vec::new();
             for ranked_id in &ranked {
@@ -717,6 +718,16 @@ pub async fn run_opencode_with_fallbacks(
             ordered.into_iter().map(Some).collect::<Vec<_>>()
         })
         .collect();
+
+    // Priority overrides: exclude drops models from the chain entirely; pin forces
+    // preferred models to the front (in listed order), ahead of stats ranking.
+    if !cfg.builder.exclude.is_empty() {
+        sequence.retain(|a| a.as_deref().map_or(true, |al| !cfg.builder.is_excluded(al)));
+    }
+    for pinned in cfg.builder.pin.iter().rev() {
+        sequence.retain(|a| a.as_deref() != Some(pinned.as_str()));
+        sequence.insert(0, Some(pinned.clone()));
+    }
 
     let tiers_configured = cfg.builder.tiers.any_configured();
     // Warn on the genuinely-misconfigured case: tiers declared but none usable.
@@ -1560,6 +1571,9 @@ mod flow_tests {
                 fallback_models: vec![],
                 tiers: Default::default(),
                 escalation_policy: "tier".into(),
+                reliability_weight: 0.5,
+                pin: vec![],
+                exclude: vec![],
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -1639,6 +1653,9 @@ mod flow_tests {
                 fallback_models: vec![],
                 tiers: Default::default(),
                 escalation_policy: "tier".into(),
+                reliability_weight: 0.5,
+                pin: vec![],
+                exclude: vec![],
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -1724,6 +1741,9 @@ mod flow_tests {
                 fallback_models: vec![],
                 tiers: Default::default(),
                 escalation_policy: "tier".into(),
+                reliability_weight: 0.5,
+                pin: vec![],
+                exclude: vec![],
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),

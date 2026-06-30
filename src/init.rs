@@ -266,6 +266,9 @@ pub fn run() -> anyhow::Result<()> {
             fallback_models: vec![],
                 tiers: Default::default(),
                 escalation_policy: "tier".into(),
+                reliability_weight: 0.5,
+                pin: vec![],
+                exclude: vec![],
             args: builder_args,
         },
         judge: crate::config::JudgeCfg {
@@ -386,6 +389,9 @@ artifacts:
                 fallback_models: vec![],
                 tiers: Default::default(),
                 escalation_policy: "tier".into(),
+                reliability_weight: 0.5,
+                pin: vec![],
+                exclude: vec![],
                 args: vec!["--variant".to_string(), "high".to_string()],
             },
             judge: crate::config::JudgeCfg {
