@@ -185,6 +185,57 @@ or clear stuck results (`EmptyDiffAfterCritique`, repeated verify failure). Fall
 either roster aliases from `builder.models` or raw provider/model ids; `bob doctor` warns on likely
 alias typos.
 
+**Model selection & stats — how bob prioritizes.** Within a tier, bob doesn't try models in
+config order — it **re-ranks them every run by measured performance**. Config order is only the
+cold-start default and the tie-breaker.
+
+After every attempt, bob appends to `.bob/model-stats.json` (per-project, gitignored, created on
+first run, flock-serialized so parallel bob runs don't clobber it):
+
+```json
+{
+  "models": {
+    "ollama/Intel/Qwen3-Coder-Next-int4-AutoRound": {
+      "runs": 10, "successes": 9, "avg_latency_secs": 40.0,
+      "last_latency_secs": 38.2, "last_success": true
+    },
+    "192.168.1.133/cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit": {
+      "runs": 10, "successes": 3, "avg_latency_secs": 20.0,
+      "last_latency_secs": 21.1, "last_success": false
+    }
+  }
+}
+```
+
+Each model gets a **score**, and the tier's chain is sorted by it, highest first:
+
+```
+score = success_rate × (1 / avg_latency_secs) × 100      # reliability × speed
+```
+
+So with the stats above (tier `medium: [gemma, qwen]`):
+
+| model | success_rate | avg latency | score | rank |
+|-------|-------------|-------------|-------|------|
+| qwen  | 9/10 = 0.90 | 40s | `0.90 × 1/40 × 100` = **2.25** | 1st |
+| gemma | 3/10 = 0.30 | 20s | `0.30 × 1/20 × 100` = **1.50** | 2nd |
+
+qwen runs first despite being 2× slower — reliability outweighs raw speed. You see the result in
+the run log: `bob: tier='medium' chain (ranked by stats): [qwen, gemma]`. A flaky or dead model
+sinks on its own; a fast reliable one floats up. An **unseen** model is neutral (success_rate 0.5,
+assumed 45s latency → score ≈ 1.1), so it's tried but not blindly trusted.
+
+Two more stat-driven behaviors fall out of the same data:
+- **Adaptive timeout** = `2 × avg_latency`, clamped to `[30s, 180s]`. It only ever *raises* your
+  configured `timeout_secs` for a known-slow model — never lowers it.
+- **Health check** — a ~3s endpoint ping before a local model is attempted, so a down endpoint is
+  skipped instead of burning the timeout.
+
+**Steering it.** Priority is *learned*, not weighted — there's no per-model priority knob today.
+To influence it: set the *tier* a model lives in, put your preferred model *first* in the tier list
+(wins cold-start and ties), or **reset history** by deleting `.bob/model-stats.json` (bob rebuilds
+it from scratch). Inspect current standings with `cat .bob/model-stats.json`.
+
 **Guardrails.** bob enforces several from `bob.yaml`, with task-local CLI/MCP overrides:
 - **Verify gates** (`verify.cmds`) are your extensible guardrail — *any* shell command that
   must pass. Add lints/scanners/policy checks: `["cargo test", "cargo clippy -- -D warnings",
