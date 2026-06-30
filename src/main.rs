@@ -197,9 +197,15 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Stats => {
-            let stats = model_stats::StatsStore::load();
-            stats.print_summary();
+        Command::Stats { reset } => {
+            if reset {
+                match model_stats::StatsStore::reset() {
+                    Some(p) => println!("reset: removed {} — rankings back to cold start", p.display()),
+                    None => println!("nothing to reset (.bob/model-stats.json not found)"),
+                }
+            } else {
+                model_stats::StatsStore::load().print_summary();
+            }
             Ok(())
         }
     }

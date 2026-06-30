@@ -94,5 +94,9 @@ pub enum Command {
         file: PathBuf,
     },
     /// Show model performance stats (latency, success rate, adaptive ranking).
-    Stats,
+    Stats {
+        /// Delete .bob/model-stats.json, resetting all learned rankings to cold start.
+        #[arg(long)]
+        reset: bool,
+    },
 }

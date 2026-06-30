@@ -231,10 +231,21 @@ Two more stat-driven behaviors fall out of the same data:
 - **Health check** — a ~3s endpoint ping before a local model is attempted, so a down endpoint is
   skipped instead of burning the timeout.
 
+**Inspect & reset.** `bob stats` prints the current standings (runs, success %, avg/last latency,
+score), sorted by score:
+
+```
+model                                          runs  succ%    avg_s   last_s  score
+ollama/Intel/Qwen3-Coder-Next-int4-AutoRound      10    90%    40.0s    38.2s    2.3
+192.168.1.133/cyankiwi/gemma-4-26B-...            10    30%    20.0s    21.1s    1.5
+```
+
+`bob stats --reset` deletes `.bob/model-stats.json` so rankings start cold again.
+
 **Steering it.** Priority is *learned*, not weighted — there's no per-model priority knob today.
 To influence it: set the *tier* a model lives in, put your preferred model *first* in the tier list
-(wins cold-start and ties), or **reset history** by deleting `.bob/model-stats.json` (bob rebuilds
-it from scratch). Inspect current standings with `cat .bob/model-stats.json`.
+(wins cold-start and ties), or `bob stats --reset` to wipe history (e.g. after fixing a flaky
+endpoint that unfairly tanked a model's score).
 
 **Guardrails.** bob enforces several from `bob.yaml`, with task-local CLI/MCP overrides:
 - **Verify gates** (`verify.cmds`) are your extensible guardrail — *any* shell command that

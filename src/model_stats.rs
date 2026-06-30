@@ -130,6 +130,17 @@ impl StatsStore {
         PathBuf::from(".bob/model-stats.json")
     }
 
+    /// Delete the stats file, resetting all learned rankings to cold start.
+    /// Returns the removed path, or None if there was nothing to reset.
+    pub fn reset() -> Option<PathBuf> {
+        let path = Self::path();
+        if path.exists() && std::fs::remove_file(&path).is_ok() {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
     pub fn get(&self, model: &str) -> &ModelStats {
         self.models.get(model).unwrap_or(&FALLBACK_STATS)
     }
