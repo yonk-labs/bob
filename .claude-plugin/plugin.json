@@ -1,7 +1,7 @@
 {
   "name": "bob",
   "displayName": "Bob",
-  "version": "0.1.0",
+  "version": "0.2.13",
   "description": "Delegate a build task to bob — an autonomous build→verify→judge loop that drives opencode + abe in an isolated worktree, gated on your tests. Exposes a `build` MCP tool, /bob:build, and a delegation skill.",
   "author": {
     "name": "yonk-labs",
