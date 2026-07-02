@@ -300,6 +300,16 @@ fn extract_path_delimiter(line: &str) -> Option<String> {
 ///
 /// Install: `curl -fsSL https://github.com/block/goose/releases/latest/download/install.sh | bash`
 /// Configure: strip to single extension (developer) + tiny_model_system.md
+/// Derive goose's `OPENAI_HOST` (host only) from a full base URL. goose appends
+/// `OPENAI_BASE_PATH` (default `v1/chat/completions`), so the host must NOT carry
+/// a trailing `/v1` or slash — otherwise the request path doubles to `/v1/v1/…`.
+/// Trims a trailing slash first so a user-written `…/v1/` normalizes the same as
+/// `…/v1`. Works for local vLLM (`http://host:8000/v1`) and OpenAI cloud
+/// (`https://api.openai.com/v1` → `https://api.openai.com`) alike.
+fn openai_host(url: &str) -> &str {
+    url.trim_end_matches('/').trim_end_matches("/v1").trim_end_matches('/')
+}
+
 pub struct GooseBuilder {
     pub cmd: String,
     pub model: String,
@@ -307,6 +317,9 @@ pub struct GooseBuilder {
     pub provider: String,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    /// Set GOOSE_TOOLSHIM=true — interpret tool calls from plain-text output when
+    /// the endpoint can't return structured tool_calls (see builder.goose_toolshim).
+    pub toolshim: bool,
 }
 
 impl Builder for GooseBuilder {
@@ -329,10 +342,22 @@ impl Builder for GooseBuilder {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        // Set OPENAI_BASE_URL / OPENAI_API_KEY for local endpoints
+        // Point goose at the local endpoint. goose's `openai` provider reads
+        // OPENAI_HOST (host only, no /v1 — it appends OPENAI_BASE_PATH), NOT
+        // OPENAI_BASE_URL. Setting only the latter silently targets api.openai.com,
+        // every request fails auth, goose makes no tool calls, and bob reports an
+        // empty diff with no error. Set both: HOST for goose, BASE_URL for others.
         if let Some(url) = &self.base_url {
+            cmd.env("OPENAI_HOST", openai_host(url));
             cmd.env("OPENAI_BASE_URL", url);
             cmd.env("OPENAI_API_KEY", self.api_key.as_deref().unwrap_or("local"));
+        }
+
+        // Interpret tool calls from plain-text output when the server can't return
+        // structured tool_calls. Opt-in via builder.goose_toolshim (env still wins
+        // if the operator sets GOOSE_TOOLSHIM directly).
+        if self.toolshim {
+            cmd.env("GOOSE_TOOLSHIM", "true");
         }
 
         // Point goose's rolling log file at a writable temp dir. We run with
@@ -481,6 +506,19 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openai_host_strips_v1_for_local_and_cloud() {
+        // local vLLM
+        assert_eq!(openai_host("http://192.168.1.193:8000/v1"), "http://192.168.1.193:8000");
+        // user-written trailing slash must not double the /v1
+        assert_eq!(openai_host("http://host:8000/v1/"), "http://host:8000");
+        // OpenAI cloud
+        assert_eq!(openai_host("https://api.openai.com/v1"), "https://api.openai.com");
+        // already host-only (no /v1) — unchanged
+        assert_eq!(openai_host("http://host:8000"), "http://host:8000");
+        assert_eq!(openai_host("https://api.openai.com"), "https://api.openai.com");
+    }
 
     #[test]
     fn parse_delimited_files() {

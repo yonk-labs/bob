@@ -537,14 +537,27 @@ fn model_label(model: &Option<String>) -> String {
         .unwrap_or_else(|| "(opencode default)".to_string())
 }
 
+/// True when a bare model id begins with a routing prefix we know how to strip
+/// (a provider token or a local host), as opposed to an HF-style id where the
+/// leading segment is part of the model name itself.
+fn has_provider_prefix(model_id: &str) -> bool {
+    model_id.starts_with("ollama/")
+        || model_id.starts_with("192.168.1.")
+        || model_id.starts_with("minimax")
+        || model_id.starts_with("zai")
+}
+
 /// Extract the model name (without provider prefix) for API calls.
 /// "ollama/Intel/Qwen3..." → "Intel/Qwen3..."
 /// "192.168.1.133/cyankiwi/gemma..." → "cyankiwi/gemma..."
+/// "Intel/Qwen3-Coder-Next-int4-AutoRound" → unchanged (HF id, no provider prefix)
 fn extract_model_name(model_id: &str) -> String {
-    if let Some(pos) = model_id.find('/') {
-        model_id[pos + 1..].to_string()
-    } else {
-        model_id.to_string()
+    match model_id.find('/') {
+        // Only strip the leading segment when it's a known provider/host prefix.
+        // Bare HF ids (e.g. "Intel/Qwen3…") contain a '/' but the prefix is part
+        // of the model name — stripping it 404s the endpoint (silent empty diff).
+        Some(pos) if has_provider_prefix(model_id) => model_id[pos + 1..].to_string(),
+        _ => model_id.to_string(),
     }
 }
 
@@ -863,6 +876,7 @@ pub async fn run_opencode_with_fallbacks(
                     timeout: builder_timeout,
                     base_url: Some(base_url),
                     api_key,
+                    toolshim: cfg.builder.goose_toolshim,
                 })
             }
             _ => crate::builder::BuilderKind::Opencode(crate::builder::Opencode {
@@ -1205,6 +1219,23 @@ mod decision_tests {
         // orchestration failures should NOT escalate (next model won't help)
         assert!(!esc("failed to create worktree"));
         assert!(!esc("git checkout failed"));
+    }
+
+    #[test]
+    fn extract_model_name_preserves_hf_ids_but_strips_provider_prefixes() {
+        // HF-style ids: the leading segment is part of the model name — keep it.
+        assert_eq!(
+            extract_model_name("Intel/Qwen3-Coder-Next-int4-AutoRound"),
+            "Intel/Qwen3-Coder-Next-int4-AutoRound"
+        );
+        assert_eq!(extract_model_name("mlx-community/Qwen3-Coder-Next-4bit"),
+            "mlx-community/Qwen3-Coder-Next-4bit");
+        // Known provider/host prefixes: strip the first segment.
+        assert_eq!(extract_model_name("ollama/Intel/Qwen3"), "Intel/Qwen3");
+        assert_eq!(extract_model_name("192.168.1.133/cyankiwi/gemma"), "cyankiwi/gemma");
+        assert_eq!(extract_model_name("zai-coding-plan/glm-5.2"), "glm-5.2");
+        // No slash at all: unchanged.
+        assert_eq!(extract_model_name("qwen"), "qwen");
     }
 
     #[test]
@@ -1574,6 +1605,7 @@ mod flow_tests {
                 reliability_weight: 0.5,
                 pin: vec![],
                 exclude: vec![],
+                goose_toolshim: false,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -1656,6 +1688,7 @@ mod flow_tests {
                 reliability_weight: 0.5,
                 pin: vec![],
                 exclude: vec![],
+                goose_toolshim: false,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -1744,6 +1777,7 @@ mod flow_tests {
                 reliability_weight: 0.5,
                 pin: vec![],
                 exclude: vec![],
+                goose_toolshim: false,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
