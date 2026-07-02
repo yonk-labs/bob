@@ -434,6 +434,58 @@ Alternative: brew install anomalyco/tap/opencode
   after a critique (stuck), the same verify failure repeated, the judge policy rejected it,
   or the diff exceeded scope caps.
 
+## Self-hosted / local models
+
+Running the goose builder against your own OpenAI-compatible endpoint (vLLM, MLX
+server, ollama) works, but a few requirements aren't obvious. Most failures show
+up as a single silent symptom: `NOT CONVERGED … EmptyDiffAfterCritique`. That
+almost always means **the builder never made a tool call** — no edits, empty
+diff. Check these in order:
+
+1. **The endpoint must return structured `tool_calls`.** goose acts only on
+   OpenAI-style structured tool calls; a server that emits the call as *text*
+   produces an empty diff. Pre-flight a server before trusting it:
+   ```bash
+   curl -s $HOST/v1/chat/completions -d '{"model":"…","messages":[{"role":"user","content":"Create hello.txt containing hello. Use the write tool."}],"tools":[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]}' | jq '.choices[0].message.tool_calls'
+   ```
+   If that `tool_calls` is `null`, structured tool-calling isn't reaching goose —
+   see the remedies below. Grammar-constrained / dedicated-parser servers (vLLM
+   with a tool-call parser ✅, MLX server ✅) are the reliable choice. Ollama is
+   template-driven: it only extracts `tool_calls` when the chat template selects a
+   parser for that model/build (check its log's `template selection` line for a
+   non-empty `parser=`), and it has streaming gaps with tools — prefer
+   `stream:false`. The pre-flight curl catches every variant regardless of cause.
+   If the server can't return structured calls, set `GOOSE_TOOLSHIM=true` (below).
+2. **`GOOSE_TOOLSHIM=true` — text-output fallback.** Makes goose interpret tool
+   calls from plain-text output, so a parser-less server works with no server or
+   model change (adds an interpretation step per call). Enable it in `bob.yaml`:
+   ```yaml
+   builder:
+     goose_toolshim: true      # sets GOOSE_TOOLSHIM=true for the goose builder
+   ```
+   or ad hoc: `GOOSE_TOOLSHIM=true bob build …` (bob inherits the environment).
+3. **Use a tool-calling *coder* model.** Qwen3-Coder-Next is verified. Thinking-mode
+   generalists (gemma-family, qwen-thinking) route everything to the reasoning
+   channel over OpenAI-compat and return empty content unless thinking is disabled
+   server-side — same empty-diff symptom.
+4. **HF-style ids (with a `/`) need the roster Full form.** A bare tier string like
+   `Intel/Qwen3-Coder-Next-int4-AutoRound` is passed through intact as `--model`,
+   but bob can't derive its `base_url` from the id. Give it the endpoint explicitly:
+   ```yaml
+   builder:
+     cmd: goose
+     models:
+       qwenc:
+         model: "Intel/Qwen3-Coder-Next-int4-AutoRound"
+         base_url: "http://192.168.1.193:8000/v1"
+     tiers:
+       cheap: ["qwenc"]
+       cheap_builder: goose
+   ```
+5. **Judge note.** `judge.policy: advisory` with abe not installed proceeds to
+   apply/candidate (`JudgeUnavailable → Apply`) and logs a `judge-unavailable`
+   line in the iteration artifacts — that line is advice, not the stop reason.
+
 ## Known limitations
 
 - Builder/judge invocation assumes `opencode`/`abe` conventions (`run --dir`, positional

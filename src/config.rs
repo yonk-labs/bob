@@ -65,6 +65,12 @@ pub struct BuilderCfg {
     /// tier chain. A hard "don't use this" override.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Set GOOSE_TOOLSHIM=true for the goose builder — makes goose interpret tool
+    /// calls out of plain-text model output. Needed when the serving stack can't
+    /// return structured `tool_calls` (parser-less Ollama, custom templates);
+    /// otherwise goose makes no edits and bob reports EmptyDiffAfterCritique.
+    #[serde(default)]
+    pub goose_toolshim: bool,
 }
 
 fn default_reliability_weight() -> f64 {
