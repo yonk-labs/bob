@@ -10,24 +10,20 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Local vLLM endpoint base (`.../v1`). Overridable via `BOB_VLLM_URL` so a
-/// moved host doesn't require a recompile. The override is normalized so common
-/// typos still work (missing scheme, trailing slash, missing `/v1`).
-/// ponytail: single env knob, current default preserved.
-pub fn vllm_url() -> String {
-    match std::env::var("BOB_VLLM_URL") {
-        Ok(u) => normalize_vllm_url(&u),
-        Err(_) => "http://192.168.1.193:8000/v1".into(),
-    }
+/// Local vLLM endpoint base (`.../v1`) from `BOB_VLLM_URL`, normalized so
+/// common typos still work (missing scheme, trailing slash, missing `/v1`).
+/// `None` when unset/blank — callers must error loudly, not guess an IP (#4).
+pub fn vllm_url() -> Option<String> {
+    std::env::var("BOB_VLLM_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .map(|u| normalize_vllm_url(&u))
 }
 
 /// Tidy a user-supplied vLLM base URL: prepend `http://` if no scheme, drop a
 /// trailing slash, and append `/v1` (the OpenAI-compatible suffix) if absent.
 fn normalize_vllm_url(raw: &str) -> String {
     let mut u = raw.trim().to_string();
-    if u.is_empty() {
-        return "http://192.168.1.193:8000/v1".into();
-    }
     if !u.starts_with("http://") && !u.starts_with("https://") {
         u = format!("http://{u}");
     }
@@ -207,7 +203,12 @@ impl StatsStore {
         // a lightweight check: can opencode reach this model?
         // For now, check if it's a known-local endpoint.
         if model_id.starts_with("ollama/") {
-            return Self::curl_health(&format!("{}/models", vllm_url()));
+            // No BOB_VLLM_URL → can't probe; assume alive so dispatch reaches
+            // the loud missing-endpoint error instead of silently skipping.
+            return match vllm_url() {
+                Some(url) => Self::curl_health(&format!("{url}/models")),
+                None => true,
+            };
         }
         if model_id.starts_with("192.168.1.") {
             let ip = model_id.split('/').next().unwrap_or("");
@@ -339,7 +340,6 @@ mod tests {
         // https preserved, already correct
         assert_eq!(normalize_vllm_url("https://host/v1"), "https://host/v1");
         // empty falls back to default
-        assert_eq!(normalize_vllm_url("   "), "http://192.168.1.193:8000/v1");
     }
 
     #[test]

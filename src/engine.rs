@@ -561,23 +561,33 @@ fn extract_model_name(model_id: &str) -> String {
     }
 }
 
-/// Extract base_url from a model id for the thin builder.
-/// "ollama/Intel/Qwen3..." → "http://192.168.1.193:8000/v1"
+/// Extract base_url from a model id for the thin builder. `vllm` is the
+/// `BOB_VLLM_URL`-derived local endpoint (injected for testability).
+/// "ollama/Intel/Qwen3..." → local vLLM (needs BOB_VLLM_URL)
 /// "192.168.1.133/cyankiwi/..." → "http://192.168.1.133:8000/v1"
-/// "zai-coding-plan/glm-5.2" → (cloud, needs env-based URL)
-fn extract_base_url(model_id: &str) -> String {
+/// "zai-coding-plan/glm-5.2" → cloud URL
+/// Anything else with no vLLM env is an error — never guess an endpoint (#4).
+fn extract_base_url(model_id: &str, vllm: Option<&str>) -> anyhow::Result<String> {
+    let need_vllm = || {
+        vllm.map(String::from).ok_or_else(|| {
+            anyhow::anyhow!(
+                "model id '{model_id}' has no endpoint — give it a base_url under \
+                 builder.models, or set BOB_VLLM_URL for local vLLM"
+            )
+        })
+    };
     if model_id.starts_with("ollama/") {
-        crate::model_stats::vllm_url()
+        need_vllm()
     } else if model_id.starts_with("192.168.1.") {
-        let ip = model_id.split('/').next().unwrap_or("192.168.1.193");
-        format!("http://{ip}:8000/v1")
+        let ip = model_id.split('/').next().unwrap_or(model_id);
+        Ok(format!("http://{ip}:8000/v1"))
     } else if model_id.starts_with("minimax") {
-        "https://api.minimax.io/v1".into()
+        Ok("https://api.minimax.io/v1".into())
     } else if model_id.starts_with("zai") {
-        "https://api.z.ai/api/paas/v4".into()
+        Ok("https://api.z.ai/api/paas/v4".into())
     } else {
-        // Fallback: assume local vLLM (env-overridable).
-        crate::model_stats::vllm_url()
+        // Bare id (e.g. an HF id served by local vLLM): env-set only.
+        need_vllm()
     }
 }
 
@@ -589,11 +599,11 @@ fn resolve_endpoint(
     cfg: &Config,
     sel: Option<&str>,
     model_id: &str,
-) -> (String, String, Option<String>) {
-    let base_url = cfg
-        .builder
-        .entry_base_url(sel)
-        .unwrap_or_else(|| extract_base_url(model_id));
+) -> anyhow::Result<(String, String, Option<String>)> {
+    let base_url = match cfg.builder.entry_base_url(sel) {
+        Some(url) => url,
+        None => extract_base_url(model_id, crate::model_stats::vllm_url().as_deref())?,
+    };
     let api_model = cfg
         .builder
         .entry_api_model(sel)
@@ -603,7 +613,7 @@ fn resolve_endpoint(
         .entry_api_key_env(sel)
         .or_else(|| extract_api_key_env(model_id))
         .and_then(|env| std::env::var(&env).ok());
-    (base_url, api_model, api_key)
+    Ok((base_url, api_model, api_key))
 }
 
 /// Extract the env var name for the API key (if any) from a model id.
@@ -858,7 +868,7 @@ pub async fn run_opencode_with_fallbacks(
         let builder: crate::builder::BuilderKind = match builder_kind {
             "thin" => {
                 let (base_url, api_model, api_key) =
-                    resolve_endpoint(cfg, model_sel.as_deref(), model_id);
+                    resolve_endpoint(cfg, model_sel.as_deref(), model_id)?;
                 crate::builder::BuilderKind::Thin(crate::builder::ThinBuilder {
                     model_id: api_model,
                     base_url,
@@ -868,7 +878,7 @@ pub async fn run_opencode_with_fallbacks(
             }
             "goose" => {
                 let (base_url, api_model, api_key) =
-                    resolve_endpoint(cfg, model_sel.as_deref(), model_id);
+                    resolve_endpoint(cfg, model_sel.as_deref(), model_id)?;
                 crate::builder::BuilderKind::Goose(crate::builder::GooseBuilder {
                     cmd: "goose".to_string(),
                     model: api_model,
@@ -1236,6 +1246,42 @@ mod decision_tests {
         assert_eq!(extract_model_name("zai-coding-plan/glm-5.2"), "glm-5.2");
         // No slash at all: unchanged.
         assert_eq!(extract_model_name("qwen"), "qwen");
+    }
+
+    #[test]
+    fn extract_base_url_errors_on_unknown_bare_ids_instead_of_guessing() {
+        // Bare id, no vLLM env: error with remediation, not a silent LAN-IP guess.
+        let err = extract_base_url("SomeOrg/unknown-model", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SomeOrg/unknown-model"));
+        assert!(err.contains("builder.models"));
+        assert!(err.contains("BOB_VLLM_URL"));
+        // ollama/ routes to local vLLM — no env means the same loud error.
+        assert!(extract_base_url("ollama/Intel/Qwen3", None).is_err());
+        // With the env set, both keep resolving to it (existing workflows unchanged).
+        let vllm = Some("http://h:8000/v1");
+        assert_eq!(
+            extract_base_url("ollama/Intel/Qwen3", vllm).unwrap(),
+            "http://h:8000/v1"
+        );
+        assert_eq!(
+            extract_base_url("Intel/Qwen3-Coder", vllm).unwrap(),
+            "http://h:8000/v1"
+        );
+        // Id-derived and cloud endpoints never need the env.
+        assert_eq!(
+            extract_base_url("192.168.1.133/cyankiwi/gemma", None).unwrap(),
+            "http://192.168.1.133:8000/v1"
+        );
+        assert_eq!(
+            extract_base_url("zai-coding-plan/glm-5.2", None).unwrap(),
+            "https://api.z.ai/api/paas/v4"
+        );
+        assert_eq!(
+            extract_base_url("minimax-coding-plan/m3", None).unwrap(),
+            "https://api.minimax.io/v1"
+        );
     }
 
     #[test]

@@ -104,11 +104,12 @@ If `bob doctor` reports opencode missing, the installer suggests the above optio
 **Tier builders & local endpoints.** Tiers pick the builder: `cheap` → thin
 (direct curl, single-shot), `medium`/`large` → goose (agent loop), `frontier` →
 opencode. The thin and goose builders talk to an OpenAI-compatible endpoint; for
-local models (model ids prefixed `ollama/` or a `192.168.x.x/…` host) the base URL
-defaults to a local vLLM server. Override it with `BOB_VLLM_URL` (e.g.
+local models the base URL comes from the model's `base_url` roster entry, from a
+`192.168.x.x/…` host prefix in the id, or from `BOB_VLLM_URL` (e.g.
 `export BOB_VLLM_URL=http://your-host:8000/v1` — scheme and `/v1` are added if you
-omit them). Cloud ids (`minimax…`, `zai…`) use their provider URL and read the
-matching `*_API_KEY` env var.
+omit them). A bare or `ollama/`-prefixed id with none of those is an error — bob
+never guesses an endpoint. Cloud ids (`minimax…`, `zai…`) use their provider URL
+and read the matching `*_API_KEY` env var.
 
 ## Quick start — interactive installer
 
@@ -150,7 +151,7 @@ builder:
     qwen:    ollama/Intel/Qwen3-Coder-Next-int4-AutoRound   # legacy form: provider/model id
     # Explicit form (same shape as hector.yaml / abe.yaml) — gives the thin/goose
     # builders an exact endpoint instead of guessing from the id prefix:
-    local:   { model: "Intel/Qwen3-...", base_url: "http://192.168.1.193:8000/v1" }
+    local:   { model: "Intel/Qwen3-...", base_url: "http://your-vllm-host:8000/v1" }
     minimax: { model: "MiniMax-M3", base_url: "https://api.minimax.io/v1", api_key_env: MINIMAX_API_KEY }
   fallback_models: []     # roster aliases or raw ids; example ["minimax"] resolves above
   args: []                # extra opencode flags (not the model), e.g. ["--variant", "high"]
@@ -477,7 +478,7 @@ diff. Check these in order:
      models:
        qwenc:
          model: "Intel/Qwen3-Coder-Next-int4-AutoRound"
-         base_url: "http://192.168.1.193:8000/v1"
+         base_url: "http://your-vllm-host:8000/v1"
      tiers:
        cheap: ["qwenc"]
        cheap_builder: goose
