@@ -596,6 +596,14 @@ pub fn should_try_next_model(res: &RunResult) -> bool {
 
 fn should_try_next_model_after_error(err: &anyhow::Error) -> bool {
     let s = err.to_string();
+    // worktree.setup_cmds failures are INFRA errors regardless of what their
+    // stderr contains — a setup cmd installing deps can easily emit "timed out"
+    // or "builder", which would otherwise match the per-model vocabulary below
+    // and escalate through every model (recording false failures in model_stats)
+    // for an error no model can fix. Same sentinel prefix run_setup_cmds emits.
+    if s.contains("worktree setup cmd") {
+        return false;
+    }
     // A builder that timed out, crashed, failed to spawn, or errored at the model
     // API is a *per-model* failure — escalate to the next model/tier rather than
     // killing the whole run. Match every builder's error vocabulary, not just
@@ -1476,6 +1484,12 @@ mod decision_tests {
         // escalate to the next model as if it were a builder failure.
         assert!(!esc(
             "worktree setup cmd failed: ln -sfn \"$BOB_REPO_ROOT/node_modules\" node_modules\n--- stderr ---\nln: failed"
+        ));
+        // ...even when the setup cmd's stderr contains the per-model builder
+        // vocabulary ("timed out", "builder", ...) — e.g. a dep install that
+        // hit the network. No model can fix a setup cmd; never escalate.
+        assert!(!esc(
+            "worktree setup cmd failed: npm ci\n--- stderr ---\nnpm ERR! network Connection timed out\nnpm ERR! builder-tools@1.0.0 fetch failed"
         ));
     }
 

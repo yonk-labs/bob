@@ -195,7 +195,17 @@ impl Workspace {
             &["worktree", "add", "-b", &branch, &dir_str, &base_sha],
             &cwd,
         )?;
-        run_setup_cmds(setup_cmds, &dir, &cwd)?;
+        // On setup failure, remove the worktree AND the bob/<run_id> branch —
+        // a fresh checkout that never ran a builder has nothing worth keeping
+        // (the failing cmd's stderr is already in the error), and leaked
+        // branches otherwise accumulate until `bob gc`. Mirrors the replay
+        // path's cleanup above.
+        if let Err(e) = run_setup_cmds(setup_cmds, &dir, &cwd) {
+            let _ = git(&["worktree", "remove", "--force", &dir_str], &cwd);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = git(&["branch", "-D", &branch], &cwd);
+            return Err(e);
+        }
         Ok(Workspace {
             repo: cwd,
             dir,
@@ -554,6 +564,21 @@ mod tests {
             "error names the failing cmd: {msg}"
         );
         assert!(msg.contains("boom-stderr"), "error carries stderr: {msg}");
+        // No leaked artifacts: the fresh worktree and its bob/<run_id> branch
+        // are removed (a checkout that never ran a builder has no value).
+        assert!(
+            !tmp.join(".bob").join("worktrees").join("setup-fail").exists(),
+            "worktree removed on setup failure"
+        );
+        let branches = Command::new("git")
+            .args(["branch", "--list", "bob/setup-fail"])
+            .current_dir(&tmp)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "bob/setup-fail branch removed on setup failure"
+        );
 
         std::env::set_current_dir(prev).unwrap();
     }
