@@ -60,7 +60,16 @@ fn freeze_untracked_test_files(workdir: &Path) {
     }
 }
 
-fn reset_test_files(workdir: &Path, base_sha: &str) {
+/// Boundary-aware prefix match, same semantics as scope::check's allowlist:
+/// `src` allows `src/x` and `src` itself, but NOT `src2/x`.
+fn path_allowed(path: &str, allow: &[String]) -> bool {
+    allow.iter().any(|p| {
+        let p = p.trim_end_matches('/');
+        path == p || path.starts_with(&format!("{p}/"))
+    })
+}
+
+fn reset_test_files(workdir: &Path, base_sha: &str, editable_paths: &[String]) -> Vec<String> {
     let mut test_files: Vec<String> = Vec::new();
 
     // Find tracked test files that differ from base_sha (the model modified them)
@@ -70,14 +79,16 @@ fn reset_test_files(workdir: &Path, base_sha: &str) {
         .output()
     {
         for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if is_test_path(line) {
+            // Test files the caller explicitly allow-listed are the task's
+            // deliverable, not a frozen contract — leave them alone.
+            if is_test_path(line) && !path_allowed(line, editable_paths) {
                 test_files.push(line.to_string());
             }
         }
     }
 
     if test_files.is_empty() {
-        return;
+        return test_files;
     }
 
     eprintln!(
@@ -94,6 +105,7 @@ fn reset_test_files(workdir: &Path, base_sha: &str) {
             .current_dir(workdir)
             .status();
     }
+    test_files
 }
 
 #[derive(Debug)]
@@ -335,6 +347,7 @@ pub struct RunResult {
     pub verify: Option<VerifySnapshot>,
     pub judge: Option<JudgeSnapshot>,
     pub builder: BuilderSnapshot,
+    pub reset_test_files: Vec<String>,
 }
 
 fn load_project_lessons() -> anyhow::Result<Option<String>> {
@@ -410,6 +423,12 @@ fn build_prompt(opts: &RunOpts, critique: Option<&str>, lessons: Option<&str>) -
         p.push_str("\n## EDITABLE PATHS\n");
         for path in &opts.editable_paths {
             p.push_str(&format!("- {path}\n"));
+        }
+        if opts.editable_paths.iter().any(|p| is_test_path(p)) {
+            p.push_str(
+                "\nEXCEPTION: test files listed under EDITABLE PATHS are part of this task's \
+                 deliverable — you MAY modify them. All other test files remain frozen.\n",
+            );
         }
     }
     if !opts.context_files.is_empty() {
@@ -996,6 +1015,7 @@ pub async fn run(
         failure_kind: String::new(),
         fallbacks_tried: vec![],
     };
+    let mut reset_files: std::collections::BTreeSet<String> = Default::default();
 
     // Freeze untracked test files BEFORE the builder loop starts. These files
     // were created by hector but never committed. If we don't freeze them now,
@@ -1028,7 +1048,9 @@ pub async fn run(
         // Discard any test-file changes the model made. Bob may only edit
         // production code. If the model modified or created test files, revert
         // them so the scope check and verify gate see only src/ changes.
-        reset_test_files(ws.path(), ws.base_sha());
+        for f in reset_test_files(ws.path(), ws.base_sha(), &opts.editable_paths) {
+            reset_files.insert(f);
+        }
 
         let diff = ws.capture_diff()?;
         final_diff = diff.clone();
@@ -1200,6 +1222,7 @@ pub async fn run(
         verify: last_verify,
         judge: last_judge,
         builder: builder_snapshot,
+        reset_test_files: reset_files.into_iter().collect(),
     };
     if should_keep_worktree(opts.keep_worktree, status) {
         eprintln!("worktree preserved at {}", ws.path().display());
@@ -1320,6 +1343,34 @@ mod decision_tests {
         let judge_spec = spec_with_lessons(&opts.spec, Some("- Keep API shape stable."));
         assert!(judge_spec.contains("fix the route"));
         assert!(judge_spec.contains("Keep API shape stable"));
+    }
+
+    #[test]
+    fn path_allowed_is_boundary_aware() {
+        let allow = vec!["core/".to_string(), "src".to_string()];
+        assert!(path_allowed("core/ai.test.ts", &allow));
+        assert!(path_allowed("src/x.rs", &allow));
+        assert!(path_allowed("src", &allow));
+        assert!(!path_allowed("src2/x.rs", &allow));
+        assert!(!path_allowed("other/y.rs", &allow));
+    }
+
+    #[test]
+    fn prompt_relaxes_test_freeze_for_editable_test_paths() {
+        let mk = |paths: Vec<String>| RunOpts {
+            spec: "s".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "r".into(),
+            builder_model: None,
+            editable_paths: paths,
+            tier: None,
+        };
+        let p = build_prompt(&mk(vec!["core/ai.test.ts".into()]), None, None);
+        assert!(p.contains("EXCEPTION"));
+        let p = build_prompt(&mk(vec!["src/lib.rs".into()]), None, None);
+        assert!(!p.contains("EXCEPTION"));
     }
 
     #[test]
@@ -1529,6 +1580,7 @@ assert!(matches!(
                 failure_kind: "ok".into(),
                 fallbacks_tried: vec![],
             },
+            reset_test_files: vec![],
         };
         assert!(should_try_next_model(&res));
         res.stop_reason = Some(StopReason::ScopeExceeded);

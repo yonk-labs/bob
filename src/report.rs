@@ -24,6 +24,7 @@ pub fn to_json(res: &RunResult) -> String {
         "applied": res.applied,
         "stop_reason": reason,
         "changed_files": &res.changed_files,
+        "reset_test_files": &res.reset_test_files,
         "scope": res.scope.as_ref().map(|s| serde_json::json!({
             "within": s.within,
             "files": s.files,
@@ -127,6 +128,7 @@ mod tests {
                 failure_kind: "ok".into(),
                 fallbacks_tried: vec!["qwen: EmptyDiffAfterCritique".into()],
             },
+            reset_test_files: vec![],
         };
         let j = to_json(&res);
         assert!(j.contains("\"status\":\"needs_review\""));
@@ -177,6 +179,7 @@ mod tests {
                 failure_kind: "ok".into(),
                 fallbacks_tried: vec![],
             },
+            reset_test_files: vec![],
         };
         assert!(to_json(&mk(RunStatus::Converged, NextAction::Done)).contains("\"status\":\"converged\""));
         assert!(to_json(&mk(RunStatus::NeedsReview, NextAction::ReviewCandidate))
