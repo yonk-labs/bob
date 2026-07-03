@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     // exist). Catches opencode from prior runs whose parent bob was SIGKILLed.
     let _ = builder::reap_orphans();
     match args.command {
-        Command::Doctor => doctor::run(),
+        Command::Doctor { probe } => doctor::run(probe),
         Command::Models => {
             let cfg = config::Config::load(args.config.as_deref())?;
             let default = cfg.builder.model.as_deref();
