@@ -1,5 +1,7 @@
 builder:
-  cmd: opencode
+  cmd: opencode           # optional when `tiers:` (below) has any entries — tiers already pick
+                          # a builder per tier, so `cmd` defaults to "goose" in that case.
+                          # Required (no default) when no tiers are configured.
   timeout_secs: 600
   model: qwen             # default: a name from `models` below, or a raw provider/model id.
                           # omit entirely to use opencode's own default model.
@@ -18,6 +20,12 @@ verify:
   cmds:                   # objective gate(s) — your guardrails. ALL must pass.
     - cargo test          #   add lints/scanners here too, e.g. "cargo clippy -- -D warnings"
                           # empty list = no gate (converges on first diff; warned)
+  replay: true            # re-run cmds against a fresh worktree before reporting converged
+  focused_cmds: []        # optional fast gate(s) run PER-ITERATION instead of cmds, e.g.
+                          #   ["cargo check", "cargo test --lib fast_case"]. cmds still runs
+                          # in full at replay-verify and gates the run — this only speeds up
+                          # the in-loop build/verify cycle. Ignored (full cmds run instead,
+                          # with a warning) unless replay: true AND cmds is non-empty.
 loop:
   max_iterations: 3
   max_walltime_secs: 1800
@@ -28,3 +36,11 @@ scope:
 apply: false
 artifacts:
   dir: .bob/runs
+worktree:
+  setup_cmds: []          # run once, in order, in each FRESH worktree (build worktree
+                          # and replay-verify scratch worktree) — before iteration 0,
+                          # before replay verify, never in the main tree. `BOB_REPO_ROOT`
+                          # is exported to the main repo root. A failing cmd aborts the
+                          # run as an infra error (not a builder/judge failure).
+                          # example: JS repos need node_modules in the worktree —
+                          #   setup_cmds: ['ln -sfn "$BOB_REPO_ROOT/node_modules" node_modules']

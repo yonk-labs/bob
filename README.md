@@ -29,6 +29,34 @@ back into the builder.
 
 ---
 
+## What's new in 0.4.0
+
+- **`worktree.setup_cmds`.** Commands run once in every fresh worktree (build, replay,
+  `bob replay`/`bob apply`) before iteration 0 — never in the main tree. `BOB_REPO_ROOT`
+  is exported, so JS repos can `ln -sfn "$BOB_REPO_ROOT/node_modules" node_modules`
+  instead of hand-writing fragile verify-cmd hacks. A failing setup cmd aborts the run
+  as an infra error (no model escalation, not a verify/judge fail).
+- **`bob doctor --probe`.** Curls each distinct configured endpoint (`<base_url>/models`,
+  3s timeout, deduped) and marks DEAD entries with the models/tiers that resolve there —
+  no more silently routing around a dead box without knowing it.
+- **`verify.focused_cmds`.** Opt-in fast per-iteration gate; the full `verify.cmds` still
+  run at replay-verify and gate the run. Cuts two of three full-suite runs per converged
+  run. Ignored (with a warning) unless `replay: true` and `cmds` is non-empty.
+- **`builder.cmd` optional with tiers.** When `tiers:` has entries, `cmd` defaults to
+  `goose` — tiers already pick the builder per tier.
+- **MCP `tier` param.** The MCP `build` tool accepts `tier` like the CLI's `--tier`
+  (an explicit `model` pin is still tried first).
+- **`bob models --json`.** Machine-readable tier→endpoint map (default model/tier,
+  tiers with their model lists, per-model id + explicit `base_url` or null — never
+  guessed). Built for orchestrators: dispatch round-robin across endpoints,
+  escalation-ladder sync, pre-dispatch tier checks.
+- **`verify_start` event.** `events.jsonl` now marks the moment a run enters its
+  verify phase — the unambiguous "builder endpoint is free" signal an orchestrator
+  needs to pipeline the next slice's builder.
+- Doctor also now acknowledges tier-less `cmd: goose` correctly and, for JS repos, warns
+  to exclude `.bob/**` in the test runner (not just `.gitignore`) so kept worktrees don't
+  double your suite.
+
 ## What's new in 0.3.0
 
 - **Replay-verify.** Converged runs now re-apply the final diff to a fresh worktree at

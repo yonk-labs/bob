@@ -1,5 +1,5 @@
 use crate::builder::{Builder, BuilderOutcome};
-use crate::config::{Config, JudgePolicy};
+use crate::config::{Config, JudgePolicy, VerifyCfg};
 use crate::judge::{Abe, Judge, Verdict};
 use crate::scope;
 use crate::verify::run_gates;
@@ -106,6 +106,27 @@ fn reset_test_files(workdir: &Path, base_sha: &str, editable_paths: &[String]) -
             .status();
     }
     test_files
+}
+
+/// Which verify gate set runs THIS iteration, and whether it's the focused
+/// subset. `focused_cmds` is only honored when `replay` is enabled AND `cmds`
+/// is non-empty — those two together are what guarantee the full suite still
+/// gates the run (at replay-verify). Otherwise the full suite must gate every
+/// iteration directly, so focused_cmds is ignored (with a one-line warning).
+fn iteration_verify_cmds(verify: &VerifyCfg) -> (&[String], bool) {
+    if verify.focused_cmds.is_empty() {
+        return (&verify.cmds, false);
+    }
+    if verify.replay && !verify.cmds.is_empty() {
+        (&verify.focused_cmds, true)
+    } else {
+        eprintln!(
+            "bob: verify.focused_cmds is set but ignored this iteration — requires verify.replay=true \
+             and a non-empty verify.cmds (the full suite must gate the run somewhere); running the full \
+             verify.cmds instead"
+        );
+        (&verify.cmds, false)
+    }
 }
 
 #[derive(Debug)]
@@ -575,6 +596,14 @@ pub fn should_try_next_model(res: &RunResult) -> bool {
 
 fn should_try_next_model_after_error(err: &anyhow::Error) -> bool {
     let s = err.to_string();
+    // worktree.setup_cmds failures are INFRA errors regardless of what their
+    // stderr contains — a setup cmd installing deps can easily emit "timed out"
+    // or "builder", which would otherwise match the per-model vocabulary below
+    // and escalate through every model (recording false failures in model_stats)
+    // for an error no model can fix. Same sentinel prefix run_setup_cmds emits.
+    if s.contains("worktree setup cmd") {
+        return false;
+    }
     // A builder that timed out, crashed, failed to spawn, or errored at the model
     // API is a *per-model* failure — escalate to the next model/tier rather than
     // killing the whole run. Match every builder's error vocabulary, not just
@@ -1022,7 +1051,7 @@ pub async fn run(
     }
     let lessons = load_project_lessons()?;
     let art = std::path::Path::new(&cfg.artifacts.dir);
-    let ws = Workspace::create(&opts.run_id)?;
+    let ws = Workspace::create(&opts.run_id, &cfg.worktree.setup_cmds)?;
     let base_sha = ws.base_sha().to_string();
     crate::report::append_event(
         art,
@@ -1119,7 +1148,15 @@ pub async fn run(
             if !sr.within {
                 StepOutcome::scope_exceeded(&sr.detail)
             } else {
-                let vr = run_gates(&cfg.verify.cmds, ws.path());
+                let (iter_verify_cmds, focused) = iteration_verify_cmds(&cfg.verify);
+                // Explicit phase marker for orchestrators tailing events.jsonl:
+                // from here the run is CPU-bound (gates), the builder endpoint is free.
+                crate::report::append_event(
+                    art,
+                    &opts.run_id,
+                    serde_json::json!({"event": "verify_start", "iter": state.index, "focused": focused}),
+                );
+                let vr = run_gates(iter_verify_cmds, ws.path());
                 last_verify = Some(VerifySnapshot {
                     passed: vr.passed,
                     cmd: vr.cmd.clone(),
@@ -1128,7 +1165,7 @@ pub async fn run(
                 crate::report::append_event(
                     art,
                     &opts.run_id,
-                    serde_json::json!({"event": "verify", "iter": state.index, "passed": vr.passed}),
+                    serde_json::json!({"event": "verify", "iter": state.index, "passed": vr.passed, "focused": focused}),
                 );
                 if !vr.passed {
                     StepOutcome::VerifyFailed { output: vr.output }
@@ -1229,7 +1266,12 @@ pub async fn run(
                 } else {
                     let replay_ran = cfg.verify.replay && !cfg.verify.cmds.is_empty();
                     let replay_ok = if replay_ran {
-                        match ws.replay_verify(&opts.run_id, &final_diff, &cfg.verify.cmds) {
+                        match ws.replay_verify(
+                            &opts.run_id,
+                            &final_diff,
+                            &cfg.verify.cmds,
+                            &cfg.worktree.setup_cmds,
+                        ) {
                             Ok(vr) if vr.passed => true,
                             Ok(vr) => {
                                 eprintln!(
@@ -1237,6 +1279,12 @@ pub async fn run(
                                     vr.cmd.as_deref().unwrap_or("gate")
                                 );
                                 false
+                            }
+                            // A failing worktree.setup_cmds run is an INFRA error, not a
+                            // verify/judge failure — abort the run rather than reporting
+                            // it as a replay-verify gate failure.
+                            Err(e) if e.to_string().starts_with("worktree setup cmd") => {
+                                return Err(e);
                             }
                             Err(e) => {
                                 eprintln!("bob: replay-verify error: {e}");
@@ -1375,6 +1423,50 @@ mod decision_tests {
         assert!(should_keep_worktree(true, RunStatus::Converged));
     }
 
+    fn verify_cfg(cmds: Vec<&str>, replay: bool, focused_cmds: Vec<&str>) -> crate::config::VerifyCfg {
+        crate::config::VerifyCfg {
+            cmds: cmds.into_iter().map(String::from).collect(),
+            replay,
+            focused_cmds: focused_cmds.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn focused_cmds_used_when_replay_on_and_cmds_nonempty() {
+        let v = verify_cfg(vec!["cargo test"], true, vec!["cargo check"]);
+        let (cmds, focused) = iteration_verify_cmds(&v);
+        assert_eq!(cmds, &["cargo check".to_string()]);
+        assert!(focused);
+    }
+
+    #[test]
+    fn focused_cmds_ignored_when_replay_disabled() {
+        // SAFETY RULE: replay off means the full suite never gates the run
+        // anywhere else, so focused_cmds must be ignored and the full cmds run.
+        let v = verify_cfg(vec!["cargo test"], false, vec!["cargo check"]);
+        let (cmds, focused) = iteration_verify_cmds(&v);
+        assert_eq!(cmds, &["cargo test".to_string()]);
+        assert!(!focused);
+    }
+
+    #[test]
+    fn focused_cmds_ignored_when_cmds_empty() {
+        // SAFETY RULE: no full suite configured at all means there is nothing
+        // for replay to gate with, so focused_cmds must be ignored too.
+        let v = verify_cfg(vec![], true, vec!["cargo check"]);
+        let (cmds, focused) = iteration_verify_cmds(&v);
+        assert!(cmds.is_empty());
+        assert!(!focused);
+    }
+
+    #[test]
+    fn no_focused_cmds_configured_runs_full_cmds_unchanged() {
+        let v = verify_cfg(vec!["cargo test"], true, vec![]);
+        let (cmds, focused) = iteration_verify_cmds(&v);
+        assert_eq!(cmds, &["cargo test".to_string()]);
+        assert!(!focused);
+    }
+
     #[test]
     fn builder_failures_escalate_orchestration_errors_dont() {
         let esc = |m: &str| should_try_next_model_after_error(&anyhow::anyhow!("{m}"));
@@ -1388,6 +1480,17 @@ mod decision_tests {
         // orchestration failures should NOT escalate (next model won't help)
         assert!(!esc("failed to create worktree"));
         assert!(!esc("git checkout failed"));
+        // a failing worktree.setup_cmds is an INFRA error — must abort, not
+        // escalate to the next model as if it were a builder failure.
+        assert!(!esc(
+            "worktree setup cmd failed: ln -sfn \"$BOB_REPO_ROOT/node_modules\" node_modules\n--- stderr ---\nln: failed"
+        ));
+        // ...even when the setup cmd's stderr contains the per-model builder
+        // vocabulary ("timed out", "builder", ...) — e.g. a dep install that
+        // hit the network. No model can fix a setup cmd; never escalate.
+        assert!(!esc(
+            "worktree setup cmd failed: npm ci\n--- stderr ---\nnpm ERR! network Connection timed out\nnpm ERR! builder-tools@1.0.0 fetch failed"
+        ));
     }
 
     #[test]
@@ -1881,6 +1984,7 @@ mod flow_tests {
             verify: crate::config::VerifyCfg {
                 cmds: vec!["true".into()],
                 replay: true,
+                focused_cmds: vec![],
             }, // gate that passes
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,
@@ -1890,6 +1994,7 @@ mod flow_tests {
             apply: false,
             artifacts: Default::default(),
             context: Default::default(),
+            worktree: Default::default(),
         };
         let opts = RunOpts {
             spec: "do the thing".into(),
@@ -1966,6 +2071,7 @@ mod flow_tests {
             verify: crate::config::VerifyCfg {
                 cmds: vec!["true".into()],
                 replay: true,
+                focused_cmds: vec![],
             },
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,
@@ -1975,6 +2081,7 @@ mod flow_tests {
             apply: false,
             artifacts: Default::default(),
             context: Default::default(),
+            worktree: Default::default(),
         };
         let opts = RunOpts {
             spec: "do the thing".into(),
@@ -2057,6 +2164,7 @@ mod flow_tests {
             verify: crate::config::VerifyCfg {
                 cmds: vec![],
                 replay: true,
+                focused_cmds: vec![],
             },
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,
@@ -2066,6 +2174,7 @@ mod flow_tests {
             apply: false,
             artifacts: Default::default(),
             context: Default::default(),
+            worktree: Default::default(),
         };
         let opts = RunOpts {
             spec: "do the thing".into(),
@@ -2096,5 +2205,350 @@ mod flow_tests {
         let s = build_judge_spec("do the thing", None, &[], std::path::Path::new("."));
         assert!(s.contains("## JUDGING RUBRIC"));
         assert!(s.contains("EACH criterion"));
+    }
+
+    struct ChangeOnceBuilder;
+    impl Builder for ChangeOnceBuilder {
+        async fn build(&self, _p: &str, workdir: &Path) -> anyhow::Result<BuilderOutcome> {
+            std::fs::write(workdir.join("out.txt"), "change\n")?;
+            Ok(BuilderOutcome {
+                failure_kind: "ok".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    struct PanicIfCalledBuilder;
+    impl Builder for PanicIfCalledBuilder {
+        async fn build(&self, _p: &str, _workdir: &Path) -> anyhow::Result<BuilderOutcome> {
+            panic!("builder must not run when worktree.setup_cmds fails — it's an infra abort");
+        }
+    }
+
+    fn setup_cmds_test_cfg(setup_cmds: Vec<String>, verify_cmds: Vec<String>) -> Config {
+        crate::config::Config {
+            builder: crate::config::BuilderCfg {
+                cmd: "opencode".into(),
+                timeout_secs: 5,
+                args: vec![],
+                model: None,
+                models: Default::default(),
+                fallback_models: vec![],
+                tiers: Default::default(),
+                escalation_policy: "tier".into(),
+                reliability_weight: 0.5,
+                pin: vec![],
+                exclude: vec![],
+                goose_toolshim: false,
+            },
+            judge: crate::config::JudgeCfg {
+                cmd: "abe".into(),
+                mode: crate::config::JudgeMode::Validate,
+                timeout_secs: 600,
+                policy: crate::config::JudgePolicy::Advisory,
+            },
+            verify: crate::config::VerifyCfg {
+                cmds: verify_cmds,
+                replay: true,
+                focused_cmds: vec![],
+            },
+            loop_cfg: crate::config::LoopCfg {
+                max_iterations: 3,
+                max_walltime_secs: 60,
+            },
+            scope: Default::default(),
+            apply: false,
+            artifacts: Default::default(),
+            context: Default::default(),
+            worktree: crate::config::WorktreeCfg { setup_cmds },
+        }
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_cmds_run_before_iteration_and_visible_to_verify() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-setup-flow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let g = |a: &[&str]| {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(tmp.join("seed.txt"), "x\n").unwrap();
+        // Mirrors the real node_modules use case: the setup cmd's output is
+        // gitignored, so it never lands in the captured diff / collides with
+        // the replay worktree's own copy of the same setup cmd.
+        std::fs::write(tmp.join(".gitignore"), "setup-marker.txt\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        // The setup cmd runs before iteration 0, referencing BOB_REPO_ROOT (the
+        // main repo, not the worktree); the verify gate proves it's visible.
+        let cfg = setup_cmds_test_cfg(
+            vec!["echo \"$BOB_REPO_ROOT\" > setup-marker.txt".into()],
+            vec!["test -f setup-marker.txt && grep -q change out.txt".into()],
+        );
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: true,
+            run_id: "setup-flow".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let res = run(&cfg, opts, &ChangeOnceBuilder, &UncertainJudge)
+            .await
+            .unwrap();
+        let worktree = std::path::PathBuf::from(&res.worktree);
+        let marker = std::fs::read_to_string(worktree.join("setup-marker.txt")).unwrap();
+
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(res.status, RunStatus::Converged);
+        assert_eq!(
+            marker.trim(),
+            tmp.canonicalize().unwrap().to_string_lossy(),
+            "BOB_REPO_ROOT in the worktree points at the main repo root, not the worktree"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_cmd_failure_aborts_run_as_infra_error() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-setup-fail-flow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let g = |a: &[&str]| {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(tmp.join("seed.txt"), "x\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = setup_cmds_test_cfg(
+            vec!["echo setup-cmd-boom 1>&2 && exit 7".into()],
+            vec!["true".into()],
+        );
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "setup-fail-flow".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        // PanicIfCalledBuilder proves the abort happens before iteration 0 —
+        // the builder is never invoked.
+        let msg = match run(&cfg, opts, &PanicIfCalledBuilder, &UncertainJudge).await {
+            Ok(_) => panic!("expected worktree setup cmd failure to abort the run"),
+            Err(e) => e.to_string(),
+        };
+
+        std::env::set_current_dir(prev).unwrap();
+        assert!(
+            msg.contains("worktree setup cmd failed"),
+            "reported as an infra error, not a builder/judge failure: {msg}"
+        );
+        assert!(msg.contains("setup-cmd-boom"), "carries the cmd's stderr: {msg}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn focused_test_cfg(cmds: Vec<String>, focused_cmds: Vec<String>, replay: bool) -> Config {
+        crate::config::Config {
+            builder: crate::config::BuilderCfg {
+                cmd: "opencode".into(),
+                timeout_secs: 5,
+                args: vec![],
+                model: None,
+                models: Default::default(),
+                fallback_models: vec![],
+                tiers: Default::default(),
+                escalation_policy: "tier".into(),
+                reliability_weight: 0.5,
+                pin: vec![],
+                exclude: vec![],
+                goose_toolshim: false,
+            },
+            judge: crate::config::JudgeCfg {
+                cmd: "abe".into(),
+                mode: crate::config::JudgeMode::Validate,
+                timeout_secs: 600,
+                policy: crate::config::JudgePolicy::Advisory,
+            },
+            verify: crate::config::VerifyCfg {
+                cmds,
+                replay,
+                focused_cmds,
+            },
+            loop_cfg: crate::config::LoopCfg {
+                max_iterations: 3,
+                max_walltime_secs: 60,
+            },
+            scope: Default::default(),
+            apply: false,
+            artifacts: Default::default(),
+            context: Default::default(),
+            worktree: Default::default(),
+        }
+    }
+
+    /// (a) Focused runs in-loop while replay runs the full suite. The focused
+    /// gate ("true") passes every iteration so the loop converges fast, but
+    /// the full suite ("true" && "false") only runs at replay-verify and its
+    /// second gate always fails — proving the run flows through the existing
+    /// replay-failed path, NOT converged-clean, when the full suite disagrees
+    /// with the focused one.
+    #[tokio::test]
+    async fn focused_verify_in_loop_full_cmds_gate_at_replay() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-focused-flow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let g = |a: &[&str]| {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(tmp.join("seed.txt"), "x\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(
+            vec!["true".into(), "false".into()], // full suite: second gate always fails
+            vec!["true".into()],                 // focused gate: always passes
+            true,
+        );
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "focused-flow".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let res = run(&cfg, opts, &ChangeOnceBuilder, &UncertainJudge)
+            .await
+            .unwrap();
+
+        // events.jsonl proves the in-loop gate that actually ran was the
+        // focused one, not the full suite.
+        let events = std::fs::read_to_string(
+            tmp.join(".bob/runs/focused-flow/events.jsonl"),
+        )
+        .unwrap();
+        let verify_lines: Vec<serde_json::Value> = events
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["event"] == "verify")
+            .collect();
+        assert_eq!(verify_lines.len(), 1);
+        assert_eq!(verify_lines[0]["focused"], true);
+        assert_eq!(verify_lines[0]["passed"], true);
+
+        std::env::set_current_dir(prev).unwrap();
+        // Converged in-loop on the focused gate, but the full suite fails at
+        // replay-verify — the run must NOT report converged-clean.
+        assert_eq!(res.status, RunStatus::NotConverged);
+        assert_eq!(res.stop_reason, Some(StopReason::ReplayVerifyFailed));
+        assert_eq!(res.iterations, 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// (b) SAFETY RULE: focused_cmds is ignored when replay is disabled — the
+    /// full suite must gate the run somewhere, so with replay off the full
+    /// cmds run every iteration exactly as before. If focused_cmds ("false")
+    /// were honored here instead, the run would never converge.
+    #[tokio::test]
+    async fn focused_cmds_ignored_when_replay_disabled_flow() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-focused-unsafe-flow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let g = |a: &[&str]| {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(tmp.join("seed.txt"), "x\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(
+            vec!["true".into()],  // full suite: always passes
+            vec!["false".into()], // focused gate: would always fail if honored
+            false,                // replay DISABLED — focused_cmds must be ignored
+        );
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "focused-unsafe-flow".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let res = run(&cfg, opts, &ChangeOnceBuilder, &UncertainJudge)
+            .await
+            .unwrap();
+
+        let events = std::fs::read_to_string(
+            tmp.join(".bob/runs/focused-unsafe-flow/events.jsonl"),
+        )
+        .unwrap();
+        let verify_lines: Vec<serde_json::Value> = events
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["event"] == "verify")
+            .collect();
+        assert_eq!(verify_lines.len(), 1);
+        assert_eq!(verify_lines[0]["focused"], false);
+        assert_eq!(verify_lines[0]["passed"], true);
+
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(res.status, RunStatus::Converged);
+        assert_eq!(res.iterations, 1);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

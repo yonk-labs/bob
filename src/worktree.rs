@@ -103,17 +103,47 @@ pub fn gc(dry_run: bool) -> anyhow::Result<GcReport> {
     })
 }
 
-/// Apply `diff` to a FRESH detached worktree at `base_sha` and run the verify
-/// gates there. This is the trust boundary for unattended apply: the reported
-/// diff must reproduce a passing tree on its own, independent of whatever
-/// state the build worktree accumulated. Err = diff didn't apply / git failed;
+/// Run `worktree.setup_cmds` once, in order, in a freshly created worktree —
+/// before iteration 0 / before replay verify, never in the main tree. Uses the
+/// same `sh -c` shell-exec mechanism as verify gates (see verify::run_gates),
+/// with cwd = the new worktree and `BOB_REPO_ROOT` exported to the main repo
+/// root. A failing cmd (non-zero exit) is an INFRA error, not a gate failure:
+/// it returns `Err` naming the command and its stderr, distinct from
+/// `verify::run_gates`'s `Ok(VerifyResult{passed: false, ..})`, so callers
+/// never mistake it for a builder/task/judge failure.
+fn run_setup_cmds(cmds: &[String], workdir: &Path, repo_root: &Path) -> anyhow::Result<()> {
+    for cmd in cmds {
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(workdir)
+            .env("BOB_REPO_ROOT", repo_root)
+            .output()
+            .map_err(|e| anyhow::anyhow!("worktree setup cmd '{cmd}' could not run: {e}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "worktree setup cmd failed: {cmd}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Apply `diff` to a FRESH detached worktree at `base_sha`, run
+/// `worktree.setup_cmds` there (see [`run_setup_cmds`] for the infra-error
+/// contract), then run the verify gates. This is the trust boundary for
+/// unattended apply: the reported diff must reproduce a passing tree on its
+/// own, independent of whatever state the build worktree accumulated.
+/// Err = setup cmd failed / diff didn't apply / git failed;
 /// Ok(vr) with vr.passed=false = gates failed on the replayed tree.
-pub fn replay_verify_at(
+pub fn replay_verify_at_with_setup(
     repo: &Path,
     base_sha: &str,
     run_id: &str,
     diff: &str,
     cmds: &[String],
+    setup_cmds: &[String],
 ) -> anyhow::Result<crate::verify::VerifyResult> {
     let parent = repo.join(".bob").join("worktrees");
     std::fs::create_dir_all(&parent)?;
@@ -122,6 +152,11 @@ pub fn replay_verify_at(
     let _ = std::fs::remove_dir_all(&dir);
     let _ = git(&["worktree", "prune"], repo);
     git(&["worktree", "add", "--detach", &dir_str, base_sha], repo)?;
+    if let Err(e) = run_setup_cmds(setup_cmds, &dir, repo) {
+        let _ = git(&["worktree", "remove", "--force", &dir_str], repo);
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
     let patch = parent.join(format!("{run_id}-replay.patch"));
     std::fs::write(&patch, diff)?;
     let patch_str = patch.to_string_lossy().to_string();
@@ -139,7 +174,10 @@ pub fn replay_verify_at(
 }
 
 impl Workspace {
-    pub fn create(run_id: &str) -> anyhow::Result<Workspace> {
+    /// Create a fresh build worktree, then run `setup_cmds` (worktree.setup_cmds)
+    /// once, in order, before returning it — before iteration 0, never in the
+    /// main tree. See [`run_setup_cmds`] for the infra-error contract.
+    pub fn create(run_id: &str, setup_cmds: &[String]) -> anyhow::Result<Workspace> {
         let cwd = std::env::current_dir()?;
         let base_sha = git(&["rev-parse", "HEAD"], &cwd)?;
         let branch = format!("bob/{run_id}");
@@ -157,6 +195,17 @@ impl Workspace {
             &["worktree", "add", "-b", &branch, &dir_str, &base_sha],
             &cwd,
         )?;
+        // On setup failure, remove the worktree AND the bob/<run_id> branch —
+        // a fresh checkout that never ran a builder has nothing worth keeping
+        // (the failing cmd's stderr is already in the error), and leaked
+        // branches otherwise accumulate until `bob gc`. Mirrors the replay
+        // path's cleanup above.
+        if let Err(e) = run_setup_cmds(setup_cmds, &dir, &cwd) {
+            let _ = git(&["worktree", "remove", "--force", &dir_str], &cwd);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = git(&["branch", "-D", &branch], &cwd);
+            return Err(e);
+        }
         Ok(Workspace {
             repo: cwd,
             dir,
@@ -238,8 +287,9 @@ impl Workspace {
         run_id: &str,
         diff: &str,
         cmds: &[String],
+        setup_cmds: &[String],
     ) -> anyhow::Result<crate::verify::VerifyResult> {
-        replay_verify_at(&self.repo, &self.base_sha, run_id, diff, cmds)
+        replay_verify_at_with_setup(&self.repo, &self.base_sha, run_id, diff, cmds, setup_cmds)
     }
 
     pub fn cleanup(&self) -> anyhow::Result<()> {
@@ -290,7 +340,7 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&tmp).unwrap();
 
-        let ws = Workspace::create("test1").unwrap();
+        let ws = Workspace::create("test1", &[]).unwrap();
         // simulate the builder editing in the worktree
         std::fs::write(ws.path().join("a.txt"), "hello\nworld\n").unwrap();
         std::fs::write(ws.path().join("new.txt"), "created\n").unwrap();
@@ -311,7 +361,7 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&tmp).unwrap();
 
-        let ws = Workspace::create("test2").unwrap();
+        let ws = Workspace::create("test2", &[]).unwrap();
         std::fs::write(ws.path().join("a.txt"), "changed\n").unwrap();
         ws.commit_candidate("test change").unwrap();
 
@@ -335,7 +385,7 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&tmp).unwrap();
 
-        let ws = Workspace::create("test3").unwrap();
+        let ws = Workspace::create("test3", &[]).unwrap();
         ws.commit_candidate("candidate").unwrap();
 
         // Advance main HEAD after Workspace::create
@@ -370,7 +420,7 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&tmp).unwrap();
 
-        let ws = Workspace::create("test4").unwrap();
+        let ws = Workspace::create("test4", &[]).unwrap();
         std::fs::write(ws.path().join("gen.lock"), "from-candidate\n").unwrap();
         ws.commit_candidate("adds gen.lock").unwrap();
         // main has an untracked gen.lock that would block a cherry-pick
@@ -399,7 +449,7 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&tmp).unwrap();
 
-        let ws = Workspace::create("gc-dry").unwrap();
+        let ws = Workspace::create("gc-dry", &[]).unwrap();
         let report = gc(true).unwrap();
         assert!(report
             .worktrees
@@ -420,7 +470,7 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&tmp).unwrap();
 
-        let ws = Workspace::create("gc-real").unwrap();
+        let ws = Workspace::create("gc-real", &[]).unwrap();
         let path = ws.path().to_path_buf();
         let report = gc(false).unwrap();
         assert!(report
@@ -456,15 +506,124 @@ mod tests {
 
         // gate that only passes if BOTH the modification and the new file landed
         let cmds = vec!["grep -q two a.txt && grep -q new b.txt".to_string()];
-        let vr = replay_verify_at(&tmp, &base, "t1", &diff, &cmds).unwrap();
+        let vr = replay_verify_at_with_setup(&tmp, &base, "t1", &diff, &cmds, &[]).unwrap();
         assert!(vr.passed);
 
         // a gate that fails is reported as failed, not as an error
-        let vr = replay_verify_at(&tmp, &base, "t2", &diff, &["false".to_string()]).unwrap();
+        let vr = replay_verify_at_with_setup(&tmp, &base, "t2", &diff, &["false".to_string()], &[]).unwrap();
         assert!(!vr.passed);
 
         // garbage diff is an error
-        assert!(replay_verify_at(&tmp, &base, "t3", "not a diff", &cmds).is_err());
+        assert!(replay_verify_at_with_setup(&tmp, &base, "t3", "not a diff", &cmds, &[]).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn create_runs_setup_cmds_in_fresh_worktree_with_repo_root_env() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir_unique();
+        init_repo(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let setup_cmds = vec![
+            "echo first > order.txt".to_string(),
+            "echo second >> order.txt".to_string(),
+            "echo \"$BOB_REPO_ROOT\" > root.txt".to_string(),
+        ];
+        let ws = Workspace::create("setup1", &setup_cmds).unwrap();
+
+        let order = std::fs::read_to_string(ws.path().join("order.txt")).unwrap();
+        assert_eq!(order, "first\nsecond\n", "setup cmds ran in order, once");
+        let root = std::fs::read_to_string(ws.path().join("root.txt")).unwrap();
+        assert_eq!(
+            root.trim(),
+            tmp.canonicalize().unwrap().to_string_lossy(),
+            "BOB_REPO_ROOT points at the main repo root, not the worktree"
+        );
+
+        ws.cleanup().unwrap();
+        std::env::set_current_dir(prev).unwrap();
+    }
+
+    #[test]
+    fn create_fails_fast_with_infra_error_on_bad_setup_cmd() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir_unique();
+        init_repo(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let setup_cmds = vec!["echo boom-stderr 1>&2 && exit 3".to_string()];
+        let msg = match Workspace::create("setup-fail", &setup_cmds) {
+            Ok(_) => panic!("expected setup cmd failure to abort worktree creation"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("echo boom-stderr 1>&2 && exit 3"),
+            "error names the failing cmd: {msg}"
+        );
+        assert!(msg.contains("boom-stderr"), "error carries stderr: {msg}");
+        // No leaked artifacts: the fresh worktree and its bob/<run_id> branch
+        // are removed (a checkout that never ran a builder has no value).
+        assert!(
+            !tmp.join(".bob").join("worktrees").join("setup-fail").exists(),
+            "worktree removed on setup failure"
+        );
+        let branches = Command::new("git")
+            .args(["branch", "--list", "bob/setup-fail"])
+            .current_dir(&tmp)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "bob/setup-fail branch removed on setup failure"
+        );
+
+        std::env::set_current_dir(prev).unwrap();
+    }
+
+    #[test]
+    fn replay_verify_at_with_setup_runs_setup_cmds_before_gates() {
+        let tmp = std::env::temp_dir().join(format!("bob-replay-setup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        sh("git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", &tmp);
+        std::fs::write(tmp.join("a.txt"), "one\n").unwrap();
+        sh("git add -A && git -c user.email=t@t -c user.name=t commit -q -m base", &tmp);
+        let base = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&tmp).output().unwrap().stdout).unwrap().trim().to_string();
+        std::fs::write(tmp.join("a.txt"), "two\n").unwrap();
+        sh("git add -A", &tmp);
+        let diff = String::from_utf8(Command::new("git").args(["diff", "--cached", "--no-renames", &base]).current_dir(&tmp).output().unwrap().stdout).unwrap();
+        sh("git reset -q --hard && git clean -qfd", &tmp);
+
+        // The gate checks BOTH the diff landed AND the file the setup cmd created —
+        // proving setup cmds ran ahead of the patch apply / gate.
+        let setup_cmds = vec!["echo ready > setup-marker.txt".to_string()];
+        let cmds = vec!["grep -q two a.txt && test -f setup-marker.txt".to_string()];
+        let vr = replay_verify_at_with_setup(&tmp, &base, "s1", &diff, &cmds, &setup_cmds).unwrap();
+        assert!(vr.passed, "gate sees the file the setup cmd created: {}", vr.output);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn replay_verify_at_with_setup_cmd_failure_is_infra_error_not_a_failed_gate() {
+        let tmp = std::env::temp_dir().join(format!("bob-replay-setup-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        sh("git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", &tmp);
+        std::fs::write(tmp.join("a.txt"), "one\n").unwrap();
+        sh("git add -A && git -c user.email=t@t -c user.name=t commit -q -m base", &tmp);
+        let base = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&tmp).output().unwrap().stdout).unwrap().trim().to_string();
+
+        let setup_cmds = vec!["echo setup-boom 1>&2 && exit 9".to_string()];
+        // A gate that would pass, to prove the failure is the setup cmd's, not the gate's.
+        let cmds = vec!["true".to_string()];
+        let err = replay_verify_at_with_setup(&tmp, &base, "s2", "", &cmds, &setup_cmds).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("setup-boom"), "error surfaces setup cmd stderr: {msg}");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

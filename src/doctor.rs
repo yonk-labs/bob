@@ -87,7 +87,7 @@ fn append_to_gitignore(dir: &std::path::Path, lines: &[&str]) -> std::io::Result
     std::fs::write(&path, new_text)
 }
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(probe: bool) -> anyhow::Result<()> {
     let checks = [
         ("git", which("git")),
         ("opencode", which("opencode")),
@@ -131,7 +131,22 @@ pub fn run() -> anyhow::Result<()> {
                     ok = false;
                 }
             } else if goose_present {
-                println!("[ok] goose (available; not used by current tier config)");
+                if cfg.builder.cmd == "goose" {
+                    println!("[ok] goose (builder.cmd — no tiers configured)");
+                } else {
+                    println!("[ok] goose (available; not used by current tier config)");
+                }
+            }
+            if probe {
+                if which("curl") {
+                    let targets = probe_targets(&cfg);
+                    if !print_probe_results(&run_probes(targets, curl_alive)) {
+                        ok = false;
+                    }
+                } else {
+                    println!("[fail] curl not found on PATH — cannot probe endpoints");
+                    ok = false;
+                }
             }
         }
         Err(e) => {
@@ -143,6 +158,9 @@ pub fn run() -> anyhow::Result<()> {
     if looks_like_js_repo(&cwd) && !gitignore_ignores_bob(&cwd) {
         println!("[warn] JS/Jest repo detected, but .gitignore does not ignore .bob/");
         println!("       Add `/.bob` to avoid test runner/module-map collisions.");
+        println!("       Also exclude `.bob/**` in your test runner config (e.g. vitest");
+        println!("       `--exclude '.bob/**'` or `exclude: ['.bob/**']` in vitest.config) —");
+        println!("       .gitignore alone won't stop it from picking up worktree copies of the suite.");
     }
     if looks_like_js_repo(&cwd) && !gitignore_ignores_node_modules(&cwd) {
         println!("[warn] package.json present, but .gitignore does not ignore node_modules/");
@@ -162,6 +180,119 @@ pub fn run() -> anyhow::Result<()> {
     } else {
         anyhow::bail!("doctor found problems")
     }
+}
+
+/// One distinct endpoint discovered in the resolved config: every model name
+/// that carries an explicit `base_url` (the `Full` roster form) pointing at
+/// it, plus which tiers (if any) reference those names. Bare `provider/model`
+/// ids with no explicit base_url are never included here — bob refuses to
+/// guess their endpoint elsewhere (see engine::extract_base_url), so there's
+/// nothing safe to curl.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeTarget {
+    base_url: String,
+    models: Vec<String>,
+    tiers: Vec<String>,
+}
+
+impl ProbeTarget {
+    fn describe(&self) -> String {
+        let models = self.models.join(", ");
+        if self.tiers.is_empty() {
+            format!("models: {models}")
+        } else {
+            format!("models: {models}; tiers: {}", self.tiers.join(", "))
+        }
+    }
+}
+
+/// Walk `builder.models`, grouping every entry with an explicit base_url by
+/// that base_url so a shared endpoint is probed once, and note which tiers
+/// (cheap/medium/large/frontier) reference each model name.
+fn probe_targets(cfg: &crate::config::Config) -> Vec<ProbeTarget> {
+    let mut by_url: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for name in cfg.builder.models.keys() {
+        if let Some(url) = cfg.builder.entry_base_url(Some(name)) {
+            by_url.entry(url).or_default().insert(name.clone());
+        }
+    }
+    by_url
+        .into_iter()
+        .map(|(base_url, model_set)| {
+            let models: Vec<String> = model_set.into_iter().collect();
+            let tiers: Vec<String> = ["cheap", "medium", "large", "frontier"]
+                .iter()
+                .filter(|t| {
+                    cfg.builder
+                        .tiers
+                        .models_for(t)
+                        .iter()
+                        .any(|m| models.contains(m))
+                })
+                .map(|t| t.to_string())
+                .collect();
+            ProbeTarget { base_url, models, tiers }
+        })
+        .collect()
+}
+
+/// Outcome of probing one endpoint.
+struct ProbeResult {
+    target: ProbeTarget,
+    alive: bool,
+}
+
+/// Probe every target through `probe_fn` — a thin seam so the grouping/report
+/// logic is unit-testable without ever shelling out to curl.
+fn run_probes(targets: Vec<ProbeTarget>, probe_fn: impl Fn(&str) -> bool) -> Vec<ProbeResult> {
+    targets
+        .into_iter()
+        .map(|target| {
+            let alive = probe_fn(&target.base_url);
+            ProbeResult { target, alive }
+        })
+        .collect()
+}
+
+/// The actual network check: `curl -sf -m 3 <base_url>/models`. Exit 0 (curl
+/// `-f` treats HTTP >=400 as failure) means alive.
+fn curl_alive(base_url: &str) -> bool {
+    std::process::Command::new("curl")
+        .args([
+            "-sf",
+            "-m",
+            "3",
+            "-o",
+            "/dev/null",
+            &format!("{}/models", base_url.trim_end_matches('/')),
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Print one line per probed endpoint. Returns false if any endpoint is dead
+/// (folded into doctor's overall exit status).
+fn print_probe_results(results: &[ProbeResult]) -> bool {
+    if results.is_empty() {
+        println!("[probe] no endpoints with an explicit base_url to probe (builder.models is empty or all entries are raw ids)");
+        return true;
+    }
+    let mut ok = true;
+    for r in results {
+        if r.alive {
+            println!("[ok] endpoint {} alive ({})", r.target.base_url, r.target.describe());
+        } else {
+            println!(
+                "[DEAD] endpoint {} unreachable ({})",
+                r.target.base_url,
+                r.target.describe()
+            );
+            ok = false;
+        }
+    }
+    ok
 }
 
 #[cfg(test)]
@@ -226,5 +357,122 @@ mod tests {
             "must not duplicate"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn cfg_from_yaml(yaml: &str) -> crate::config::Config {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn probe_targets_dedupes_by_base_url_and_skips_raw_ids() {
+        let cfg = cfg_from_yaml(
+            r#"
+builder:
+  cmd: opencode
+  models:
+    qwen: { model: "Intel/Qwen3", base_url: "http://host:8000/v1" }
+    qwen-alt: { model: "Intel/Qwen3-Alt", base_url: "http://host:8000/v1" }
+    cloud: { model: "MiniMax-M3", base_url: "https://api.minimax.io/v1" }
+    legacy: ollama/Intel/Qwen3-Coder
+judge:
+  cmd: abe
+"#,
+        );
+        let mut targets = probe_targets(&cfg);
+        targets.sort_by(|a, b| a.base_url.cmp(&b.base_url));
+        assert_eq!(targets.len(), 2, "same base_url must be deduped into one target");
+        let host = targets.iter().find(|t| t.base_url == "http://host:8000/v1").unwrap();
+        assert_eq!(host.models, vec!["qwen", "qwen-alt"]);
+        let cloud = targets
+            .iter()
+            .find(|t| t.base_url == "https://api.minimax.io/v1")
+            .unwrap();
+        assert_eq!(cloud.models, vec!["cloud"]);
+        // "legacy" has no explicit base_url — never guessed, never probed.
+        assert!(targets.iter().all(|t| !t.models.contains(&"legacy".to_string())));
+    }
+
+    #[test]
+    fn probe_targets_notes_which_tiers_reference_a_model() {
+        let cfg = cfg_from_yaml(
+            r#"
+builder:
+  cmd: opencode
+  models:
+    qwen: { model: "Intel/Qwen3", base_url: "http://host:8000/v1" }
+  tiers:
+    cheap: [qwen]
+    large: [qwen]
+    default_tier: cheap
+judge:
+  cmd: abe
+"#,
+        );
+        let targets = probe_targets(&cfg);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].tiers, vec!["cheap", "large"]);
+    }
+
+    #[test]
+    fn probe_targets_empty_when_no_explicit_endpoints() {
+        let cfg = cfg_from_yaml("builder: { cmd: opencode }\njudge: { cmd: abe }");
+        assert!(probe_targets(&cfg).is_empty());
+    }
+
+    #[test]
+    fn run_probes_uses_injected_probe_fn_without_touching_network() {
+        let targets = vec![
+            ProbeTarget {
+                base_url: "http://alive:8000/v1".into(),
+                models: vec!["a".into()],
+                tiers: vec![],
+            },
+            ProbeTarget {
+                base_url: "http://dead:8000/v1".into(),
+                models: vec!["b".into()],
+                tiers: vec![],
+            },
+        ];
+        let results = run_probes(targets, |url| url.contains("alive"));
+        assert!(results.iter().find(|r| r.target.base_url.contains("alive")).unwrap().alive);
+        assert!(!results.iter().find(|r| r.target.base_url.contains("dead")).unwrap().alive);
+    }
+
+    #[test]
+    fn print_probe_results_returns_false_when_any_dead() {
+        let all_alive = vec![ProbeResult {
+            target: ProbeTarget {
+                base_url: "http://ok:8000/v1".into(),
+                models: vec!["a".into()],
+                tiers: vec![],
+            },
+            alive: true,
+        }];
+        assert!(print_probe_results(&all_alive));
+
+        let one_dead = vec![
+            ProbeResult {
+                target: ProbeTarget {
+                    base_url: "http://ok:8000/v1".into(),
+                    models: vec!["a".into()],
+                    tiers: vec![],
+                },
+                alive: true,
+            },
+            ProbeResult {
+                target: ProbeTarget {
+                    base_url: "http://dead:8000/v1".into(),
+                    models: vec!["b".into()],
+                    tiers: vec![],
+                },
+                alive: false,
+            },
+        ];
+        assert!(!print_probe_results(&one_dead));
+    }
+
+    #[test]
+    fn print_probe_results_ok_when_no_targets() {
+        assert!(print_probe_results(&[]));
     }
 }

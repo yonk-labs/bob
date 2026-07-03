@@ -74,9 +74,17 @@ pub enum Command {
     /// Write a starter bob.yaml into the current directory.
     Init,
     /// Check git/opencode/abe presence and config validity.
-    Doctor,
+    Doctor {
+        /// Curl each configured endpoint's base_url and mark dead entries.
+        #[arg(long)]
+        probe: bool,
+    },
     /// List the builder model roster (builder.models) and the default.
-    Models,
+    Models {
+        /// Emit a machine-readable tier→endpoint map instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove stale bob worktrees and bob/* branches.
     Gc {
         /// Show what would be removed without deleting anything.
