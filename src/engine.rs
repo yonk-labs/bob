@@ -1141,6 +1141,13 @@ pub async fn run(
                 StepOutcome::scope_exceeded(&sr.detail)
             } else {
                 let (iter_verify_cmds, focused) = iteration_verify_cmds(&cfg.verify);
+                // Explicit phase marker for orchestrators tailing events.jsonl:
+                // from here the run is CPU-bound (gates), the builder endpoint is free.
+                crate::report::append_event(
+                    art,
+                    &opts.run_id,
+                    serde_json::json!({"event": "verify_start", "iter": state.index, "focused": focused}),
+                );
                 let vr = run_gates(iter_verify_cmds, ws.path());
                 last_verify = Some(VerifySnapshot {
                     passed: vr.passed,
