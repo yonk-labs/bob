@@ -140,7 +140,7 @@ pub fn run(probe: bool) -> anyhow::Result<()> {
             if probe {
                 if which("curl") {
                     let targets = probe_targets(&cfg);
-                    if !print_probe_results(&run_probes(targets, curl_alive)) {
+                    if !print_probe_results(&run_probes(targets, curl_probe)) {
                         ok = false;
                     }
                 } else {
@@ -193,6 +193,7 @@ struct ProbeTarget {
     base_url: String,
     models: Vec<String>,
     tiers: Vec<String>,
+    api_key_env: Option<String>,
 }
 
 impl ProbeTarget {
@@ -232,48 +233,90 @@ fn probe_targets(cfg: &crate::config::Config) -> Vec<ProbeTarget> {
                 })
                 .map(|t| t.to_string())
                 .collect();
-            ProbeTarget { base_url, models, tiers }
+            // If multiple models share a base_url and disagree on api_key_env,
+            // take the first Some — good enough for a doctor probe.
+            let api_key_env = models
+                .iter()
+                .find_map(|m| cfg.builder.entry_api_key_env(Some(m)));
+            ProbeTarget { base_url, models, tiers, api_key_env }
         })
         .collect()
+}
+
+/// Three-state result of probing an endpoint's `/models` route. A 401/403
+/// means the endpoint answered — it's reachable, just unauthorized — so it
+/// must not be conflated with a genuinely dead endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeStatus {
+    Alive,
+    NeedsAuth,
+    Unreachable,
+}
+
+/// Map an HTTP status code (as curl's `%{http_code}` prints it, including the
+/// `000` curl emits on connection failure) to a ProbeStatus. 2xx -> Alive,
+/// 401/403 -> NeedsAuth, everything else (4xx, 5xx, 000, unparsable) ->
+/// Unreachable.
+fn classify(http_code: &str) -> ProbeStatus {
+    match http_code.trim().parse::<u32>() {
+        Ok(code) if (200..300).contains(&code) => ProbeStatus::Alive,
+        Ok(401) | Ok(403) => ProbeStatus::NeedsAuth,
+        _ => ProbeStatus::Unreachable,
+    }
 }
 
 /// Outcome of probing one endpoint.
 struct ProbeResult {
     target: ProbeTarget,
-    alive: bool,
+    status: ProbeStatus,
 }
 
 /// Probe every target through `probe_fn` — a thin seam so the grouping/report
 /// logic is unit-testable without ever shelling out to curl.
-fn run_probes(targets: Vec<ProbeTarget>, probe_fn: impl Fn(&str) -> bool) -> Vec<ProbeResult> {
+fn run_probes(
+    targets: Vec<ProbeTarget>,
+    probe_fn: impl Fn(&ProbeTarget) -> ProbeStatus,
+) -> Vec<ProbeResult> {
     targets
         .into_iter()
         .map(|target| {
-            let alive = probe_fn(&target.base_url);
-            ProbeResult { target, alive }
+            let status = probe_fn(&target);
+            ProbeResult { target, status }
         })
         .collect()
 }
 
-/// The actual network check: `curl -sf -m 3 <base_url>/models`. Exit 0 (curl
-/// `-f` treats HTTP >=400 as failure) means alive.
-fn curl_alive(base_url: &str) -> bool {
-    std::process::Command::new("curl")
-        .args([
-            "-sf",
-            "-m",
-            "3",
-            "-o",
-            "/dev/null",
-            &format!("{}/models", base_url.trim_end_matches('/')),
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// The actual network check: `curl -s -m 3 -o /dev/null -w "%{http_code}"
+/// <base_url>/models`, with a bearer token attached when the target declares
+/// an `api_key_env` and that env var is set. Captures the status code instead
+/// of relying on curl's `-f` (which can't distinguish "unauthorized" from
+/// "unreachable").
+fn curl_probe(target: &ProbeTarget) -> ProbeStatus {
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "-m", "3", "-o", "/dev/null", "-w", "%{http_code}"]);
+    if let Some(env_var) = &target.api_key_env {
+        if let Ok(token) = std::env::var(env_var) {
+            if !token.is_empty() {
+                cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
+            }
+        }
+    }
+    cmd.arg(format!("{}/models", target.base_url.trim_end_matches('/')));
+    match cmd.output() {
+        Ok(out) if out.status.success() || !out.stdout.is_empty() => {
+            match std::str::from_utf8(&out.stdout) {
+                Ok(code) => classify(code),
+                Err(_) => ProbeStatus::Unreachable,
+            }
+        }
+        _ => ProbeStatus::Unreachable,
+    }
 }
 
-/// Print one line per probed endpoint. Returns false if any endpoint is dead
-/// (folded into doctor's overall exit status).
+/// Print one line per probed endpoint. Returns false only if any endpoint is
+/// genuinely unreachable (folded into doctor's overall exit status) — an
+/// endpoint that answered with 401/403 is reachable, just unauthorized, and
+/// does not fail the check.
 fn print_probe_results(results: &[ProbeResult]) -> bool {
     if results.is_empty() {
         println!("[probe] no endpoints with an explicit base_url to probe (builder.models is empty or all entries are raw ids)");
@@ -281,15 +324,37 @@ fn print_probe_results(results: &[ProbeResult]) -> bool {
     }
     let mut ok = true;
     for r in results {
-        if r.alive {
-            println!("[ok] endpoint {} alive ({})", r.target.base_url, r.target.describe());
-        } else {
-            println!(
-                "[DEAD] endpoint {} unreachable ({})",
-                r.target.base_url,
-                r.target.describe()
-            );
-            ok = false;
+        match r.status {
+            ProbeStatus::Alive => {
+                println!("[ok] endpoint {} alive ({})", r.target.base_url, r.target.describe());
+            }
+            ProbeStatus::NeedsAuth => {
+                let hint = match &r.target.api_key_env {
+                    Some(env_var) => {
+                        let set = std::env::var(env_var).map(|v| !v.is_empty()).unwrap_or(false);
+                        if set {
+                            format!("(${env_var} rejected — check the key)")
+                        } else {
+                            format!("(set ${env_var})")
+                        }
+                    }
+                    None => "(no api_key_env configured for this endpoint)".to_string(),
+                };
+                println!(
+                    "[auth] endpoint {} reachable — needs auth ({}) {}",
+                    r.target.base_url,
+                    r.target.describe(),
+                    hint
+                );
+            }
+            ProbeStatus::Unreachable => {
+                println!(
+                    "[DEAD] endpoint {} unreachable ({})",
+                    r.target.base_url,
+                    r.target.describe()
+                );
+                ok = false;
+            }
         }
     }
     ok
@@ -372,7 +437,7 @@ builder:
   models:
     qwen: { model: "Intel/Qwen3", base_url: "http://host:8000/v1" }
     qwen-alt: { model: "Intel/Qwen3-Alt", base_url: "http://host:8000/v1" }
-    cloud: { model: "MiniMax-M3", base_url: "https://api.minimax.io/v1" }
+    cloud: { model: "MiniMax-M3", base_url: "https://api.minimax.io/v1", api_key_env: "MINIMAX_API_KEY" }
     legacy: ollama/Intel/Qwen3-Coder
 judge:
   cmd: abe
@@ -383,11 +448,13 @@ judge:
         assert_eq!(targets.len(), 2, "same base_url must be deduped into one target");
         let host = targets.iter().find(|t| t.base_url == "http://host:8000/v1").unwrap();
         assert_eq!(host.models, vec!["qwen", "qwen-alt"]);
+        assert_eq!(host.api_key_env, None);
         let cloud = targets
             .iter()
             .find(|t| t.base_url == "https://api.minimax.io/v1")
             .unwrap();
         assert_eq!(cloud.models, vec!["cloud"]);
+        assert_eq!(cloud.api_key_env.as_deref(), Some("MINIMAX_API_KEY"));
         // "legacy" has no explicit base_url — never guessed, never probed.
         assert!(targets.iter().all(|t| !t.models.contains(&"legacy".to_string())));
     }
@@ -426,16 +493,30 @@ judge:
                 base_url: "http://alive:8000/v1".into(),
                 models: vec!["a".into()],
                 tiers: vec![],
+                api_key_env: None,
             },
             ProbeTarget {
                 base_url: "http://dead:8000/v1".into(),
                 models: vec!["b".into()],
                 tiers: vec![],
+                api_key_env: None,
             },
         ];
-        let results = run_probes(targets, |url| url.contains("alive"));
-        assert!(results.iter().find(|r| r.target.base_url.contains("alive")).unwrap().alive);
-        assert!(!results.iter().find(|r| r.target.base_url.contains("dead")).unwrap().alive);
+        let results = run_probes(targets, |t| {
+            if t.base_url.contains("alive") {
+                ProbeStatus::Alive
+            } else {
+                ProbeStatus::Unreachable
+            }
+        });
+        assert_eq!(
+            results.iter().find(|r| r.target.base_url.contains("alive")).unwrap().status,
+            ProbeStatus::Alive
+        );
+        assert_eq!(
+            results.iter().find(|r| r.target.base_url.contains("dead")).unwrap().status,
+            ProbeStatus::Unreachable
+        );
     }
 
     #[test]
@@ -445,8 +526,9 @@ judge:
                 base_url: "http://ok:8000/v1".into(),
                 models: vec!["a".into()],
                 tiers: vec![],
+                api_key_env: None,
             },
-            alive: true,
+            status: ProbeStatus::Alive,
         }];
         assert!(print_probe_results(&all_alive));
 
@@ -456,19 +538,50 @@ judge:
                     base_url: "http://ok:8000/v1".into(),
                     models: vec!["a".into()],
                     tiers: vec![],
+                    api_key_env: None,
                 },
-                alive: true,
+                status: ProbeStatus::Alive,
             },
             ProbeResult {
                 target: ProbeTarget {
                     base_url: "http://dead:8000/v1".into(),
                     models: vec!["b".into()],
                     tiers: vec![],
+                    api_key_env: None,
                 },
-                alive: false,
+                status: ProbeStatus::Unreachable,
             },
         ];
         assert!(!print_probe_results(&one_dead));
+    }
+
+    #[test]
+    fn print_probe_results_needs_auth_is_not_a_failure() {
+        let results = vec![ProbeResult {
+            target: ProbeTarget {
+                base_url: "https://api.minimax.io/v1".into(),
+                models: vec!["cloud".into()],
+                tiers: vec![],
+                api_key_env: Some("MINIMAX_API_KEY".into()),
+            },
+            status: ProbeStatus::NeedsAuth,
+        }];
+        assert!(
+            print_probe_results(&results),
+            "an endpoint that answered 401/403 is reachable, not a failure"
+        );
+    }
+
+    #[test]
+    fn classify_maps_http_codes_to_probe_status() {
+        assert_eq!(classify("200"), ProbeStatus::Alive);
+        assert_eq!(classify("204"), ProbeStatus::Alive);
+        assert_eq!(classify("401"), ProbeStatus::NeedsAuth);
+        assert_eq!(classify("403"), ProbeStatus::NeedsAuth);
+        assert_eq!(classify("404"), ProbeStatus::Unreachable);
+        assert_eq!(classify("500"), ProbeStatus::Unreachable);
+        assert_eq!(classify("000"), ProbeStatus::Unreachable);
+        assert_eq!(classify(""), ProbeStatus::Unreachable);
     }
 
     #[test]
