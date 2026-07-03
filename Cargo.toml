@@ -1,6 +1,6 @@
 [package]
 name = "bob"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Autonomous build-verify-judge loop over opencode + abe"
 license = "Apache-2.0"

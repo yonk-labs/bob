@@ -44,6 +44,54 @@ fn git_stdout(args: &[&str], cwd: &Path) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// Bounded retry-with-jitter wrapper around `git worktree add`. Two truly
+/// concurrent `git worktree add` calls against one shared `.git` can hit
+/// git's own internal metadata race (`fatal: failed to read
+/// .git/worktrees/<sibling>/commondir`); it fails safely (nothing corrupts)
+/// but self-clears once the peer's add finishes, so a short staggered retry
+/// is enough. Retries on ANY add failure — a genuinely broken add still
+/// fails all attempts and surfaces the real error.
+///
+/// A failed `-b <branch>` add can still leave the branch object behind (git
+/// creates it while "Preparing worktree" before the race trips), which would
+/// make a bare retry of the same command fail with "branch already exists"
+/// instead of the transient race — so between attempts we defensively clear
+/// any partial registration/branch this call itself may have left.
+/// ponytail: bounded retry for git's concurrent worktree-add metadata race;
+/// cross-process flock if 3 attempts ever proves too few.
+fn worktree_add_with_retry(
+    args: &[&str],
+    cwd: &Path,
+    dir: &Path,
+    branch: Option<&str>,
+) -> anyhow::Result<String> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match git(args, cwd) {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < MAX_ATTEMPTS {
+                    let dir_str = dir.to_string_lossy().to_string();
+                    let _ = git(&["worktree", "remove", "--force", &dir_str], cwd);
+                    if let Some(b) = branch {
+                        let _ = git(&["branch", "-D", b], cwd);
+                    }
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos())
+                        .unwrap_or(0);
+                    let jitter = (nanos ^ std::process::id()) % 25;
+                    let backoff_ms = u64::from(15 * (attempt + 1) + jitter);
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
 fn bob_worktrees(repo: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let root = repo.join(".bob").join("worktrees");
     let mut out = Vec::new();
@@ -149,9 +197,17 @@ pub fn replay_verify_at_with_setup(
     std::fs::create_dir_all(&parent)?;
     let dir = parent.join(format!("{run_id}-replay"));
     let dir_str = dir.to_string_lossy().to_string();
+    // Scoped teardown of only this replay worktree — never a blanket
+    // `git worktree prune`, which would corrupt a concurrent peer build's
+    // registration (see Workspace::create / bug #20).
+    let _ = git(&["worktree", "remove", "--force", &dir_str], repo);
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = git(&["worktree", "prune"], repo);
-    git(&["worktree", "add", "--detach", &dir_str, base_sha], repo)?;
+    worktree_add_with_retry(
+        &["worktree", "add", "--detach", &dir_str, base_sha],
+        repo,
+        &dir,
+        None,
+    )?;
     if let Err(e) = run_setup_cmds(setup_cmds, &dir, repo) {
         let _ = git(&["worktree", "remove", "--force", &dir_str], repo);
         let _ = std::fs::remove_dir_all(&dir);
@@ -186,14 +242,23 @@ impl Workspace {
         let wt_parent = cwd.join(".bob").join("worktrees");
         std::fs::create_dir_all(&wt_parent)?;
         let dir = wt_parent.join(run_id);
-        // Remove any leftover directory from a prior run so `git worktree add` can create it fresh.
-        let _ = std::fs::remove_dir_all(&dir);
-        // Prune stale registrations so accumulated preserved worktrees don't block new ones.
-        let _ = git(&["worktree", "prune"], &cwd);
         let dir_str = dir.to_string_lossy().to_string();
-        git(
+        // Tear down only THIS run's leftover worktree so a rerun with the same
+        // run_id can recreate it — scoped to our own dir, NEVER a blanket
+        // `git worktree prune`. A blanket prune mutates the shared worktree
+        // registry that concurrent peer builds (hector `dispatch --jobs N`, one
+        // shared .git) depend on; pruning a peer's registration deregisters its
+        // worktree, so the peer's `git add -A` resolves to the MAIN repo and
+        // stages sibling worktrees into it (bug #20). `worktree remove --force`
+        // deregisters + deletes our leftover if present (live or prunable);
+        // `remove_dir_all` then clears any stray dir with no live registration.
+        let _ = git(&["worktree", "remove", "--force", &dir_str], &cwd);
+        let _ = std::fs::remove_dir_all(&dir);
+        worktree_add_with_retry(
             &["worktree", "add", "-b", &branch, &dir_str, &base_sha],
             &cwd,
+            &dir,
+            Some(&branch),
         )?;
         // On setup failure, remove the worktree AND the bob/<run_id> branch —
         // a fresh checkout that never ran a builder has nothing worth keeping
@@ -223,7 +288,13 @@ impl Workspace {
 
     /// Diff of all changes in the worktree vs base, including untracked files.
     pub fn capture_diff(&self) -> anyhow::Result<String> {
-        git(&["add", "-A"], &self.dir)?; // stage incl. untracked
+        // Stage all worktree changes (incl. untracked) but NEVER the repo's
+        // `.bob/` tree (where sibling build worktrees live). The `,top` anchors
+        // the exclude at the repo root, so even if this worktree's git
+        // resolution has fallen back to the MAIN repo — e.g. its registration
+        // was pruned by a concurrent build — `git add -A` cannot stage another
+        // build's files or pollute the main index (bug #20 / #21).
+        git(&["add", "-A", "--", ".", ":(exclude,top).bob"], &self.dir)?;
         git_stdout(
             &["diff", "--cached", "--no-renames", &self.base_sha],
             &self.dir,
@@ -231,7 +302,9 @@ impl Workspace {
     }
 
     pub fn commit_candidate(&self, msg: &str) -> anyhow::Result<()> {
-        git(&["add", "-A"], &self.dir)?;
+        // Exclude `.bob/` for the same reason as capture_diff — a candidate
+        // commit must never absorb sibling build worktrees (bug #20 / #21).
+        git(&["add", "-A", "--", ".", ":(exclude,top).bob"], &self.dir)?;
         // allow empty so callers don't have to special-case no-op
         git(&["commit", "-q", "--allow-empty", "-m", msg], &self.dir)?;
         Ok(())
@@ -605,6 +678,131 @@ mod tests {
         assert!(vr.passed, "gate sees the file the setup cmd created: {}", vr.output);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn capture_diff_never_stages_sibling_worktrees_into_main() {
+        // Deterministic repro for bug #20/#21. Worktrees live UNDER the repo at
+        // .bob/worktrees/<id>. If a build's worktree registration is lost — e.g.
+        // a concurrent build's blanket `git worktree prune` deregistered it — the
+        // worktree's `.git` link no longer resolves, git walks UP to the MAIN
+        // repo, and an unscoped `git add -A` stages EVERY sibling build's
+        // worktree into main. That cross-contaminates the captured diff (→
+        // ScopeExceeded) and dirties the main tree/index despite apply=false.
+        // Here we model that lost registration directly (remove the worktree's
+        // `.git` link) so the repro is deterministic rather than timing-dependent.
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir_unique();
+        init_repo(&tmp);
+        // NOTE: .bob deliberately NOT gitignored — this is the vulnerable repo
+        // shape where sibling worktrees are stageable from the main root.
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let ws_a = Workspace::create("bldA", &[]).unwrap();
+        let ws_b = Workspace::create("bldB", &[]).unwrap();
+        std::fs::write(ws_b.path().join("peer_b.txt"), "from build B\n").unwrap();
+        std::fs::write(ws_a.path().join("mine_a.txt"), "from build A\n").unwrap();
+
+        // Simulate the lost registration a concurrent prune produces: drop A's
+        // `.git` link so A's git resolution falls back to the MAIN repo.
+        std::fs::remove_file(ws_a.path().join(".git")).unwrap();
+
+        let diff = ws_a.capture_diff().unwrap();
+
+        let staged = git(&["diff", "--cached", "--name-only"], &tmp).unwrap();
+        // Clean up before asserting so a failure never leaks worktrees/branches.
+        let _ = ws_a.cleanup();
+        let _ = ws_b.cleanup();
+        let _ = git(&["reset", "-q", "--hard"], &tmp);
+        let _ = git(&["clean", "-qfd"], &tmp);
+        std::env::set_current_dir(prev).unwrap();
+
+        assert!(
+            !diff.contains("peer_b.txt"),
+            "build A's captured diff leaked peer build B's file:\n{diff}"
+        );
+        assert!(
+            staged.trim().is_empty(),
+            "main index was polluted by a build's `git add -A`:\n{staged}"
+        );
+    }
+
+    #[test]
+    fn concurrent_builds_stay_isolated() {
+        // Regression guard for bug #20: two bob builds share ONE main-repo .git
+        // (hector `dispatch --jobs 2`). Each build creates its own worktree, edits
+        // a DISJOINT file, and captures its diff — concurrently. Each diff must
+        // contain ONLY its own file, and the main tree must stay clean. Before the
+        // fix, each create's blanket `git worktree prune` could rmdir the shared
+        // `.git/worktrees` out from under the peer's `git worktree add` (add fails
+        // with "Invalid path '.git/worktrees'") or deregister the peer's worktree
+        // (its `git add -A` then resolves to main and stages the other build).
+        use std::thread;
+
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir_unique();
+        init_repo(&tmp);
+        std::fs::write(tmp.join(".gitignore"), "/.bob\n").unwrap();
+        {
+            let run = |args: &[&str]| {
+                Command::new("git").args(args).current_dir(&tmp).output().unwrap();
+            };
+            run(&["add", ".gitignore"]);
+            run(&["commit", "-qm", "gitignore .bob"]);
+        }
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let mut failures: Vec<String> = Vec::new();
+        for i in 0..25 {
+            // Two builds started as close to simultaneously as possible, sharing
+            // the one repo cwd — exactly the `--jobs 2` shape.
+            let spawn_one = |run_id: String, fname: String| {
+                thread::spawn(move || -> Result<String, String> {
+                    let ws = Workspace::create(&run_id, &[])
+                        .map_err(|e| format!("{run_id}: create failed: {e}"))?;
+                    std::fs::write(ws.path().join(&fname), "x\n").unwrap();
+                    let diff = ws
+                        .capture_diff()
+                        .map_err(|e| format!("{run_id}: capture_diff failed: {e}"))?;
+                    let out = if !diff.contains(&fname) {
+                        Err(format!("{run_id}: own file {fname} missing from diff"))
+                    } else {
+                        Ok(diff)
+                    };
+                    let _ = ws.cleanup();
+                    out
+                })
+            };
+            let fa = format!("only_a_{i}.txt");
+            let fb = format!("only_b_{i}.txt");
+            let ha = spawn_one(format!("cc-a-{i}"), fa.clone());
+            let hb = spawn_one(format!("cc-b-{i}"), fb.clone());
+            match ha.join().unwrap() {
+                Ok(diff) if diff.contains(&fb) => {
+                    failures.push(format!("iter {i}: build A's diff leaked peer file {fb}"))
+                }
+                Ok(_) => {}
+                Err(e) => failures.push(format!("iter {i}: {e}")),
+            }
+            match hb.join().unwrap() {
+                Ok(diff) if diff.contains(&fa) => {
+                    failures.push(format!("iter {i}: build B's diff leaked peer file {fa}"))
+                }
+                Ok(_) => {}
+                Err(e) => failures.push(format!("iter {i}: {e}")),
+            }
+            let status = git(&["status", "--porcelain"], &tmp).unwrap();
+            if !status.trim().is_empty() {
+                failures.push(format!("iter {i}: main tree dirty:\n{status}"));
+            }
+            let _ = git(&["reset", "-q", "--hard"], &tmp);
+            let _ = git(&["clean", "-qfd"], &tmp);
+        }
+
+        std::env::set_current_dir(prev).unwrap();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

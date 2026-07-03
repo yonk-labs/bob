@@ -42,7 +42,7 @@ fn looks_like_js_repo(dir: &std::path::Path) -> bool {
         || dir.join("jest.config.mjs").is_file()
 }
 
-fn gitignore_ignores_bob(dir: &std::path::Path) -> bool {
+pub(crate) fn gitignore_ignores_bob(dir: &std::path::Path) -> bool {
     let Ok(text) = std::fs::read_to_string(dir.join(".gitignore")) else {
         return false;
     };
@@ -64,7 +64,7 @@ fn gitignore_ignores_node_modules(dir: &std::path::Path) -> bool {
     })
 }
 
-fn append_to_gitignore(dir: &std::path::Path, lines: &[&str]) -> std::io::Result<()> {
+pub(crate) fn append_to_gitignore(dir: &std::path::Path, lines: &[&str]) -> std::io::Result<()> {
     let path = dir.join(".gitignore");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let mut new_text = existing.clone();

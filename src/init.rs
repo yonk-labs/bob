@@ -82,6 +82,18 @@ fn detect_opencode() -> bool {
     which("opencode")
 }
 
+/// Make sure `.bob/` (bob's worktrees + run artifacts) can never be committed or
+/// staged by other tools. Idempotent: does nothing if `.gitignore` already ignores
+/// `.bob` in any common form (`/.bob`, `.bob/`, `.bob`). Creates `.gitignore` with a
+/// single `/.bob` line if it doesn't exist yet; otherwise appends `/.bob` on its own
+/// line, preserving existing content.
+fn ensure_bob_gitignored(dir: &std::path::Path) -> std::io::Result<()> {
+    if crate::doctor::gitignore_ignores_bob(dir) {
+        return Ok(());
+    }
+    crate::doctor::append_to_gitignore(dir, &["/.bob"])
+}
+
 pub fn run() -> anyhow::Result<()> {
     if !detect_git() {
         eprintln!("[ERROR] git not found on PATH");
@@ -307,6 +319,13 @@ pub fn run() -> anyhow::Result<()> {
     std::fs::write(&path, yaml)?;
     println!();
     println!("[DONE] Wrote config to ./bob.yaml");
+
+    if let Err(e) = ensure_bob_gitignored(std::path::Path::new(".")) {
+        println!("[WARN] failed to update .gitignore: {e}");
+    } else {
+        println!("[ok] .gitignore ignores /.bob (worktrees + run artifacts)");
+    }
+
     println!("Next: run `bob doctor` to verify tools + config.");
     Ok(())
 }
@@ -329,6 +348,47 @@ mod tests {
     fn detect_git_works() {
         // Just verify the function doesn't panic
         let _ = detect_git();
+    }
+
+    fn tmp_dir(label: &str) -> std::path::PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("bob-init-{label}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn ensure_bob_gitignored_creates_appends_and_is_idempotent() {
+        let dir = tmp_dir("gitignore");
+
+        // Fresh create: no .gitignore yet.
+        assert!(!dir.join(".gitignore").exists());
+        ensure_bob_gitignored(&dir).unwrap();
+        let text = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(text, "/.bob\n");
+
+        // Append-to-existing: pre-existing content without a .bob entry.
+        std::fs::write(dir.join(".gitignore"), "/target\n").unwrap();
+        ensure_bob_gitignored(&dir).unwrap();
+        let text = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(text, "/target\n/.bob\n");
+
+        // Idempotent: running again must not duplicate the entry.
+        ensure_bob_gitignored(&dir).unwrap();
+        let text = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(text, "/target\n/.bob\n");
+
+        // Already-ignored via a different form: must not add a duplicate line.
+        std::fs::write(dir.join(".gitignore"), "node_modules/\n.bob/\n").unwrap();
+        ensure_bob_gitignored(&dir).unwrap();
+        let text = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(text, "node_modules/\n.bob/\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -516,7 +516,10 @@ When you run `bob init`, the installer:
    - Apply by default (default: propose-only)
    - Artifacts directory (default: .bob/runs)
 3. **Writes `bob.yaml`** — the complete configuration
-4. **Guides next steps** — `bob doctor` to verify
+4. **Seeds `.gitignore`** — appends `/.bob` (idempotent) so worktrees and run artifacts
+   under `.bob/` are never committed; committing `.bob/` is unnecessary and can confuse
+   parallel builds
+5. **Guides next steps** — `bob doctor` to verify
 
 Opencode missing? The wizard prints:
 
