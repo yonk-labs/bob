@@ -158,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
             files,
             max_iters,
             model,
+            run_id,
             fallback_models,
             verify_cmds,
             allow_paths,
@@ -204,11 +205,19 @@ async fn main() -> anyhow::Result<()> {
                 None => task.clone(),
             };
             let apply = apply || cfg.apply;
-            let run_id = format!(
-                "{}-{}",
-                std::process::id(),
-                BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            );
+            let run_id = match run_id {
+                Some(id) => {
+                    engine::validate_run_id(&id).map_err(|e| anyhow::anyhow!(e))?;
+                    engine::check_run_id_collision(&cfg.artifacts.dir, &id)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    id
+                }
+                None => format!(
+                    "{}-{}",
+                    std::process::id(),
+                    BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ),
+            };
             let opts = engine::RunOpts {
                 spec: spec_text,
                 context_files: files,

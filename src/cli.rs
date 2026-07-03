@@ -27,6 +27,11 @@ pub enum Command {
         /// Model to build with: a name from builder.models, or a raw provider/model id.
         #[arg(long)]
         model: Option<String>,
+        /// Name this run so its events path (<artifacts.dir>/<run_id>/events.jsonl)
+        /// is known before spawn. Must be fresh (no existing run dir) and
+        /// filesystem/git-ref-safe. Omit to auto-mint an id.
+        #[arg(long)]
+        run_id: Option<String>,
         /// Fallback model to try if the selected model errors or stalls. Repeat for a chain.
         #[arg(long = "fallback-model")]
         fallback_models: Vec<String>,

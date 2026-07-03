@@ -63,6 +63,11 @@ pub struct BuildParams {
     /// Try only the selected `model`: no tier escalation, no fallback models.
     #[serde(default)]
     pub skip_escalation: Option<bool>,
+    /// Name this run so its events path (<artifacts.dir>/<run_id>/events.jsonl)
+    /// is known before spawn. Must be fresh (no existing run dir) and
+    /// filesystem/git-ref-safe. Omit to auto-mint an id.
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[tool_router]
@@ -70,7 +75,9 @@ impl BobServer {
     #[tool(description = "Run the build-verify-judge loop on a task/spec; \
 returns a RunResult JSON with fields: status, base_sha, iterations, applied, \
 next_action, verify, judge, scope, changed_files, stop_reason, final_diff. \
-apply defaults to false (propose only); fallback_models retries builder errors/stalls.")]
+apply defaults to false (propose only); fallback_models retries builder errors/stalls. \
+run_id optionally names the run so its events path is known before spawn — must be \
+fresh and filesystem/git-ref-safe, or the tool errors.")]
     pub async fn build(&self, Parameters(p): Parameters<BuildParams>) -> String {
         json_or_error(run_build(p).await)
     }
@@ -114,17 +121,25 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
         .map(std::path::PathBuf::from)
         .collect();
     let fallback_models = p.fallback_models.unwrap_or_default();
+    let run_id = match p.run_id {
+        Some(id) => {
+            engine::validate_run_id(&id).map_err(|e| anyhow::anyhow!(e))?;
+            engine::check_run_id_collision(&cfg.artifacts.dir, &id).map_err(|e| anyhow::anyhow!(e))?;
+            id
+        }
+        None => format!(
+            "mcp-{}-{}",
+            std::process::id(),
+            MCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+    };
     let opts = engine::RunOpts {
         spec,
         context_files: files,
         apply,
         keep_worktree: p.keep_worktree.unwrap_or(false),
         editable_paths: allow_paths_for_opts,
-        run_id: format!(
-            "mcp-{}-{}",
-            std::process::id(),
-            MCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ),
+        run_id,
         builder_model: None,
         tier: p.tier,
     };

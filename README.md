@@ -351,7 +351,7 @@ bob refuses to use it if it is over 16KB or trips the secret scanner.
 bob build <task> [--spec FILE] [--files ...] [--max-iters N]
   [--verify CMD] [--allow-path PATH] [--max-changed-files N]
   [--max-changed-lines N] [--judge-policy advisory|blocking|retry_on_fail]
-  [--model NAME_OR_ID] [--fallback-model NAME_OR_ID] [--apply] [--keep-worktree]
+  [--model NAME_OR_ID] [--fallback-model NAME_OR_ID] [--run-id ID] [--apply] [--keep-worktree]
 bob doctor            # check git/opencode/abe presence + config
 bob init              # write a starter ./bob.yaml
 bob mcp               # run the stdio MCP server
@@ -371,6 +371,8 @@ bob apply <run_id>    # replay-verify, then git-apply the run's diff to your wor
 - `--judge-policy ...` — override whether Abe is advisory, blocking, or retry feedback.
 - `--model NAME_OR_ID` — override the builder model for this run.
 - `--fallback-model NAME_OR_ID` — fallback builder model for errors/stalls; repeat for a chain.
+- `--run-id ID` — caller names the run so `<artifacts.dir>/<run_id>/events.jsonl` is known
+  before spawn; must be fresh (no existing run dir) and filesystem-safe.
 - `--keep` / `--keep-worktree` — keep the worktree after the run. Artifacts are always kept.
 
 **Cleanup.** Converged runs clean up their worktree automatically; any non-converged

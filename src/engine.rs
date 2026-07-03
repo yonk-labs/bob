@@ -262,6 +262,48 @@ pub fn next_action(state: &LoopState, step: &StepOutcome, judge_policy: JudgePol
     }
 }
 
+/// Allowed caller-supplied `--run-id` / MCP `run_id` format. The id flows raw
+/// into `Path::join` (the artifacts dir) and into the git branch name
+/// `bob/<run_id>` (see worktree::Workspace::create), so it must be both
+/// path-traversal-safe and git-ref-safe. Auto-minted ids (`{pid}-{seq}`,
+/// `mcp-{pid}-{seq}`) never go through this check.
+pub const RUN_ID_FORMAT_HELP: &str =
+    "run-id must be non-empty, at most 64 characters, start with a letter or digit, \
+     contain only letters, digits, '.', '_', '-', and must not contain '..'";
+
+/// Validate a caller-supplied run id against [`RUN_ID_FORMAT_HELP`].
+pub fn validate_run_id(id: &str) -> Result<(), String> {
+    let valid = !id.is_empty()
+        && id.len() <= 64
+        && id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !id.contains("..");
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("invalid --run-id '{id}': {RUN_ID_FORMAT_HELP}"))
+    }
+}
+
+/// Refuse to reuse an existing run dir for a caller-supplied run id — do NOT
+/// silently append into an existing run's artifacts. Auto-minted ids keep the
+/// current create-on-first-event behavior; this only guards the explicit
+/// `--run-id` / MCP `run_id` path, and must run before the build starts
+/// (before any `report::append_event`, which creates the dir on first write).
+pub fn check_run_id_collision(artifacts_dir: &str, run_id: &str) -> Result<(), String> {
+    let dir = Path::new(artifacts_dir).join(run_id);
+    if dir.exists() {
+        Err(format!(
+            "run dir already exists at {}, choose a fresh --run-id",
+            dir.display()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub struct RunOpts {
     pub spec: String,
     pub context_files: Vec<PathBuf>,
@@ -1565,6 +1607,38 @@ mod decision_tests {
         let judge_spec = spec_with_lessons(&opts.spec, Some("- Keep API shape stable."));
         assert!(judge_spec.contains("fix the route"));
         assert!(judge_spec.contains("Keep API shape stable"));
+    }
+
+    #[test]
+    fn validate_run_id_accepts_safe_ids() {
+        assert!(validate_run_id("campaign2-slice3").is_ok());
+        assert!(validate_run_id("a").is_ok());
+        assert!(validate_run_id("run.1").is_ok());
+    }
+
+    #[test]
+    fn validate_run_id_rejects_unsafe_ids() {
+        assert!(validate_run_id("").is_err());
+        assert!(validate_run_id("../x").is_err());
+        assert!(validate_run_id("a/b").is_err());
+        assert!(validate_run_id("a..b").is_err());
+        assert!(validate_run_id("-leading-dash").is_err());
+        assert!(validate_run_id(".leading-dot").is_err());
+        assert!(validate_run_id(&"a".repeat(65)).is_err());
+        assert!(validate_run_id("foo bar").is_err());
+    }
+
+    #[test]
+    fn run_id_collision_blocks_existing_dir_but_not_fresh_id() {
+        let tmp = std::env::temp_dir().join(format!("bob-runid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("taken")).unwrap();
+        let artifacts_dir = tmp.to_string_lossy().to_string();
+
+        assert!(check_run_id_collision(&artifacts_dir, "taken").is_err());
+        assert!(check_run_id_collision(&artifacts_dir, "fresh").is_ok());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
