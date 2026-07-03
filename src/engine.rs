@@ -483,6 +483,13 @@ fn verdict_name(v: Verdict) -> &'static str {
     }
 }
 
+/// A non-converged worktree is often the only correct artifact of the run
+/// (pilot lesson: the diff can be wrong while the tree is right). Keep it;
+/// `bob gc` reaps them.
+fn should_keep_worktree(keep_flag: bool, status: RunStatus) -> bool {
+    keep_flag || status != RunStatus::Converged
+}
+
 fn result_next_action(
     status: RunStatus,
     applied: bool,
@@ -1007,9 +1014,10 @@ pub async fn run(
         let builder_out: BuilderOutcome = match builder.build(&prompt, ws.path()).await {
             Ok(out) => out,
             Err(e) => {
-                if !opts.keep_worktree {
-                    let _ = ws.cleanup();
-                }
+                eprintln!(
+                    "bob: builder error — worktree preserved at {}",
+                    ws.path().display()
+                );
                 return Err(e);
             }
         };
@@ -1193,7 +1201,7 @@ pub async fn run(
         judge: last_judge,
         builder: builder_snapshot,
     };
-    if opts.keep_worktree {
+    if should_keep_worktree(opts.keep_worktree, status) {
         eprintln!("worktree preserved at {}", ws.path().display());
     } else {
         ws.cleanup()?;
@@ -1214,6 +1222,15 @@ mod decision_tests {
             uncertain_streak: 0,
             walltime_exceeded: false,
         }
+    }
+
+    #[test]
+    fn worktree_kept_on_non_converged() {
+        assert!(should_keep_worktree(false, RunStatus::NotConverged));
+        assert!(should_keep_worktree(false, RunStatus::NeedsReview));
+        assert!(should_keep_worktree(false, RunStatus::Error));
+        assert!(!should_keep_worktree(false, RunStatus::Converged));
+        assert!(should_keep_worktree(true, RunStatus::Converged));
     }
 
     #[test]
@@ -1788,7 +1805,7 @@ mod flow_tests {
     }
 
     #[tokio::test]
-    async fn non_converged_run_cleans_worktree_by_default() {
+    async fn non_converged_run_keeps_worktree_by_default() {
         let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("bob-clean-flow-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1857,7 +1874,10 @@ mod flow_tests {
 
         std::env::set_current_dir(prev).unwrap();
         assert_eq!(res.status, RunStatus::NotConverged);
-        assert!(!worktree.exists(), "worktree should be cleaned by default");
+        assert!(
+            worktree.exists(),
+            "non-converged worktree should be preserved by default"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
