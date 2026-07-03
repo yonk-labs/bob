@@ -100,7 +100,9 @@ fn looks_like_command_error(out: &str) -> bool {
         "only one is allowed",
         "no tests found",
         "no test files found",
-        "cannot find module",
+        // ponytail: a missing module is the expected TDD-red for a to-be-created target, not a
+        // broken gate; genuinely broken require-paths on base go unflagged (acceptable — probe
+        // is advisory).
         "could not run",
         "permission denied",
         "not executable",
@@ -141,6 +143,22 @@ mod tests {
     #[test]
     fn preflight_quiet_on_no_gates() {
         assert!(preflight_diagnose(&[], Path::new(".")).is_none());
+    }
+
+    #[test]
+    fn preflight_quiet_on_missing_node_module() {
+        // TDD-red: the test imports a module the task is SUPPOSED to create. This is
+        // expected-red, not a broken gate — must NOT warn (regression guard for #24).
+        let cmd = "echo \"Error: Cannot find module './incorporation'\" && exit 1";
+        assert!(preflight_diagnose(&[cmd.into()], Path::new(".")).is_none());
+    }
+
+    #[test]
+    fn preflight_quiet_on_missing_python_module() {
+        // pytest import-collection error on a to-be-created module; same expected-red
+        // shape as the node case. Confirms this was already unmatched (guards regression).
+        let cmd = "echo \"ModuleNotFoundError: No module named 'src.util'\" && exit 1";
+        assert!(preflight_diagnose(&[cmd.into()], Path::new(".")).is_none());
     }
 
     #[test]

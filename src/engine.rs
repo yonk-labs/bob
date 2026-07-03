@@ -231,9 +231,14 @@ pub fn next_action(state: &LoopState, step: &StepOutcome, judge_policy: JudgePol
                 }
             }
         }
+        // Judge-unavailable is not a judge *fail* — verify already passed, and
+        // verify is the authority per bob.yaml's own stance. `retry_on_fail`
+        // only means "retry/block when the judge explicitly FAILS the diff",
+        // so it applies here same as advisory. `blocking` is the one policy
+        // where the judge must explicitly approve, so unavailable still stops.
         StepOutcome::JudgeUnavailable { .. } => match judge_policy {
-            JudgePolicy::Advisory => LoopAction::Apply,
-            JudgePolicy::Blocking | JudgePolicy::RetryOnFail => LoopAction::Stop {
+            JudgePolicy::Advisory | JudgePolicy::RetryOnFail => LoopAction::Apply,
+            JudgePolicy::Blocking => LoopAction::Stop {
                 reason: StopReason::JudgeUnavailable,
             },
         },
@@ -1241,8 +1246,18 @@ pub async fn run(
                         }
                         Err(e) => {
                             let detail = e.to_string();
-                            if cfg.judge.policy == JudgePolicy::Advisory {
-                                eprintln!("abe advisory unavailable (non-blocking): {detail}");
+                            match cfg.judge.policy {
+                                JudgePolicy::Advisory => {
+                                    eprintln!(
+                                        "abe advisory unavailable (non-blocking): {detail}"
+                                    );
+                                }
+                                JudgePolicy::RetryOnFail => {
+                                    eprintln!(
+                                        "abe judge unavailable — applying on verify authority (policy=retry_on_fail; unavailable is not a judge fail): {detail}"
+                                    );
+                                }
+                                JudgePolicy::Blocking => {}
                             }
                             last_judge = Some(JudgeSnapshot {
                                 policy: cfg.judge.policy,
@@ -1676,6 +1691,39 @@ mod decision_tests {
         assert!(matches!(
             next_action(&s, &step, JudgePolicy::RetryOnFail),
             LoopAction::Apply
+        ));
+    }
+    #[test]
+    fn judge_unavailable_advisory_applies() {
+        let s = state(0, 3);
+        let step = StepOutcome::judge_unavailable("connection refused");
+        assert!(matches!(
+            next_action(&s, &step, JudgePolicy::Advisory),
+            LoopAction::Apply
+        ));
+    }
+    #[test]
+    fn judge_unavailable_retry_on_fail_applies() {
+        // Unavailable is not a judge *fail* — verify already passed, and
+        // retry_on_fail only retries/blocks on an explicit judge FAIL.
+        let s = state(0, 3);
+        let step = StepOutcome::judge_unavailable("connection refused");
+        assert!(matches!(
+            next_action(&s, &step, JudgePolicy::RetryOnFail),
+            LoopAction::Apply
+        ));
+    }
+    #[test]
+    fn judge_unavailable_blocking_stops() {
+        // Blocking is the one policy where the judge must explicitly
+        // approve, so unavailable must still stop the run.
+        let s = state(0, 3);
+        let step = StepOutcome::judge_unavailable("connection refused");
+        assert!(matches!(
+            next_action(&s, &step, JudgePolicy::Blocking),
+            LoopAction::Stop {
+                reason: StopReason::JudgeUnavailable
+            }
         ));
     }
     #[test]
