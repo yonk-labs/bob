@@ -1,5 +1,7 @@
 builder:
-  cmd: opencode
+  cmd: opencode           # optional when `tiers:` (below) has any entries — tiers already pick
+                          # a builder per tier, so `cmd` defaults to "goose" in that case.
+                          # Required (no default) when no tiers are configured.
   timeout_secs: 600
   model: qwen             # default: a name from `models` below, or a raw provider/model id.
                           # omit entirely to use opencode's own default model.

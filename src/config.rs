@@ -23,6 +23,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(try_from = "BuilderCfgRaw")]
 pub struct BuilderCfg {
     pub cmd: String,
     #[serde(default = "default_builder_timeout")]
@@ -75,6 +76,65 @@ pub struct BuilderCfg {
     /// otherwise goose makes no edits and bob reports EmptyDiffAfterCritique.
     #[serde(default)]
     pub goose_toolshim: bool,
+}
+
+/// Deserialization shadow for `BuilderCfg`: `cmd` is optional here so it can
+/// be defaulted to "goose" when `tiers` is configured — tiers already pick a
+/// builder per tier, so requiring `cmd` too was redundant. With no tiers and
+/// no `cmd`, deserialization still fails exactly as it always has.
+#[derive(Debug, Clone, Deserialize)]
+struct BuilderCfgRaw {
+    #[serde(default)]
+    cmd: Option<String>,
+    #[serde(default = "default_builder_timeout")]
+    timeout_secs: u64,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    models: BTreeMap<String, ModelDef>,
+    #[serde(default)]
+    fallback_models: Vec<String>,
+    #[serde(default)]
+    tiers: TierCfg,
+    #[serde(default = "default_escalation_policy")]
+    escalation_policy: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default = "default_reliability_weight")]
+    reliability_weight: f64,
+    #[serde(default)]
+    pin: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
+    #[serde(default)]
+    goose_toolshim: bool,
+}
+
+impl TryFrom<BuilderCfgRaw> for BuilderCfg {
+    type Error = String;
+
+    fn try_from(raw: BuilderCfgRaw) -> Result<Self, Self::Error> {
+        let cmd = match raw.cmd {
+            Some(cmd) => cmd,
+            None if raw.tiers.any_configured() => "goose".to_string(),
+            None => return Err("missing field `cmd`".to_string()),
+        };
+        #[allow(deprecated)]
+        Ok(BuilderCfg {
+            cmd,
+            timeout_secs: raw.timeout_secs,
+            model: raw.model,
+            models: raw.models,
+            fallback_models: raw.fallback_models,
+            tiers: raw.tiers,
+            escalation_policy: raw.escalation_policy,
+            args: raw.args,
+            reliability_weight: raw.reliability_weight,
+            pin: raw.pin,
+            exclude: raw.exclude,
+            goose_toolshim: raw.goose_toolshim,
+        })
+    }
 }
 
 fn default_reliability_weight() -> f64 {
@@ -524,6 +584,44 @@ verify: { cmds: [] }
         assert!(b.is_excluded("qwen")); // by alias
         assert!(b.is_excluded("ollama/Intel/Qwen3-Coder")); // by resolved id
         assert!(!b.is_excluded("minimax/MiniMax-M3")); // unrelated model
+    }
+
+    #[test]
+    fn cmd_defaults_to_goose_when_tiers_configured() {
+        let yaml = r#"
+builder:
+  tiers:
+    cheap: [qwen-193]
+judge: { cmd: abe }
+"#;
+        let b = serde_yaml::from_str::<Config>(yaml).unwrap().builder;
+        assert_eq!(b.cmd, "goose");
+    }
+
+    #[test]
+    fn explicit_cmd_wins_over_tiers_default() {
+        let yaml = r#"
+builder:
+  cmd: opencode
+  tiers:
+    cheap: [qwen-193]
+judge: { cmd: abe }
+"#;
+        let b = serde_yaml::from_str::<Config>(yaml).unwrap().builder;
+        assert_eq!(b.cmd, "opencode");
+    }
+
+    #[test]
+    fn missing_cmd_without_tiers_errors_like_today() {
+        // No tiers configured and no cmd given → still a hard error, matching
+        // the pre-existing "missing field `cmd`" behavior (unwrap panics were
+        // the norm here before tiers existed).
+        let yaml = "builder: {}\njudge: { cmd: abe }\n";
+        let err = serde_yaml::from_str::<Config>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("missing field `cmd`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
