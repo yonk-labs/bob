@@ -20,6 +20,8 @@ pub struct Campaign {
     pub auto_commit: bool,
     #[serde(default)]
     pub max_slices: Option<usize>,
+    #[serde(default)]
+    pub verify_cmds: Vec<String>,
     pub slices: Vec<Slice>,
 }
 
@@ -63,6 +65,14 @@ pub struct CampaignReport {
     pub status: String,
     pub result_path: String,
     pub slices: Vec<SliceReport>,
+    pub campaign_verify: Option<CampaignVerify>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CampaignVerify {
+    pub passed: bool,
+    pub cmd: Option<String>,
+    pub output_tail: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -167,11 +177,26 @@ pub async fn run(campaign: Campaign, base_cfg: &Config) -> anyhow::Result<Campai
         }
     }
 
+    let mut campaign_verify = None;
+    let mut status = if completed { "completed" } else { "stopped" }.to_string();
+    if completed && !campaign.verify_cmds.is_empty() {
+        let cwd = std::env::current_dir()?;
+        let vr = crate::verify::run_gates(&campaign.verify_cmds, &cwd);
+        if !vr.passed {
+            status = "integration_failed".into();
+        }
+        campaign_verify = Some(CampaignVerify {
+            passed: vr.passed,
+            cmd: vr.cmd.clone(),
+            output_tail: crate::builder::tail(&vr.output, 4000),
+        });
+    }
     let report = CampaignReport {
         name,
-        status: if completed { "completed" } else { "stopped" }.into(),
+        status,
         result_path: result_path_str,
         slices: reports,
+        campaign_verify,
     };
     write_result_artifact(&result_path, &report)?;
     Ok(report)
@@ -321,6 +346,7 @@ mod tests {
             auto_apply: true,
             auto_commit: false,
             max_slices: None,
+            verify_cmds: vec![],
             slices: vec![slice("a"), slice("b")],
         };
         assert!(validate(&c).is_err());
@@ -336,6 +362,7 @@ mod tests {
             status: "completed".into(),
             result_path: path.to_string_lossy().to_string(),
             slices: vec![],
+            campaign_verify: None,
         };
 
         write_result_artifact(&path, &report).unwrap();
@@ -409,6 +436,13 @@ slices:
         assert_eq!(s.max_changed_lines, Some(50));
         assert_eq!(s.tier.as_deref(), Some("medium"));
         assert!(matches!(s.judge_policy, Some(JudgePolicy::Blocking)));
+    }
+
+    #[test]
+    fn campaign_level_verify_cmds_parse() {
+        let y = "name: c\nverify_cmds: [\"npm run test:all\"]\nslices:\n  - task: t\n";
+        let c: Campaign = serde_yaml::from_str(y).unwrap();
+        assert_eq!(c.verify_cmds, vec!["npm run test:all"]);
     }
 
     fn slice(task: &str) -> Slice {
