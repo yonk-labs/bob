@@ -1,5 +1,5 @@
 use crate::builder::{Builder, BuilderOutcome};
-use crate::config::{Config, JudgePolicy};
+use crate::config::{Config, JudgePolicy, VerifyCfg};
 use crate::judge::{Abe, Judge, Verdict};
 use crate::scope;
 use crate::verify::run_gates;
@@ -106,6 +106,27 @@ fn reset_test_files(workdir: &Path, base_sha: &str, editable_paths: &[String]) -
             .status();
     }
     test_files
+}
+
+/// Which verify gate set runs THIS iteration, and whether it's the focused
+/// subset. `focused_cmds` is only honored when `replay` is enabled AND `cmds`
+/// is non-empty — those two together are what guarantee the full suite still
+/// gates the run (at replay-verify). Otherwise the full suite must gate every
+/// iteration directly, so focused_cmds is ignored (with a one-line warning).
+fn iteration_verify_cmds(verify: &VerifyCfg) -> (&[String], bool) {
+    if verify.focused_cmds.is_empty() {
+        return (&verify.cmds, false);
+    }
+    if verify.replay && !verify.cmds.is_empty() {
+        (&verify.focused_cmds, true)
+    } else {
+        eprintln!(
+            "bob: verify.focused_cmds is set but ignored this iteration — requires verify.replay=true \
+             and a non-empty verify.cmds (the full suite must gate the run somewhere); running the full \
+             verify.cmds instead"
+        );
+        (&verify.cmds, false)
+    }
 }
 
 #[derive(Debug)]
@@ -1119,7 +1140,8 @@ pub async fn run(
             if !sr.within {
                 StepOutcome::scope_exceeded(&sr.detail)
             } else {
-                let vr = run_gates(&cfg.verify.cmds, ws.path());
+                let (iter_verify_cmds, focused) = iteration_verify_cmds(&cfg.verify);
+                let vr = run_gates(iter_verify_cmds, ws.path());
                 last_verify = Some(VerifySnapshot {
                     passed: vr.passed,
                     cmd: vr.cmd.clone(),
@@ -1128,7 +1150,7 @@ pub async fn run(
                 crate::report::append_event(
                     art,
                     &opts.run_id,
-                    serde_json::json!({"event": "verify", "iter": state.index, "passed": vr.passed}),
+                    serde_json::json!({"event": "verify", "iter": state.index, "passed": vr.passed, "focused": focused}),
                 );
                 if !vr.passed {
                     StepOutcome::VerifyFailed { output: vr.output }
@@ -1384,6 +1406,50 @@ mod decision_tests {
         assert!(should_keep_worktree(false, RunStatus::Error));
         assert!(!should_keep_worktree(false, RunStatus::Converged));
         assert!(should_keep_worktree(true, RunStatus::Converged));
+    }
+
+    fn verify_cfg(cmds: Vec<&str>, replay: bool, focused_cmds: Vec<&str>) -> crate::config::VerifyCfg {
+        crate::config::VerifyCfg {
+            cmds: cmds.into_iter().map(String::from).collect(),
+            replay,
+            focused_cmds: focused_cmds.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn focused_cmds_used_when_replay_on_and_cmds_nonempty() {
+        let v = verify_cfg(vec!["cargo test"], true, vec!["cargo check"]);
+        let (cmds, focused) = iteration_verify_cmds(&v);
+        assert_eq!(cmds, &["cargo check".to_string()]);
+        assert!(focused);
+    }
+
+    #[test]
+    fn focused_cmds_ignored_when_replay_disabled() {
+        // SAFETY RULE: replay off means the full suite never gates the run
+        // anywhere else, so focused_cmds must be ignored and the full cmds run.
+        let v = verify_cfg(vec!["cargo test"], false, vec!["cargo check"]);
+        let (cmds, focused) = iteration_verify_cmds(&v);
+        assert_eq!(cmds, &["cargo test".to_string()]);
+        assert!(!focused);
+    }
+
+    #[test]
+    fn focused_cmds_ignored_when_cmds_empty() {
+        // SAFETY RULE: no full suite configured at all means there is nothing
+        // for replay to gate with, so focused_cmds must be ignored too.
+        let v = verify_cfg(vec![], true, vec!["cargo check"]);
+        let (cmds, focused) = iteration_verify_cmds(&v);
+        assert!(cmds.is_empty());
+        assert!(!focused);
+    }
+
+    #[test]
+    fn no_focused_cmds_configured_runs_full_cmds_unchanged() {
+        let v = verify_cfg(vec!["cargo test"], true, vec![]);
+        let (cmds, focused) = iteration_verify_cmds(&v);
+        assert_eq!(cmds, &["cargo test".to_string()]);
+        assert!(!focused);
     }
 
     #[test]
@@ -1897,6 +1963,7 @@ mod flow_tests {
             verify: crate::config::VerifyCfg {
                 cmds: vec!["true".into()],
                 replay: true,
+                focused_cmds: vec![],
             }, // gate that passes
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,
@@ -1983,6 +2050,7 @@ mod flow_tests {
             verify: crate::config::VerifyCfg {
                 cmds: vec!["true".into()],
                 replay: true,
+                focused_cmds: vec![],
             },
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,
@@ -2075,6 +2143,7 @@ mod flow_tests {
             verify: crate::config::VerifyCfg {
                 cmds: vec![],
                 replay: true,
+                focused_cmds: vec![],
             },
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,
@@ -2160,6 +2229,7 @@ mod flow_tests {
             verify: crate::config::VerifyCfg {
                 cmds: verify_cmds,
                 replay: true,
+                focused_cmds: vec![],
             },
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,
@@ -2282,6 +2352,182 @@ mod flow_tests {
             "reported as an infra error, not a builder/judge failure: {msg}"
         );
         assert!(msg.contains("setup-cmd-boom"), "carries the cmd's stderr: {msg}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn focused_test_cfg(cmds: Vec<String>, focused_cmds: Vec<String>, replay: bool) -> Config {
+        crate::config::Config {
+            builder: crate::config::BuilderCfg {
+                cmd: "opencode".into(),
+                timeout_secs: 5,
+                args: vec![],
+                model: None,
+                models: Default::default(),
+                fallback_models: vec![],
+                tiers: Default::default(),
+                escalation_policy: "tier".into(),
+                reliability_weight: 0.5,
+                pin: vec![],
+                exclude: vec![],
+                goose_toolshim: false,
+            },
+            judge: crate::config::JudgeCfg {
+                cmd: "abe".into(),
+                mode: crate::config::JudgeMode::Validate,
+                timeout_secs: 600,
+                policy: crate::config::JudgePolicy::Advisory,
+            },
+            verify: crate::config::VerifyCfg {
+                cmds,
+                replay,
+                focused_cmds,
+            },
+            loop_cfg: crate::config::LoopCfg {
+                max_iterations: 3,
+                max_walltime_secs: 60,
+            },
+            scope: Default::default(),
+            apply: false,
+            artifacts: Default::default(),
+            context: Default::default(),
+            worktree: Default::default(),
+        }
+    }
+
+    /// (a) Focused runs in-loop while replay runs the full suite. The focused
+    /// gate ("true") passes every iteration so the loop converges fast, but
+    /// the full suite ("true" && "false") only runs at replay-verify and its
+    /// second gate always fails — proving the run flows through the existing
+    /// replay-failed path, NOT converged-clean, when the full suite disagrees
+    /// with the focused one.
+    #[tokio::test]
+    async fn focused_verify_in_loop_full_cmds_gate_at_replay() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-focused-flow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let g = |a: &[&str]| {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(tmp.join("seed.txt"), "x\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(
+            vec!["true".into(), "false".into()], // full suite: second gate always fails
+            vec!["true".into()],                 // focused gate: always passes
+            true,
+        );
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "focused-flow".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let res = run(&cfg, opts, &ChangeOnceBuilder, &UncertainJudge)
+            .await
+            .unwrap();
+
+        // events.jsonl proves the in-loop gate that actually ran was the
+        // focused one, not the full suite.
+        let events = std::fs::read_to_string(
+            tmp.join(".bob/runs/focused-flow/events.jsonl"),
+        )
+        .unwrap();
+        let verify_lines: Vec<serde_json::Value> = events
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["event"] == "verify")
+            .collect();
+        assert_eq!(verify_lines.len(), 1);
+        assert_eq!(verify_lines[0]["focused"], true);
+        assert_eq!(verify_lines[0]["passed"], true);
+
+        std::env::set_current_dir(prev).unwrap();
+        // Converged in-loop on the focused gate, but the full suite fails at
+        // replay-verify — the run must NOT report converged-clean.
+        assert_eq!(res.status, RunStatus::NotConverged);
+        assert_eq!(res.stop_reason, Some(StopReason::ReplayVerifyFailed));
+        assert_eq!(res.iterations, 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// (b) SAFETY RULE: focused_cmds is ignored when replay is disabled — the
+    /// full suite must gate the run somewhere, so with replay off the full
+    /// cmds run every iteration exactly as before. If focused_cmds ("false")
+    /// were honored here instead, the run would never converge.
+    #[tokio::test]
+    async fn focused_cmds_ignored_when_replay_disabled_flow() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-focused-unsafe-flow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let g = |a: &[&str]| {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(tmp.join("seed.txt"), "x\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(
+            vec!["true".into()],  // full suite: always passes
+            vec!["false".into()], // focused gate: would always fail if honored
+            false,                // replay DISABLED — focused_cmds must be ignored
+        );
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "focused-unsafe-flow".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let res = run(&cfg, opts, &ChangeOnceBuilder, &UncertainJudge)
+            .await
+            .unwrap();
+
+        let events = std::fs::read_to_string(
+            tmp.join(".bob/runs/focused-unsafe-flow/events.jsonl"),
+        )
+        .unwrap();
+        let verify_lines: Vec<serde_json::Value> = events
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["event"] == "verify")
+            .collect();
+        assert_eq!(verify_lines.len(), 1);
+        assert_eq!(verify_lines[0]["focused"], false);
+        assert_eq!(verify_lines[0]["passed"], true);
+
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(res.status, RunStatus::Converged);
+        assert_eq!(res.iterations, 1);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

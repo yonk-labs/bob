@@ -430,6 +430,14 @@ pub struct VerifyCfg {
     /// success; the payoff is a diff that is trustworthy for unattended apply.
     #[serde(default = "default_replay")]
     pub replay: bool,
+    /// Optional fast/focused gate(s) run per-iteration INSTEAD of the full
+    /// `cmds` list, cutting CPU-only wall-clock inside the build loop. Only
+    /// takes effect when `replay` is true and `cmds` is non-empty — the full
+    /// `cmds` suite always still runs at replay-verify (and gates apply), so
+    /// a focused-converged run whose full suite fails at replay flows through
+    /// the normal replay-failure path. Ignored (with a warning) otherwise.
+    #[serde(default)]
+    pub focused_cmds: Vec<String>,
 }
 fn default_replay() -> bool {
     true
@@ -439,6 +447,7 @@ impl Default for VerifyCfg {
         Self {
             cmds: vec![],
             replay: default_replay(),
+            focused_cmds: vec![],
         }
     }
 }
@@ -753,6 +762,32 @@ worktree:
                 "echo second".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn focused_cmds_defaults_to_empty() {
+        let yaml = "builder: { cmd: opencode }\njudge: { cmd: abe }\nverify: { cmds: [cargo test] }";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.verify.focused_cmds.is_empty());
+    }
+
+    #[test]
+    fn focused_cmds_parses_from_yaml() {
+        let yaml = r#"
+builder:
+  cmd: opencode
+judge:
+  cmd: abe
+verify:
+  cmds: ["cargo test"]
+  focused_cmds: ["cargo check", "cargo test --lib fast_case"]
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.verify.focused_cmds,
+            vec!["cargo check".to_string(), "cargo test --lib fast_case".to_string()]
+        );
+        assert_eq!(cfg.verify.cmds, vec!["cargo test".to_string()]);
     }
 
     #[test]

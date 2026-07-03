@@ -20,6 +20,12 @@ verify:
   cmds:                   # objective gate(s) — your guardrails. ALL must pass.
     - cargo test          #   add lints/scanners here too, e.g. "cargo clippy -- -D warnings"
                           # empty list = no gate (converges on first diff; warned)
+  replay: true            # re-run cmds against a fresh worktree before reporting converged
+  focused_cmds: []        # optional fast gate(s) run PER-ITERATION instead of cmds, e.g.
+                          #   ["cargo check", "cargo test --lib fast_case"]. cmds still runs
+                          # in full at replay-verify and gates the run — this only speeds up
+                          # the in-loop build/verify cycle. Ignored (full cmds run instead,
+                          # with a warning) unless replay: true AND cmds is non-empty.
 loop:
   max_iterations: 3
   max_walltime_secs: 1800

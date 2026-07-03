@@ -281,6 +281,7 @@ pub fn run() -> anyhow::Result<()> {
         verify: crate::config::VerifyCfg {
             cmds: verify_cmds,
             replay: true,
+            focused_cmds: vec![],
         },
         loop_cfg: crate::config::LoopCfg {
             max_iterations,
@@ -413,6 +414,7 @@ artifacts:
                     "echo ' special \" chars ".to_string(),
                 ],
                 replay: true,
+                focused_cmds: vec![],
             },
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,
