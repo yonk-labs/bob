@@ -429,7 +429,8 @@ fn build_prompt(opts: &RunOpts, critique: Option<&str>, lessons: Option<&str>) -
            end of your response explaining what you think is wrong and why. This will be reported back.\n\
          - Match the API signature the test expects exactly. The spec is the contract.\n\
          - Do NOT modify test files (tests/, *_test.*, *.test.*). Tests are frozen.\n\
-         - Implement to make the test/gate pass — don't change the contract.\n",
+         - Implement to make the test/gate pass — don't change the contract.\n\
+         - Every tool call must include ALL required parameters (e.g. a file write needs both the path AND the full content). Never emit a partial tool call.\n",
         opts.spec
     );
     if !opts.editable_paths.is_empty() {

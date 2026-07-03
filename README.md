@@ -29,6 +29,31 @@ back into the builder.
 
 ---
 
+## What's new in 0.3.0
+
+- **Replay-verify.** Converged runs now re-apply the final diff to a fresh worktree at
+  base and re-run the verify gates there before reporting `converged` — catches gates
+  that only passed because of leftover builder-worktree state. On by default
+  (`verify.replay: true`); a replay failure reports `ReplayVerifyFailed` /
+  `human_decision_required` instead of applying blind. See `bob replay` / `bob apply`.
+- **Context ceilings.** `context.soft_tokens` / `context.hard_tokens` in `bob.yaml` cap
+  the estimated prompt size sent to the builder — warn past soft, refuse the run past
+  hard. `RunResult.context_est_tokens` and per-iteration `prompt_est_tokens` report
+  what was actually sent.
+- **Worktrees are kept by default** on any non-converged outcome (previously reaped
+  the same as converged runs), so you can inspect what the builder actually did;
+  `bob gc` reaps them when you're done.
+- **Editable test paths.** Test files listed under `allow_paths`/`editable_paths` are no
+  longer silently reverted — the builder may edit them as part of the deliverable. Any
+  test-file resets that *do* happen (paths outside that exemption) are reported in
+  `RunResult.reset_test_files`.
+- **Telemetry.** Every run writes `<artifacts>/<run_id>/run.json` (the full `RunResult`)
+  and `events.jsonl` (one timestamped JSON event per loop step).
+- **Campaign integration gate.** A campaign file's top-level `verify_cmds` runs once
+  after all slices land, catching cross-slice interactions no single slice's gate would see.
+
+---
+
 ## Agent Lifecycle
 
 Bob is intentionally narrow: it builds one bounded slice and reports exactly what happened.
@@ -164,9 +189,14 @@ judge:
 verify:
   cmds:                   # objective gate(s); run in order, stop at first failure.
     - cargo test          # empty list => no gate (bob warns; converges on first diff)
+  replay: true            # re-apply the final diff to a fresh worktree at base and
+                          # re-run the gates there before reporting converged (default: true)
 loop:
   max_iterations: 3
   max_walltime_secs: 1800
+context:
+  soft_tokens: 16000       # warn when the estimated builder prompt exceeds this
+  hard_tokens: 32000       # refuse the run outright past this
 scope:
   max_changed_files: 20   # reject a runaway diff
   max_changed_lines: 800
@@ -272,6 +302,16 @@ unfairly tanked a model's score). `bob stats` shows scores under your configured
   to pass; `retry_on_fail` feeds Abe critique back into the builder.
 - **Secret scan** on inputs + the diff, **propose-by-default** (no `--apply` = no writes),
   and bounded iteration (`max_iterations` / `max_walltime_secs`).
+- **Replay-verify** (`verify.replay`, default on) — before reporting converged, bob
+  re-applies the final diff to a fresh worktree at base and re-runs the verify gates
+  there. A replay failure stops the run (`ReplayVerifyFailed`) instead of applying.
+- **Context ceilings** (`context.soft_tokens` / `hard_tokens`) — bob estimates the
+  builder prompt size before each attempt; past `soft_tokens` it warns, past
+  `hard_tokens` it refuses the run rather than send a prompt local models choke on.
+- **Frozen tests, with an exemption** — test files are frozen by default; listing one
+  under `editable_paths`/`allow_paths` makes it part of the deliverable. Any test file
+  the builder touches outside that exemption is reset to its base_sha state and
+  reported in `RunResult.reset_test_files`.
 
 **Project lessons.** If `.bob/lessons.md` exists, bob includes it in builder and judge
 context so repeated local pitfalls are not rediscovered every run. Keep it short and factual;
@@ -289,6 +329,8 @@ bob init              # write a starter ./bob.yaml
 bob mcp               # run the stdio MCP server
 bob gc [--dry-run]    # remove stale .bob/worktrees/* and bob/* branches
 bob campaign --file campaign.yaml
+bob replay <run_id>   # re-run replay-verify for a past run, read-only
+bob apply <run_id>    # replay-verify, then git-apply the run's diff to your working tree
 ```
 
 - `--apply` — apply the candidate to your working tree on convergence (default: propose only).
@@ -303,13 +345,42 @@ bob campaign --file campaign.yaml
 - `--fallback-model NAME_OR_ID` — fallback builder model for errors/stalls; repeat for a chain.
 - `--keep` / `--keep-worktree` — keep the worktree after the run. Artifacts are always kept.
 
-**Cleanup.** `bob gc --dry-run` shows stale Bob worktrees and `bob/*` branches; `bob gc`
-removes them. Use it after interrupted or non-converged runs if later tooling trips over
-`.bob/worktrees`. Normal completed runs clean their worktree by default, including
-non-converged runs; inspect `artifact_dir` and `final_diff` instead.
+**Cleanup.** Converged runs clean up their worktree automatically; any non-converged
+outcome (`not_converged`, `needs_review`, `error`) **keeps** its worktree by default so
+you can inspect what the builder actually did — `bob gc --dry-run` shows stale Bob
+worktrees and `bob/*` branches, `bob gc` removes them. Pass `--keep`/`--keep-worktree`
+to keep a converged run's worktree too.
 For JS/Jest repos, `bob doctor` warns if `.gitignore` does not ignore `/.bob`.
 
+**Replay & apply.** `bob replay <run_id>` re-applies a past run's recorded `final_diff`
+to a fresh worktree at its `base_sha` and re-runs the verify gates — read-only, exits
+`1` on failure. `bob apply <run_id>` does the same replay-verify, then `git apply`s the
+diff to your current working tree (unstaged); it refuses if `HEAD` has moved off the
+run's `base_sha` rather than apply against a moved target. Useful for an unattended run
+that reported `converged` but you want to double-check before trusting the diff, or one
+where `apply: false` left a candidate you're now ready to use:
+
+```bash
+bob build "fix the flaky retry test" --max-iters 5   # unattended, apply: false
+# ... later, sanity-check before trusting the candidate:
+bob replay a1b2c3d4                                  # re-verify in a clean worktree
+bob apply a1b2c3d4                                   # replay passes -> apply to working tree
+```
+
 **Exit codes:** `0` converged, `1` did not converge / error. (So CI and agents can detect failure.)
+
+## Telemetry
+
+Every run writes two files under `<artifacts.dir>/<run_id>/`, alongside the existing
+per-iteration `iter-N/{prompt.txt,diff.patch,verdict.txt}`:
+
+- **`run.json`** — the full `RunResult` as JSON: status, next_action, verify/judge/scope
+  detail, `final_diff`, `verify_cmds`, `context_est_tokens`, `reset_test_files`, and more.
+  This is what `bob replay`/`bob apply` read back in.
+- **`events.jsonl`** — one timestamped JSON object per loop step (build attempt, verify
+  result, test-file resets, judge verdict, replay-verify, run end), so you can reconstruct
+  a run's timeline without re-parsing prose logs. Best-effort — a write failure here never
+  fails the run.
 
 ## Campaigns
 
@@ -322,6 +393,8 @@ surface for Hector output: tests/specs go in `reference_paths`, production files
 ```yaml
 name: roster-plan-api
 auto_commit: true          # implies apply; creates one commit per converged slice
+verify_cmds:
+  - npm run test:all        # integration gate — runs once after all slices land
 slices:
   - name: summary endpoint
     task: Implement GET /api/roster-plan so the focused test passes.
@@ -339,6 +412,12 @@ Each slice may override `verify_cmds`, `editable_paths`/`allow_paths`, scope cap
 `judge_policy`, `model`, and `fallback_models`. Campaign output is JSON with per-slice status,
 changed files, artifact directory, final diff, and `result_path`. Bob also writes the same JSON
 to that path under `.bob/runs/`; feed it to `hector review` when Hector created the campaign.
+
+A top-level `verify_cmds` (as opposed to a slice's) is an **integration gate**: once all
+slices land, it runs once against the fully-merged tree, in `auto_apply`/`auto_commit`
+campaigns only. It catches interactions between slices that no individual slice's verify
+command would see. Failure reports campaign status `integration_failed` instead of the
+per-slice statuses.
 
 ## MCP server
 
