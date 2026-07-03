@@ -403,6 +403,15 @@ fn build_judge_spec(
             ));
         }
     }
+    out.push_str(
+        "\n\n## JUDGING RUBRIC\n\
+         Extract the concrete acceptance criteria from the TASK/SPEC above \
+         (explicit bullets, 'must'/'should' clauses, numeric limits, named commands). \
+         Evaluate the diff against EACH criterion. List every violated criterion as a \
+         disagreement, quoting the criterion text. If all criteria hold, state that \
+         explicitly. Never return a fail verdict without naming at least one violated \
+         criterion.",
+    );
     out
 }
 
@@ -1961,5 +1970,12 @@ mod flow_tests {
             "non-converged worktree should be preserved by default"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn judge_spec_carries_rubric_instruction() {
+        let s = build_judge_spec("do the thing", None, &[], std::path::Path::new("."));
+        assert!(s.contains("## JUDGING RUBRIC"));
+        assert!(s.contains("EACH criterion"));
     }
 }
