@@ -22,6 +22,9 @@ pub struct Config {
     pub worktree: WorktreeCfg,
 }
 
+// NOTE: try_from routes ALL deserialization through BuilderCfgRaw — field-level
+// serde attrs on THIS struct (default/rename/alias/...) are dead for deserialize
+// and must be mirrored on BuilderCfgRaw to take effect.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(try_from = "BuilderCfgRaw")]
 pub struct BuilderCfg {
@@ -82,6 +85,8 @@ pub struct BuilderCfg {
 /// be defaulted to "goose" when `tiers` is configured — tiers already pick a
 /// builder per tier, so requiring `cmd` too was redundant. With no tiers and
 /// no `cmd`, deserialization still fails exactly as it always has.
+/// KEEP FIELDS AND SERDE ATTRS IN SYNC with `BuilderCfg` — attrs on that
+/// struct do nothing for deserialize; only the ones here take effect.
 #[derive(Debug, Clone, Deserialize)]
 struct BuilderCfgRaw {
     #[serde(default)]

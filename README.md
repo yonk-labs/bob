@@ -46,6 +46,13 @@ back into the builder.
   `goose` — tiers already pick the builder per tier.
 - **MCP `tier` param.** The MCP `build` tool accepts `tier` like the CLI's `--tier`
   (an explicit `model` pin is still tried first).
+- **`bob models --json`.** Machine-readable tier→endpoint map (default model/tier,
+  tiers with their model lists, per-model id + explicit `base_url` or null — never
+  guessed). Built for orchestrators: dispatch round-robin across endpoints,
+  escalation-ladder sync, pre-dispatch tier checks.
+- **`verify_start` event.** `events.jsonl` now marks the moment a run enters its
+  verify phase — the unambiguous "builder endpoint is free" signal an orchestrator
+  needs to pipeline the next slice's builder.
 - Doctor also now acknowledges tier-less `cmd: goose` correctly and, for JS repos, warns
   to exclude `.bob/**` in the test runner (not just `.gitignore`) so kept worktrees don't
   double your suite.
