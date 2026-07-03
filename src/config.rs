@@ -357,10 +357,26 @@ impl std::str::FromStr for JudgePolicy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VerifyCfg {
     #[serde(default)]
     pub cmds: Vec<String>,
+    /// Re-apply the final diff to a fresh worktree at base and re-run the
+    /// gates before reporting converged. The cost is one extra verify run on
+    /// success; the payoff is a diff that is trustworthy for unattended apply.
+    #[serde(default = "default_replay")]
+    pub replay: bool,
+}
+fn default_replay() -> bool {
+    true
+}
+impl Default for VerifyCfg {
+    fn default() -> Self {
+        Self {
+            cmds: vec![],
+            replay: default_replay(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

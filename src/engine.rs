@@ -126,6 +126,7 @@ pub enum StopReason {
     SecretScanBlocked,
     JudgeRejected,
     JudgeUnavailable,
+    ReplayVerifyFailed,
 }
 
 /// Mutable per-loop history the decision function reads.
@@ -529,6 +530,7 @@ fn result_next_action(
         Some(StopReason::EmptyDiffAfterCritique) => NextAction::EscalateModel,
         Some(StopReason::RepeatedVerifyFailure) => NextAction::RetryWithVerifyFailure,
         Some(StopReason::JudgeRejected) => NextAction::RetryWithJudgeCritique,
+        Some(StopReason::ReplayVerifyFailed) => NextAction::HumanDecisionRequired,
         _ => NextAction::HumanDecisionRequired,
     }
 }
@@ -1157,16 +1159,39 @@ pub async fn run(
                     status = RunStatus::NotConverged;
                     stop_reason = Some(StopReason::SecretScanBlocked);
                 } else {
-                    status = RunStatus::Converged;
-                    if opts.apply {
-                        ws.commit_candidate(&format!(
-                            "bob: {}",
-                            opts.spec.lines().next().unwrap_or("change")
-                        ))?;
-                        match ws.apply_to_main()? {
-                            ApplyOutcome::Applied => applied = true,
-                            ApplyOutcome::BaseMoved => {
-                                eprintln!("base moved since run started — not applying; candidate diff returned");
+                    let replay_ok = if cfg.verify.replay && !cfg.verify.cmds.is_empty() {
+                        match ws.replay_verify(&opts.run_id, &final_diff, &cfg.verify.cmds) {
+                            Ok(vr) if vr.passed => true,
+                            Ok(vr) => {
+                                eprintln!(
+                                    "bob: replay-verify FAILED — the final diff does not reproduce a passing tree at base ({})",
+                                    vr.cmd.as_deref().unwrap_or("gate")
+                                );
+                                false
+                            }
+                            Err(e) => {
+                                eprintln!("bob: replay-verify error: {e}");
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
+                    if !replay_ok {
+                        status = RunStatus::NotConverged;
+                        stop_reason = Some(StopReason::ReplayVerifyFailed);
+                    } else {
+                        status = RunStatus::Converged;
+                        if opts.apply {
+                            ws.commit_candidate(&format!(
+                                "bob: {}",
+                                opts.spec.lines().next().unwrap_or("change")
+                            ))?;
+                            match ws.apply_to_main()? {
+                                ApplyOutcome::Applied => applied = true,
+                                ApplyOutcome::BaseMoved => {
+                                    eprintln!("base moved since run started — not applying; candidate diff returned");
+                                }
                             }
                         }
                     }
@@ -1730,6 +1755,7 @@ mod flow_tests {
             },
             verify: crate::config::VerifyCfg {
                 cmds: vec!["true".into()],
+                replay: true,
             }, // gate that passes
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,
@@ -1813,6 +1839,7 @@ mod flow_tests {
             },
             verify: crate::config::VerifyCfg {
                 cmds: vec!["true".into()],
+                replay: true,
             },
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,
@@ -1900,7 +1927,10 @@ mod flow_tests {
                 timeout_secs: 600,
                 policy: crate::config::JudgePolicy::Advisory,
             },
-            verify: crate::config::VerifyCfg { cmds: vec![] },
+            verify: crate::config::VerifyCfg {
+                cmds: vec![],
+                replay: true,
+            },
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,
                 max_walltime_secs: 60,

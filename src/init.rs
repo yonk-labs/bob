@@ -278,7 +278,10 @@ pub fn run() -> anyhow::Result<()> {
             timeout_secs: judge_timeout,
             policy: JudgePolicy::Advisory,
         },
-        verify: crate::config::VerifyCfg { cmds: verify_cmds },
+        verify: crate::config::VerifyCfg {
+            cmds: verify_cmds,
+            replay: true,
+        },
         loop_cfg: crate::config::LoopCfg {
             max_iterations,
             max_walltime_secs: max_walltime,
@@ -407,6 +410,7 @@ artifacts:
                     "cargo test".to_string(),
                     "echo ' special \" chars ".to_string(),
                 ],
+                replay: true,
             },
             loop_cfg: crate::config::LoopCfg {
                 max_iterations: 3,

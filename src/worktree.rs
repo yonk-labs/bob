@@ -103,6 +103,41 @@ pub fn gc(dry_run: bool) -> anyhow::Result<GcReport> {
     })
 }
 
+/// Apply `diff` to a FRESH detached worktree at `base_sha` and run the verify
+/// gates there. This is the trust boundary for unattended apply: the reported
+/// diff must reproduce a passing tree on its own, independent of whatever
+/// state the build worktree accumulated. Err = diff didn't apply / git failed;
+/// Ok(vr) with vr.passed=false = gates failed on the replayed tree.
+pub fn replay_verify_at(
+    repo: &Path,
+    base_sha: &str,
+    run_id: &str,
+    diff: &str,
+    cmds: &[String],
+) -> anyhow::Result<crate::verify::VerifyResult> {
+    let parent = repo.join(".bob").join("worktrees");
+    std::fs::create_dir_all(&parent)?;
+    let dir = parent.join(format!("{run_id}-replay"));
+    let dir_str = dir.to_string_lossy().to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = git(&["worktree", "prune"], repo);
+    git(&["worktree", "add", "--detach", &dir_str, base_sha], repo)?;
+    let patch = parent.join(format!("{run_id}-replay.patch"));
+    std::fs::write(&patch, diff)?;
+    let patch_str = patch.to_string_lossy().to_string();
+    let applied = git(&["apply", "--whitespace=nowarn", &patch_str], &dir);
+    let result = match applied {
+        Ok(_) => Ok(crate::verify::run_gates(cmds, &dir)),
+        Err(e) => Err(anyhow::anyhow!(
+            "final_diff does not apply cleanly to base {base_sha}: {e}"
+        )),
+    };
+    let _ = git(&["worktree", "remove", "--force", &dir_str], repo);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&patch);
+    result
+}
+
 impl Workspace {
     pub fn create(run_id: &str) -> anyhow::Result<Workspace> {
         let cwd = std::env::current_dir()?;
@@ -196,6 +231,15 @@ impl Workspace {
             }
         }
         Ok(ApplyOutcome::Applied)
+    }
+
+    pub fn replay_verify(
+        &self,
+        run_id: &str,
+        diff: &str,
+        cmds: &[String],
+    ) -> anyhow::Result<crate::verify::VerifyResult> {
+        replay_verify_at(&self.repo, &self.base_sha, run_id, diff, cmds)
     }
 
     pub fn cleanup(&self) -> anyhow::Result<()> {
@@ -388,5 +432,39 @@ mod tests {
         assert!(!branches.lines().any(|b| b == "bob/gc-real"));
 
         std::env::set_current_dir(prev).unwrap();
+    }
+
+    fn sh(cmd: &str, cwd: &Path) {
+        assert!(Command::new("sh").args(["-c", cmd]).current_dir(cwd).status().unwrap().success(), "{cmd}");
+    }
+
+    #[test]
+    fn replay_verify_applies_diff_and_runs_gates() {
+        let tmp = std::env::temp_dir().join(format!("bob-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        sh("git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", &tmp);
+        std::fs::write(tmp.join("a.txt"), "one\n").unwrap();
+        sh("git add -A && git -c user.email=t@t -c user.name=t commit -q -m base", &tmp);
+        let base = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&tmp).output().unwrap().stdout).unwrap().trim().to_string();
+        // build a diff: modify a.txt and add b.txt
+        std::fs::write(tmp.join("a.txt"), "two\n").unwrap();
+        std::fs::write(tmp.join("b.txt"), "new\n").unwrap();
+        sh("git add -A", &tmp);
+        let diff = String::from_utf8(Command::new("git").args(["diff", "--cached", "--no-renames", &base]).current_dir(&tmp).output().unwrap().stdout).unwrap();
+        sh("git reset -q --hard && git clean -qfd", &tmp);
+
+        // gate that only passes if BOTH the modification and the new file landed
+        let cmds = vec!["grep -q two a.txt && grep -q new b.txt".to_string()];
+        let vr = replay_verify_at(&tmp, &base, "t1", &diff, &cmds).unwrap();
+        assert!(vr.passed);
+
+        // a gate that fails is reported as failed, not as an error
+        let vr = replay_verify_at(&tmp, &base, "t2", &diff, &["false".to_string()]).unwrap();
+        assert!(!vr.passed);
+
+        // garbage diff is an error
+        assert!(replay_verify_at(&tmp, &base, "t3", "not a diff", &cmds).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
