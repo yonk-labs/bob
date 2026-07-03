@@ -1226,7 +1226,8 @@ pub async fn run(
                     status = RunStatus::NotConverged;
                     stop_reason = Some(StopReason::SecretScanBlocked);
                 } else {
-                    let replay_ok = if cfg.verify.replay && !cfg.verify.cmds.is_empty() {
+                    let replay_ran = cfg.verify.replay && !cfg.verify.cmds.is_empty();
+                    let replay_ok = if replay_ran {
                         match ws.replay_verify(&opts.run_id, &final_diff, &cfg.verify.cmds) {
                             Ok(vr) if vr.passed => true,
                             Ok(vr) => {
@@ -1247,7 +1248,7 @@ pub async fn run(
                     crate::report::append_event(
                         art,
                         &opts.run_id,
-                        serde_json::json!({"event": "replay_verify", "passed": replay_ok}),
+                        serde_json::json!({"event": "replay_verify", "ran": replay_ran, "passed": replay_ok}),
                     );
                     if !replay_ok {
                         status = RunStatus::NotConverged;
