@@ -681,16 +681,22 @@ fn has_provider_prefix(model_id: &str) -> bool {
         || model_id.starts_with("zai")
 }
 
-/// Extract the model name (without provider prefix) for API calls.
+/// Extract the bare model name (without provider prefix) that an endpoint's
+/// `/v1/models` serves — for direct API calls by the thin/goose builders.
 /// "ollama/Intel/Qwen3..." → "Intel/Qwen3..."
 /// "192.168.1.133/cyankiwi/gemma..." → "cyankiwi/gemma..."
-/// "Intel/Qwen3-Coder-Next-int4-AutoRound" → unchanged (HF id, no provider prefix)
+/// "mlx140/mlx-community/Qwen3-Coder-Next-4bit" → "mlx-community/Qwen3-Coder-Next-4bit"
+/// "Intel/Qwen3-Coder-Next-int4-AutoRound" → unchanged (bare HF id, one slash)
 fn extract_model_name(model_id: &str) -> String {
     match model_id.find('/') {
-        // Only strip the leading segment when it's a known provider/host prefix.
-        // Bare HF ids (e.g. "Intel/Qwen3…") contain a '/' but the prefix is part
-        // of the model name — stripping it 404s the endpoint (silent empty diff).
-        Some(pos) if has_provider_prefix(model_id) => model_id[pos + 1..].to_string(),
+        // Strip the leading segment when it is a known provider/host prefix OR the
+        // id has provider/org/model shape (≥2 slashes) — e.g. an mlx-style alias
+        // ("mlx140/…") not in the known-prefix list. A bare HF id ("Intel/Qwen3…",
+        // one slash) keeps its prefix: it IS the model name, and stripping it 404s
+        // the endpoint (silent empty diff).
+        Some(pos) if has_provider_prefix(model_id) || model_id.matches('/').count() >= 2 => {
+            model_id[pos + 1..].to_string()
+        }
         _ => model_id.to_string(),
     }
 }
@@ -738,9 +744,15 @@ fn resolve_endpoint(
         Some(url) => url,
         None => extract_base_url(model_id, crate::model_stats::vllm_url().as_deref())?,
     };
+    // The roster `model:` field is stored opencode-style (provider/model, e.g.
+    // `192.168.1.133/cyankiwi/gemma…`) because opencode needs that prefix; but
+    // thin/goose hit the endpoint directly and must send the BARE name its
+    // `/v1/models` serves. Strip the provider prefix on BOTH the Full-form
+    // (entry_api_model) and legacy-id paths — otherwise goose 404s on the LAN roster.
     let api_model = cfg
         .builder
         .entry_api_model(sel)
+        .map(|m| extract_model_name(&m))
         .unwrap_or_else(|| extract_model_name(model_id));
     let api_key = cfg
         .builder
@@ -1563,8 +1575,33 @@ mod decision_tests {
         assert_eq!(extract_model_name("ollama/Intel/Qwen3"), "Intel/Qwen3");
         assert_eq!(extract_model_name("192.168.1.133/cyankiwi/gemma"), "cyankiwi/gemma");
         assert_eq!(extract_model_name("zai-coding-plan/glm-5.2"), "glm-5.2");
+        // Provider/org/model shape (≥2 slashes) strips the leading segment even
+        // when the provider alias isn't in the known list — e.g. the mlx endpoint.
+        assert_eq!(
+            extract_model_name("mlx140/mlx-community/Qwen3-Coder-Next-4bit"),
+            "mlx-community/Qwen3-Coder-Next-4bit"
+        );
         // No slash at all: unchanged.
         assert_eq!(extract_model_name("qwen"), "qwen");
+    }
+
+    #[test]
+    fn resolve_endpoint_gives_goose_the_bare_model_for_full_form_roster() {
+        // Regression for the goose 404: Full-form roster entries store the
+        // opencode-style provider/model id in `model:`, but thin/goose must send
+        // the BARE name the endpoint's /v1/models serves.
+        let yaml = "builder:\n  cmd: goose\n  model: gemma-133\n  models:\n    \
+            gemma-133: { model: 192.168.1.133/cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit, \
+            base_url: 'http://192.168.1.133:8000/v1' }\njudge: { cmd: abe }";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let (base_url, api_model, _key) = resolve_endpoint(
+            &cfg,
+            Some("gemma-133"),
+            "192.168.1.133/cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit",
+        )
+        .unwrap();
+        assert_eq!(base_url, "http://192.168.1.133:8000/v1");
+        assert_eq!(api_model, "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit");
     }
 
     #[test]
