@@ -97,7 +97,12 @@ pub fn parse_abe_validate(json: &str) -> anyhow::Result<JudgeOutcome> {
             "fail" => Verdict::Fail,
             _ => Verdict::Uncertain,
         };
-        let critique = collect_disagreements(&v);
+        let mut critique = collect_disagreements(&v);
+        if critique.trim().is_empty() {
+            if let Some(take) = v.get("take").and_then(|x| x.as_str()) {
+                critique = take.to_string();
+            }
+        }
         return Ok(JudgeOutcome { verdict, critique });
     }
 
@@ -223,5 +228,21 @@ mod tests {
     fn validate_mode_stays_single_reviewer() {
         let args = abe_args(JudgeMode::Validate, "stmt".into());
         assert_eq!(args, ["validate", "--json", "--verdict", "--", "stmt"]);
+    }
+
+    #[test]
+    fn fail_with_empty_disagreements_falls_back_to_take() {
+        let j = r#"{"verdict":"fail","take":"the diff duplicates the slow tests","disagreements":[]}"#;
+        let o = parse_abe_validate(j).unwrap();
+        assert!(matches!(o.verdict, Verdict::Fail));
+        assert_eq!(o.critique, "the diff duplicates the slow tests");
+    }
+
+    #[test]
+    fn fail_with_disagreements_ignores_take() {
+        let j = r#"{"verdict":"fail","take":"prose","disagreements":["off-by-one in loop"]}"#;
+        let o = parse_abe_validate(j).unwrap();
+        assert!(o.critique.contains("off-by-one"));
+        assert!(!o.critique.contains("prose"));
     }
 }
