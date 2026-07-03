@@ -126,16 +126,63 @@ fn bob_branches(repo: &Path) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
+/// Liveness marker path for a build worktree: a sibling `<run_id>.pid` under
+/// `.bob/worktrees/` — deliberately OUTSIDE the worktree working tree, so it is
+/// never staged by `capture_diff` (and, being a file not a dir, never mistaken
+/// for a worktree by `bob_worktrees`). `Workspace::create` writes it; `gc` reads
+/// it to avoid reclaiming a worktree whose build is still in flight.
+fn worktree_pidfile(worktree: &Path) -> Option<PathBuf> {
+    let name = worktree.file_name()?;
+    Some(worktree.parent()?.join(format!("{}.pid", name.to_string_lossy())))
+}
+
+/// Is the build process that owns `worktree` still running? Reads the sibling
+/// pidfile and checks `/proc/<pid>`.
+/// ponytail: Linux-only /proc check (bob already assumes it — opencode sandbox).
+/// On PID reuse the worst case is gc SKIPPING a stale worktree (safe, leaves
+/// cruft) rather than deleting a live one — deliberately biased that way.
+fn worktree_owner_alive(worktree: &Path) -> bool {
+    worktree_pidfile(worktree)
+        .filter(|p| p.exists())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .is_some_and(|pid| Path::new("/proc").join(pid.to_string()).exists())
+}
+
 pub fn gc(dry_run: bool) -> anyhow::Result<GcReport> {
     let repo = std::env::current_dir()?;
-    let worktrees = bob_worktrees(&repo)?;
-    let branches = bob_branches(&repo)?;
+    // Never reclaim a worktree whose owning build is still alive: a `bob gc` run
+    // DURING a live `--jobs N` campaign must not force-remove in-flight peers (it
+    // would delete their worktree + branch wholesale). Partition first, act only
+    // on the dead-owner ones.
+    let (live, worktrees): (Vec<PathBuf>, Vec<PathBuf>) =
+        bob_worktrees(&repo)?.into_iter().partition(|p| worktree_owner_alive(p));
+    let live_ids: std::collections::HashSet<String> = live
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
+    // Keep the branch of any live worktree; only report/delete reclaimable ones.
+    let branches: Vec<String> = bob_branches(&repo)?
+        .into_iter()
+        .filter(|b| !live_ids.contains(b.strip_prefix("bob/").unwrap_or(b)))
+        .collect();
+
+    if !live.is_empty() {
+        eprintln!(
+            "bob gc: skipping {} in-use worktree(s) with a live build: {}",
+            live.len(),
+            live.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
 
     if !dry_run {
         for path in &worktrees {
             let path_str = path.to_string_lossy().to_string();
             if git(&["worktree", "remove", "--force", &path_str], &repo).is_err() && path.exists() {
                 let _ = std::fs::remove_dir_all(path);
+            }
+            if let Some(pidfile) = worktree_pidfile(path) {
+                let _ = std::fs::remove_file(pidfile);
             }
         }
         let _ = git(&["worktree", "prune"], &repo);
@@ -270,6 +317,12 @@ impl Workspace {
             let _ = std::fs::remove_dir_all(&dir);
             let _ = git(&["branch", "-D", &branch], &cwd);
             return Err(e);
+        }
+        // Mark this worktree live so `bob gc` won't reclaim it mid-build (see
+        // worktree_owner_alive). Best-effort; a missing marker just means gc
+        // treats it as reclaimable, matching pre-liveness behavior.
+        if let Some(pidfile) = worktree_pidfile(&dir) {
+            let _ = std::fs::write(pidfile, std::process::id().to_string());
         }
         Ok(Workspace {
             repo: cwd,
@@ -523,6 +576,9 @@ mod tests {
         std::env::set_current_dir(&tmp).unwrap();
 
         let ws = Workspace::create("gc-dry", &[]).unwrap();
+        // Simulate a FINISHED build (owner process exited) so gc treats it as
+        // reclaimable; create() writes our own live pid, which gc would skip.
+        std::fs::write(worktree_pidfile(ws.path()).unwrap(), u32::MAX.to_string()).unwrap();
         let report = gc(true).unwrap();
         assert!(report
             .worktrees
@@ -545,6 +601,8 @@ mod tests {
 
         let ws = Workspace::create("gc-real", &[]).unwrap();
         let path = ws.path().to_path_buf();
+        // Finished build → dead owner pid, so gc reclaims it.
+        std::fs::write(worktree_pidfile(&path).unwrap(), u32::MAX.to_string()).unwrap();
         let report = gc(false).unwrap();
         assert!(report
             .worktrees
@@ -554,6 +612,31 @@ mod tests {
         let branches = git(&["branch", "--format=%(refname:short)"], &tmp).unwrap();
         assert!(!branches.lines().any(|b| b == "bob/gc-real"));
 
+        std::env::set_current_dir(prev).unwrap();
+    }
+
+    #[test]
+    fn gc_skips_worktree_with_live_owner() {
+        // bob gc during a live --jobs N campaign must NOT reclaim an in-flight
+        // peer. create() writes our own (alive) pid as the owner, so gc must
+        // leave the worktree + branch untouched and not report it as reclaimed.
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir_unique();
+        init_repo(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let ws = Workspace::create("gc-live", &[]).unwrap();
+        let report = gc(false).unwrap();
+        assert!(ws.path().exists(), "gc must not remove a worktree with a live owner");
+        assert!(
+            !report.worktrees.iter().any(|p| p.ends_with(".bob/worktrees/gc-live")),
+            "live worktree must not be reported as reclaimed"
+        );
+        let branches = git(&["branch", "--format=%(refname:short)"], &tmp).unwrap();
+        assert!(branches.lines().any(|b| b == "bob/gc-live"), "live branch must survive");
+
+        ws.cleanup().unwrap();
         std::env::set_current_dir(prev).unwrap();
     }
 

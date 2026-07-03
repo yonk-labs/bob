@@ -378,8 +378,9 @@ bob apply <run_id>    # replay-verify, then git-apply the run's diff to your wor
 **Cleanup.** Converged runs clean up their worktree automatically; any non-converged
 outcome (`not_converged`, `needs_review`, `error`) **keeps** its worktree by default so
 you can inspect what the builder actually did — `bob gc --dry-run` shows stale Bob
-worktrees and `bob/*` branches, `bob gc` removes them. Pass `--keep`/`--keep-worktree`
-to keep a converged run's worktree too.
+worktrees and `bob/*` branches, `bob gc` removes them. `bob gc` skips any worktree whose
+build is still running, so it is safe to run during a live `--jobs N` campaign. Pass
+`--keep`/`--keep-worktree` to keep a converged run's worktree too.
 For JS/Jest repos, `bob doctor` warns if `.gitignore` does not ignore `/.bob`.
 
 **Replay & apply.** `bob replay <run_id>` re-applies a past run's recorded `final_diff`
