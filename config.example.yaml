@@ -28,3 +28,11 @@ scope:
 apply: false
 artifacts:
   dir: .bob/runs
+worktree:
+  setup_cmds: []          # run once, in order, in each FRESH worktree (build worktree
+                          # and replay-verify scratch worktree) — before iteration 0,
+                          # before replay verify, never in the main tree. `BOB_REPO_ROOT`
+                          # is exported to the main repo root. A failing cmd aborts the
+                          # run as an infra error (not a builder/judge failure).
+                          # example: JS repos need node_modules in the worktree —
+                          #   setup_cmds: ['ln -sfn "$BOB_REPO_ROOT/node_modules" node_modules']

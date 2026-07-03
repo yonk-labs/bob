@@ -40,7 +40,14 @@ fn replay_run(cfg: &config::Config, run_id: &str) -> anyhow::Result<(serde_json:
         .unwrap_or_default();
     let cmds = if cmds.is_empty() { cfg.verify.cmds.clone() } else { cmds };
     let repo = std::env::current_dir()?;
-    let vr = worktree::replay_verify_at(&repo, &base_sha, run_id, &diff, &cmds)?;
+    let vr = worktree::replay_verify_at_with_setup(
+        &repo,
+        &base_sha,
+        run_id,
+        &diff,
+        &cmds,
+        &cfg.worktree.setup_cmds,
+    )?;
     println!(
         "bob: replay-verify {} for run {run_id} ({} gate(s))",
         if vr.passed { "PASSED" } else { "FAILED" },

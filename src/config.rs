@@ -18,6 +18,8 @@ pub struct Config {
     pub artifacts: ArtifactsCfg,
     #[serde(default)]
     pub context: ContextCfg,
+    #[serde(default)]
+    pub worktree: WorktreeCfg,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -381,6 +383,19 @@ impl Default for VerifyCfg {
     }
 }
 
+/// Commands run once, in order, right after bob creates a FRESH worktree (the
+/// build worktree and the replay-verify scratch worktree) — before iteration 0
+/// and before replay verify, never in the main tree. Use this for per-worktree
+/// setup that a verify cmd can't safely do (e.g. re-linking node_modules, which
+/// would nest a symlink inside the real dir if a verify cmd ran it in the main
+/// tree). Runs via the same `sh -c` mechanism as verify cmds, with cwd set to
+/// the new worktree and `BOB_REPO_ROOT` exported to the main repo root.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WorktreeCfg {
+    #[serde(default)]
+    pub setup_cmds: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoopCfg {
     #[serde(default = "default_max_iters")]
@@ -617,6 +632,29 @@ judge:
         assert_eq!(cfg.scope.max_changed_files, 20);
         assert!(cfg.verify.cmds.is_empty());
         assert!(!cfg.apply);
+        assert!(cfg.worktree.setup_cmds.is_empty());
+    }
+
+    #[test]
+    fn worktree_setup_cmds_parses_from_yaml() {
+        let yaml = r#"
+builder:
+  cmd: opencode
+judge:
+  cmd: abe
+worktree:
+  setup_cmds:
+    - 'ln -sfn "$BOB_REPO_ROOT/node_modules" node_modules'
+    - echo second
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.worktree.setup_cmds,
+            vec![
+                "ln -sfn \"$BOB_REPO_ROOT/node_modules\" node_modules".to_string(),
+                "echo second".to_string(),
+            ]
+        );
     }
 
     #[test]

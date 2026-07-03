@@ -1022,7 +1022,7 @@ pub async fn run(
     }
     let lessons = load_project_lessons()?;
     let art = std::path::Path::new(&cfg.artifacts.dir);
-    let ws = Workspace::create(&opts.run_id)?;
+    let ws = Workspace::create(&opts.run_id, &cfg.worktree.setup_cmds)?;
     let base_sha = ws.base_sha().to_string();
     crate::report::append_event(
         art,
@@ -1229,7 +1229,12 @@ pub async fn run(
                 } else {
                     let replay_ran = cfg.verify.replay && !cfg.verify.cmds.is_empty();
                     let replay_ok = if replay_ran {
-                        match ws.replay_verify(&opts.run_id, &final_diff, &cfg.verify.cmds) {
+                        match ws.replay_verify(
+                            &opts.run_id,
+                            &final_diff,
+                            &cfg.verify.cmds,
+                            &cfg.worktree.setup_cmds,
+                        ) {
                             Ok(vr) if vr.passed => true,
                             Ok(vr) => {
                                 eprintln!(
@@ -1237,6 +1242,12 @@ pub async fn run(
                                     vr.cmd.as_deref().unwrap_or("gate")
                                 );
                                 false
+                            }
+                            // A failing worktree.setup_cmds run is an INFRA error, not a
+                            // verify/judge failure — abort the run rather than reporting
+                            // it as a replay-verify gate failure.
+                            Err(e) if e.to_string().starts_with("worktree setup cmd") => {
+                                return Err(e);
                             }
                             Err(e) => {
                                 eprintln!("bob: replay-verify error: {e}");
@@ -1388,6 +1399,11 @@ mod decision_tests {
         // orchestration failures should NOT escalate (next model won't help)
         assert!(!esc("failed to create worktree"));
         assert!(!esc("git checkout failed"));
+        // a failing worktree.setup_cmds is an INFRA error — must abort, not
+        // escalate to the next model as if it were a builder failure.
+        assert!(!esc(
+            "worktree setup cmd failed: ln -sfn \"$BOB_REPO_ROOT/node_modules\" node_modules\n--- stderr ---\nln: failed"
+        ));
     }
 
     #[test]
@@ -1890,6 +1906,7 @@ mod flow_tests {
             apply: false,
             artifacts: Default::default(),
             context: Default::default(),
+            worktree: Default::default(),
         };
         let opts = RunOpts {
             spec: "do the thing".into(),
@@ -1975,6 +1992,7 @@ mod flow_tests {
             apply: false,
             artifacts: Default::default(),
             context: Default::default(),
+            worktree: Default::default(),
         };
         let opts = RunOpts {
             spec: "do the thing".into(),
@@ -2066,6 +2084,7 @@ mod flow_tests {
             apply: false,
             artifacts: Default::default(),
             context: Default::default(),
+            worktree: Default::default(),
         };
         let opts = RunOpts {
             spec: "do the thing".into(),
@@ -2096,5 +2115,173 @@ mod flow_tests {
         let s = build_judge_spec("do the thing", None, &[], std::path::Path::new("."));
         assert!(s.contains("## JUDGING RUBRIC"));
         assert!(s.contains("EACH criterion"));
+    }
+
+    struct ChangeOnceBuilder;
+    impl Builder for ChangeOnceBuilder {
+        async fn build(&self, _p: &str, workdir: &Path) -> anyhow::Result<BuilderOutcome> {
+            std::fs::write(workdir.join("out.txt"), "change\n")?;
+            Ok(BuilderOutcome {
+                failure_kind: "ok".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    struct PanicIfCalledBuilder;
+    impl Builder for PanicIfCalledBuilder {
+        async fn build(&self, _p: &str, _workdir: &Path) -> anyhow::Result<BuilderOutcome> {
+            panic!("builder must not run when worktree.setup_cmds fails — it's an infra abort");
+        }
+    }
+
+    fn setup_cmds_test_cfg(setup_cmds: Vec<String>, verify_cmds: Vec<String>) -> Config {
+        crate::config::Config {
+            builder: crate::config::BuilderCfg {
+                cmd: "opencode".into(),
+                timeout_secs: 5,
+                args: vec![],
+                model: None,
+                models: Default::default(),
+                fallback_models: vec![],
+                tiers: Default::default(),
+                escalation_policy: "tier".into(),
+                reliability_weight: 0.5,
+                pin: vec![],
+                exclude: vec![],
+                goose_toolshim: false,
+            },
+            judge: crate::config::JudgeCfg {
+                cmd: "abe".into(),
+                mode: crate::config::JudgeMode::Validate,
+                timeout_secs: 600,
+                policy: crate::config::JudgePolicy::Advisory,
+            },
+            verify: crate::config::VerifyCfg {
+                cmds: verify_cmds,
+                replay: true,
+            },
+            loop_cfg: crate::config::LoopCfg {
+                max_iterations: 3,
+                max_walltime_secs: 60,
+            },
+            scope: Default::default(),
+            apply: false,
+            artifacts: Default::default(),
+            context: Default::default(),
+            worktree: crate::config::WorktreeCfg { setup_cmds },
+        }
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_cmds_run_before_iteration_and_visible_to_verify() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-setup-flow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let g = |a: &[&str]| {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(tmp.join("seed.txt"), "x\n").unwrap();
+        // Mirrors the real node_modules use case: the setup cmd's output is
+        // gitignored, so it never lands in the captured diff / collides with
+        // the replay worktree's own copy of the same setup cmd.
+        std::fs::write(tmp.join(".gitignore"), "setup-marker.txt\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        // The setup cmd runs before iteration 0, referencing BOB_REPO_ROOT (the
+        // main repo, not the worktree); the verify gate proves it's visible.
+        let cfg = setup_cmds_test_cfg(
+            vec!["echo \"$BOB_REPO_ROOT\" > setup-marker.txt".into()],
+            vec!["test -f setup-marker.txt && grep -q change out.txt".into()],
+        );
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: true,
+            run_id: "setup-flow".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let res = run(&cfg, opts, &ChangeOnceBuilder, &UncertainJudge)
+            .await
+            .unwrap();
+        let worktree = std::path::PathBuf::from(&res.worktree);
+        let marker = std::fs::read_to_string(worktree.join("setup-marker.txt")).unwrap();
+
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(res.status, RunStatus::Converged);
+        assert_eq!(
+            marker.trim(),
+            tmp.canonicalize().unwrap().to_string_lossy(),
+            "BOB_REPO_ROOT in the worktree points at the main repo root, not the worktree"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_cmd_failure_aborts_run_as_infra_error() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-setup-fail-flow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let g = |a: &[&str]| {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(tmp.join("seed.txt"), "x\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = setup_cmds_test_cfg(
+            vec!["echo setup-cmd-boom 1>&2 && exit 7".into()],
+            vec!["true".into()],
+        );
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "setup-fail-flow".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        // PanicIfCalledBuilder proves the abort happens before iteration 0 —
+        // the builder is never invoked.
+        let msg = match run(&cfg, opts, &PanicIfCalledBuilder, &UncertainJudge).await {
+            Ok(_) => panic!("expected worktree setup cmd failure to abort the run"),
+            Err(e) => e.to_string(),
+        };
+
+        std::env::set_current_dir(prev).unwrap();
+        assert!(
+            msg.contains("worktree setup cmd failed"),
+            "reported as an infra error, not a builder/judge failure: {msg}"
+        );
+        assert!(msg.contains("setup-cmd-boom"), "carries the cmd's stderr: {msg}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
