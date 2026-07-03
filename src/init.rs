@@ -293,6 +293,7 @@ pub fn run() -> anyhow::Result<()> {
         },
         apply: apply_default,
         artifacts: crate::config::ArtifactsCfg { dir: artifacts_dir },
+        context: crate::config::ContextCfg::default(),
     };
 
     let yaml = serde_yaml::to_string(&cfg).expect("config serializes");
@@ -425,6 +426,7 @@ artifacts:
             artifacts: crate::config::ArtifactsCfg {
                 dir: ".bob/runs".to_string(),
             },
+            context: crate::config::ContextCfg::default(),
         };
         let yaml = serde_yaml::to_string(&cfg).expect("config serializes");
         let parsed: crate::config::Config = serde_yaml::from_str(&yaml).expect("roundtrip works");

@@ -16,6 +16,8 @@ pub struct Config {
     pub apply: bool,
     #[serde(default)]
     pub artifacts: ArtifactsCfg,
+    #[serde(default)]
+    pub context: ContextCfg,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -399,6 +401,28 @@ fn default_max_iters() -> u32 {
 }
 fn default_max_walltime() -> u64 {
     1800
+}
+
+/// Ceilings for the estimated context handed to the builder (bytes/4 ≈ tokens).
+/// Local models on this network degrade past ~16k input and choke well before
+/// their nominal window — soft warns, hard refuses the run up front.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContextCfg {
+    #[serde(default = "default_soft_tokens")]
+    pub soft_tokens: u64,
+    #[serde(default = "default_hard_tokens")]
+    pub hard_tokens: u64,
+}
+impl Default for ContextCfg {
+    fn default() -> Self {
+        Self { soft_tokens: default_soft_tokens(), hard_tokens: default_hard_tokens() }
+    }
+}
+fn default_soft_tokens() -> u64 {
+    16_000
+}
+fn default_hard_tokens() -> u64 {
+    32_000
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

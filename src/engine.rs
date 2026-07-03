@@ -349,6 +349,8 @@ pub struct RunResult {
     pub judge: Option<JudgeSnapshot>,
     pub builder: BuilderSnapshot,
     pub reset_test_files: Vec<String>,
+    pub context_est_tokens: u64,
+    pub prompt_est_tokens: Vec<u64>,
 }
 
 fn load_project_lessons() -> anyhow::Result<Option<String>> {
@@ -458,13 +460,14 @@ fn build_prompt(opts: &RunOpts, critique: Option<&str>, lessons: Option<&str>) -
     p
 }
 
-/// Pre-flight: estimate the on-disk size of the files Bob points the builder at,
-/// and warn when it's large. Agentic builders (goose/opencode) READ these files
-/// into their own context window mid-loop, so a single oversized file (e.g. a
-/// 223KB route file) silently blows the model's window and stalls the run for the
-/// full timeout. Surfacing the budget up front turns a mystery 600s hang into a
-/// one-line "context ≈ Nk tokens — trim it". Read-only; never blocks the run.
-fn warn_on_context_budget(opts: &RunOpts) {
+/// Pre-flight: estimate the on-disk size of the files Bob points the builder at.
+/// Agentic builders (goose/opencode) READ these files into their own context
+/// window mid-loop, so a single oversized file (e.g. a 223KB route file)
+/// silently blows the model's window and stalls the run for the full timeout.
+/// Surfacing the budget up front turns a mystery 600s hang into a one-line
+/// "context ≈ Nk tokens — trim it". Read-only; never blocks the run. Returns
+/// 0 when there are no files to estimate.
+fn context_est_tokens(opts: &RunOpts) -> u64 {
     let mut files: Vec<(String, u64)> = Vec::new();
     for f in &opts.context_files {
         if let Ok(m) = std::fs::metadata(f) {
@@ -477,7 +480,7 @@ fn warn_on_context_budget(opts: &RunOpts) {
         }
     }
     if files.is_empty() {
-        return;
+        return 0;
     }
     let total: u64 = files.iter().map(|(_, n)| n).sum();
     let est_tokens = total / 4; // ~4 bytes/token, standard rough estimate for code/text
@@ -491,17 +494,33 @@ fn warn_on_context_budget(opts: &RunOpts) {
         biggest_name,
         biggest_bytes / 1024,
     );
-    // Local vLLM models prefill slowly and agentic loops choke well before the
-    // model's nominal context limit. Above this, warn loudly.
-    const WARN_TOKENS: u64 = 32_000;
-    if est_tokens > WARN_TOKENS {
-        eprintln!(
-            "bob: ⚠️  context ~{}k tokens exceeds ~{}k — agentic builders read these files into \
-             their window and may stall/timeout. Trim large files or pass excerpts instead.",
-            est_tokens / 1000,
-            WARN_TOKENS / 1000,
+    est_tokens
+}
+
+/// Pre-flight gate: refuse runs whose context estimate exceeds the hard
+/// ceiling (the builder would stall long before producing anything useful),
+/// warn past the soft one. Returns the estimate for RunResult telemetry.
+fn enforce_context_budget(
+    opts: &RunOpts,
+    cfg: &crate::config::ContextCfg,
+) -> anyhow::Result<u64> {
+    let est = context_est_tokens(opts);
+    if est > cfg.hard_tokens {
+        anyhow::bail!(
+            "context ~{}k tokens exceeds hard ceiling {}k — trim files/editable_paths, \
+             pass excerpts instead of whole files, or raise context.hard_tokens in bob.yaml",
+            est / 1000,
+            cfg.hard_tokens / 1000
         );
     }
+    if est > cfg.soft_tokens {
+        eprintln!(
+            "bob: ⚠️  context ~{}k tokens exceeds soft ceiling {}k — local builders degrade past this; consider trimming",
+            est / 1000,
+            cfg.soft_tokens / 1000
+        );
+    }
+    Ok(est)
 }
 
 fn verdict_name(v: Verdict) -> &'static str {
@@ -813,7 +832,6 @@ pub async fn run_opencode_with_fallbacks(
             .map(|a| cfg.builder.resolved_model(a.as_deref()))
             .collect::<Vec<_>>()
     );
-    warn_on_context_budget(&opts);
     // Pre-flight the verify gate on the unmodified base tree: catch a gate that
     // already passes (too weak — bob converges on nothing) or errors on bad flags
     // (unpassable — bob loops). Both otherwise look like "the model failed".
@@ -981,6 +999,9 @@ pub async fn run(
     if cfg.verify.cmds.is_empty() {
         eprintln!("warning: no verify gates configured — abe is the sole gate");
     }
+    // Pre-flight context budget gate: refuse (hard) or warn (soft) before any
+    // worktree/workspace setup, so an oversized context never burns a worktree.
+    let context_est = enforce_context_budget(&opts, &cfg.context)?;
     // Secret-scan inputs before anything enters a prompt.
     let spec_hits = crate::safety::scan(&opts.spec);
     if !spec_hits.is_empty() {
@@ -1027,6 +1048,7 @@ pub async fn run(
         fallbacks_tried: vec![],
     };
     let mut reset_files: std::collections::BTreeSet<String> = Default::default();
+    let mut prompt_est_tokens: Vec<u64> = Vec::new();
 
     // Freeze untracked test files BEFORE the builder loop starts. These files
     // were created by hector but never committed. If we don't freeze them now,
@@ -1040,6 +1062,7 @@ pub async fn run(
     loop {
         state.walltime_exceeded = Instant::now() >= deadline;
         let prompt = build_prompt(&opts, critique.as_deref(), lessons.as_deref());
+        prompt_est_tokens.push((prompt.len() as u64) / 4);
 
         // BUILD
         let builder_out: BuilderOutcome = match builder.build(&prompt, ws.path()).await {
@@ -1257,6 +1280,8 @@ pub async fn run(
         judge: last_judge,
         builder: builder_snapshot,
         reset_test_files: reset_files.into_iter().collect(),
+        context_est_tokens: context_est,
+        prompt_est_tokens,
     };
     if should_keep_worktree(opts.keep_worktree, status) {
         eprintln!("worktree preserved at {}", ws.path().display());
@@ -1615,6 +1640,8 @@ assert!(matches!(
                 fallbacks_tried: vec![],
             },
             reset_test_files: vec![],
+            context_est_tokens: 0,
+            prompt_est_tokens: vec![],
         };
         assert!(should_try_next_model(&res));
         res.stop_reason = Some(StopReason::ScopeExceeded);
@@ -1631,6 +1658,34 @@ assert!(matches!(
             ),
             NextAction::ReviewCandidate
         );
+    }
+
+    #[test]
+    fn context_budget_gate_refuses_over_hard_ceiling() {
+        let tmp = std::env::temp_dir().join(format!("bob-ctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let big = tmp.join("big.txt");
+        std::fs::write(&big, "x".repeat(200_000)).unwrap(); // ~50k est tokens
+        let opts = RunOpts {
+            spec: "s".into(),
+            context_files: vec![big.clone()],
+            apply: false,
+            keep_worktree: false,
+            run_id: "r".into(),
+            builder_model: None,
+            editable_paths: vec![],
+            tier: None,
+        };
+        let cfg = crate::config::ContextCfg::default(); // soft 16k / hard 32k
+        let err = enforce_context_budget(&opts, &cfg).unwrap_err().to_string();
+        assert!(err.contains("hard ceiling"), "{err}");
+        assert!(err.contains("context.hard_tokens"), "remediation missing: {err}");
+        // under the ceiling passes and returns the estimate
+        std::fs::write(&big, "x".repeat(4_000)).unwrap();
+        let est = enforce_context_budget(&opts, &cfg).unwrap();
+        assert!(est >= 1_000 / 4 && est < 16_000, "{est}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
@@ -1773,6 +1828,7 @@ mod flow_tests {
             scope: Default::default(),
             apply: false,
             artifacts: Default::default(),
+            context: Default::default(),
         };
         let opts = RunOpts {
             spec: "do the thing".into(),
@@ -1857,6 +1913,7 @@ mod flow_tests {
             scope: Default::default(),
             apply: false,
             artifacts: Default::default(),
+            context: Default::default(),
         };
         let opts = RunOpts {
             spec: "do the thing".into(),
@@ -1947,6 +2004,7 @@ mod flow_tests {
             scope: Default::default(),
             apply: false,
             artifacts: Default::default(),
+            context: Default::default(),
         };
         let opts = RunOpts {
             spec: "do the thing".into(),
