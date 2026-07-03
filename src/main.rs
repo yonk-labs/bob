@@ -27,6 +27,45 @@ fn load_run_json(artifacts_dir: &str, run_id: &str) -> anyhow::Result<serde_json
     Ok(serde_json::from_str(&text)?)
 }
 
+/// Build the machine-readable tier→endpoint map for `bob models --json`.
+/// Serializes only what's actually configured: tiers with no models are
+/// omitted, and base_url is null unless the roster entry is the explicit
+/// `Full` form (bob never guesses endpoints — same resolution `doctor
+/// --probe` uses via `entry_base_url`).
+fn models_json(cfg: &config::Config) -> serde_json::Value {
+    let tiers_cfg = &cfg.builder.tiers;
+    let mut tiers = serde_json::Map::new();
+    for tier in ["cheap", "medium", "large", "frontier"] {
+        let models = tiers_cfg.models_for(tier);
+        if !models.is_empty() {
+            tiers.insert(tier.to_string(), serde_json::json!(models));
+        }
+    }
+    let default_tier = tiers_cfg.any_configured().then(|| tiers_cfg.default_tier.clone());
+
+    let mut models = serde_json::Map::new();
+    for (name, def) in &cfg.builder.models {
+        models.insert(
+            name.clone(),
+            serde_json::json!({
+                "id": def.id(),
+                "base_url": cfg.builder.entry_base_url(Some(name)),
+            }),
+        );
+    }
+
+    #[allow(deprecated)]
+    let fallback_models = cfg.builder.fallback_models.clone();
+
+    serde_json::json!({
+        "default_model": cfg.builder.model,
+        "default_tier": default_tier,
+        "tiers": tiers,
+        "models": models,
+        "fallback_models": fallback_models,
+    })
+}
+
 fn replay_run(cfg: &config::Config, run_id: &str) -> anyhow::Result<(serde_json::Value, bool)> {
     let run = load_run_json(&cfg.artifacts.dir, run_id)?;
     let base_sha = run["base_sha"].as_str().unwrap_or_default().to_string();
@@ -67,8 +106,12 @@ async fn main() -> anyhow::Result<()> {
     let _ = builder::reap_orphans();
     match args.command {
         Command::Doctor { probe } => doctor::run(probe),
-        Command::Models => {
+        Command::Models { json } => {
             let cfg = config::Config::load(args.config.as_deref())?;
+            if json {
+                println!("{}", models_json(&cfg));
+                return Ok(());
+            }
             let default = cfg.builder.model.as_deref();
             if cfg.builder.models.is_empty() {
                 println!("No model roster configured (builder.models).");
@@ -286,5 +329,72 @@ async fn main() -> anyhow::Result<()> {
             println!("bob: applied run {run_id} to the working tree (unstaged)");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_json_reports_tiers_and_explicit_base_urls() {
+        let yaml = r#"
+builder:
+  cmd: opencode
+  model: qwen
+  models:
+    qwen: { model: "Intel/Qwen3", base_url: "http://host:8000/v1" }
+    codex: { model: "gpt-5-codex", base_url: "https://api.openai.com/v1" }
+  tiers:
+    cheap: [qwen]
+    frontier: [codex]
+    default_tier: cheap
+judge: { cmd: abe }
+verify: { cmds: [] }
+"#;
+        let cfg = serde_yaml::from_str::<config::Config>(yaml).unwrap();
+        let v = models_json(&cfg);
+        assert_eq!(v["default_model"], "qwen");
+        assert_eq!(v["default_tier"], "cheap");
+        assert_eq!(v["tiers"]["cheap"], serde_json::json!(["qwen"]));
+        assert_eq!(v["tiers"]["frontier"], serde_json::json!(["codex"]));
+        assert!(v["tiers"].get("medium").is_none());
+        assert!(v["tiers"].get("large").is_none());
+        assert_eq!(v["models"]["qwen"]["id"], "Intel/Qwen3");
+        assert_eq!(v["models"]["qwen"]["base_url"], "http://host:8000/v1");
+        assert_eq!(v["models"]["codex"]["base_url"], "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn models_json_null_base_url_for_raw_id_models() {
+        let yaml = r#"
+builder:
+  cmd: opencode
+  models:
+    legacy: ollama/Intel/Qwen3-Coder
+judge: { cmd: abe }
+verify: { cmds: [] }
+"#;
+        let cfg = serde_yaml::from_str::<config::Config>(yaml).unwrap();
+        let v = models_json(&cfg);
+        assert_eq!(v["models"]["legacy"]["id"], "ollama/Intel/Qwen3-Coder");
+        assert!(v["models"]["legacy"]["base_url"].is_null());
+    }
+
+    #[test]
+    fn models_json_empty_tiers_and_null_default_tier_when_unconfigured() {
+        let yaml = r#"
+builder:
+  cmd: opencode
+judge: { cmd: abe }
+verify: { cmds: [] }
+"#;
+        let cfg = serde_yaml::from_str::<config::Config>(yaml).unwrap();
+        let v = models_json(&cfg);
+        assert!(v["default_model"].is_null());
+        assert!(v["default_tier"].is_null());
+        assert_eq!(v["tiers"], serde_json::json!({}));
+        assert_eq!(v["models"], serde_json::json!({}));
+        assert_eq!(v["fallback_models"], serde_json::json!([]));
     }
 }

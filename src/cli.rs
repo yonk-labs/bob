@@ -80,7 +80,11 @@ pub enum Command {
         probe: bool,
     },
     /// List the builder model roster (builder.models) and the default.
-    Models,
+    Models {
+        /// Emit a machine-readable tier→endpoint map instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove stale bob worktrees and bob/* branches.
     Gc {
         /// Show what would be removed without deleting anything.
