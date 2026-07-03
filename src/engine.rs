@@ -351,6 +351,7 @@ pub struct RunResult {
     pub reset_test_files: Vec<String>,
     pub context_est_tokens: u64,
     pub prompt_est_tokens: Vec<u64>,
+    pub verify_cmds: Vec<String>,
 }
 
 fn load_project_lessons() -> anyhow::Result<Option<String>> {
@@ -1019,8 +1020,14 @@ pub async fn run(
         }
     }
     let lessons = load_project_lessons()?;
+    let art = std::path::Path::new(&cfg.artifacts.dir);
     let ws = Workspace::create(&opts.run_id)?;
     let base_sha = ws.base_sha().to_string();
+    crate::report::append_event(
+        art,
+        &opts.run_id,
+        serde_json::json!({"event": "run_start", "base_sha": base_sha, "model": opts.builder_model}),
+    );
     let judge_spec = build_judge_spec(&opts.spec, lessons.as_deref(), &opts.context_files, ws.path());
     let deadline = Instant::now() + Duration::from_secs(cfg.loop_cfg.max_walltime_secs);
 
@@ -1078,11 +1085,24 @@ pub async fn run(
         builder_snapshot.stdout_tail = builder_out.stdout_tail;
         builder_snapshot.stderr_tail = builder_out.stderr_tail;
         builder_snapshot.failure_kind = builder_out.failure_kind;
+        crate::report::append_event(
+            art,
+            &opts.run_id,
+            serde_json::json!({"event": "builder_done", "iter": state.index, "failure_kind": builder_snapshot.failure_kind}),
+        );
 
         // Discard any test-file changes the model made. Bob may only edit
         // production code. If the model modified or created test files, revert
         // them so the scope check and verify gate see only src/ changes.
-        for f in reset_test_files(ws.path(), ws.base_sha(), &opts.editable_paths) {
+        let reset_now = reset_test_files(ws.path(), ws.base_sha(), &opts.editable_paths);
+        if !reset_now.is_empty() {
+            crate::report::append_event(
+                art,
+                &opts.run_id,
+                serde_json::json!({"event": "test_files_reset", "files": reset_now}),
+            );
+        }
+        for f in reset_now {
             reset_files.insert(f);
         }
 
@@ -1104,6 +1124,11 @@ pub async fn run(
                     cmd: vr.cmd.clone(),
                     output_tail: crate::builder::tail(&vr.output, 4000),
                 });
+                crate::report::append_event(
+                    art,
+                    &opts.run_id,
+                    serde_json::json!({"event": "verify", "iter": state.index, "passed": vr.passed}),
+                );
                 if !vr.passed {
                     StepOutcome::VerifyFailed { output: vr.output }
                 } else {
@@ -1119,6 +1144,16 @@ pub async fn run(
                                 verdict: verdict_name(o.verdict).into(),
                                 critique: o.critique.clone(),
                             });
+                            crate::report::append_event(
+                                art,
+                                &opts.run_id,
+                                serde_json::json!({
+                                    "event": "judge",
+                                    "iter": state.index,
+                                    "verdict": verdict_name(o.verdict),
+                                    "critique_empty": o.critique.trim().is_empty(),
+                                }),
+                            );
                             StepOutcome::Judged {
                                 verdict: o.verdict,
                                 critique: o.critique,
@@ -1209,6 +1244,11 @@ pub async fn run(
                     } else {
                         true
                     };
+                    crate::report::append_event(
+                        art,
+                        &opts.run_id,
+                        serde_json::json!({"event": "replay_verify", "passed": replay_ok}),
+                    );
                     if !replay_ok {
                         status = RunStatus::NotConverged;
                         stop_reason = Some(StopReason::ReplayVerifyFailed);
@@ -1282,7 +1322,25 @@ pub async fn run(
         reset_test_files: reset_files.into_iter().collect(),
         context_est_tokens: context_est,
         prompt_est_tokens,
+        verify_cmds: cfg.verify.cmds.clone(),
     };
+    let status_str = match status {
+        RunStatus::Converged => "converged",
+        RunStatus::NeedsReview => "needs_review",
+        RunStatus::NotConverged => "not_converged",
+        RunStatus::Error => "error",
+    };
+    let stop_reason_str = stop_reason.map(|r| format!("{r:?}")).unwrap_or_default();
+    crate::report::append_event(
+        art,
+        &opts.run_id,
+        serde_json::json!({"event": "run_end", "status": status_str, "stop_reason": stop_reason_str}),
+    );
+    let _ = std::fs::create_dir_all(std::path::Path::new(&result.artifact_dir));
+    let _ = std::fs::write(
+        std::path::Path::new(&result.artifact_dir).join("run.json"),
+        crate::report::to_json(&result),
+    );
     if should_keep_worktree(opts.keep_worktree, status) {
         eprintln!("worktree preserved at {}", ws.path().display());
     } else {
@@ -1642,6 +1700,7 @@ assert!(matches!(
             reset_test_files: vec![],
             context_est_tokens: 0,
             prompt_est_tokens: vec![],
+            verify_cmds: vec![],
         };
         assert!(should_try_next_model(&res));
         res.stop_reason = Some(StopReason::ScopeExceeded);

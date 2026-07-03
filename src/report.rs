@@ -27,6 +27,7 @@ pub fn to_json(res: &RunResult) -> String {
         "reset_test_files": &res.reset_test_files,
         "context_est_tokens": res.context_est_tokens,
         "prompt_est_tokens": &res.prompt_est_tokens,
+        "verify_cmds": &res.verify_cmds,
         "scope": res.scope.as_ref().map(|s| serde_json::json!({
             "within": s.within,
             "files": s.files,
@@ -97,6 +98,30 @@ pub fn write_artifacts(
     Ok(())
 }
 
+/// Best-effort structured event log: one JSON object per line in
+/// <dir>/<run_id>/events.jsonl, stamped with unix seconds. Never fails the run.
+pub fn append_event(dir: &Path, run_id: &str, mut event: serde_json::Value) {
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(o) = event.as_object_mut() {
+        o.insert("ts".into(), serde_json::json!(ts));
+    }
+    let d = dir.join(run_id);
+    if std::fs::create_dir_all(&d).is_err() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(d.join("events.jsonl"))
+    {
+        let _ = writeln!(f, "{event}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +158,7 @@ mod tests {
             reset_test_files: vec![],
             context_est_tokens: 0,
             prompt_est_tokens: vec![],
+            verify_cmds: vec![],
         };
         let j = to_json(&res);
         assert!(j.contains("\"status\":\"needs_review\""));
@@ -186,6 +212,7 @@ mod tests {
             reset_test_files: vec![],
             context_est_tokens: 0,
             prompt_est_tokens: vec![],
+            verify_cmds: vec![],
         };
         assert!(to_json(&mk(RunStatus::Converged, NextAction::Done)).contains("\"status\":\"converged\""));
         assert!(to_json(&mk(RunStatus::NeedsReview, NextAction::ReviewCandidate))
@@ -202,5 +229,20 @@ mod tests {
             std::fs::read_to_string(tmp.join("r1/iter-0/diff.patch")).unwrap(),
             "D"
         );
+    }
+
+    #[test]
+    fn append_event_writes_jsonl() {
+        let tmp = std::env::temp_dir().join(format!("bob-ev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        append_event(&tmp, "r1", serde_json::json!({"event": "verify", "passed": true}));
+        append_event(&tmp, "r1", serde_json::json!({"event": "judge", "verdict": "pass"}));
+        let text = std::fs::read_to_string(tmp.join("r1/events.jsonl")).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["event"], "verify");
+        assert!(first["ts"].as_u64().unwrap() > 0);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

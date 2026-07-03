@@ -20,6 +20,35 @@ use cli::{Cli, Command};
 
 static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+fn load_run_json(artifacts_dir: &str, run_id: &str) -> anyhow::Result<serde_json::Value> {
+    let path = std::path::Path::new(artifacts_dir).join(run_id).join("run.json");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("no run.json for {run_id} at {}: {e}", path.display()))?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn replay_run(cfg: &config::Config, run_id: &str) -> anyhow::Result<(serde_json::Value, bool)> {
+    let run = load_run_json(&cfg.artifacts.dir, run_id)?;
+    let base_sha = run["base_sha"].as_str().unwrap_or_default().to_string();
+    let diff = run["final_diff"].as_str().unwrap_or_default().to_string();
+    if diff.trim().is_empty() {
+        anyhow::bail!("run {run_id} has an empty final_diff — nothing to replay");
+    }
+    let cmds: Vec<String> = run["verify_cmds"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let cmds = if cmds.is_empty() { cfg.verify.cmds.clone() } else { cmds };
+    let repo = std::env::current_dir()?;
+    let vr = worktree::replay_verify_at(&repo, &base_sha, run_id, &diff, &cmds)?;
+    println!(
+        "bob: replay-verify {} for run {run_id} ({} gate(s))",
+        if vr.passed { "PASSED" } else { "FAILED" },
+        cmds.len()
+    );
+    Ok((run, vr.passed))
+}
+
 #[cfg(test)]
 pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -209,6 +238,45 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or(0.5);
                 model_stats::StatsStore::load().print_summary(weight);
             }
+            Ok(())
+        }
+        Command::Replay { run_id } => {
+            let cfg = config::Config::load(args.config.as_deref())?;
+            let (_, passed) = replay_run(&cfg, &run_id)?;
+            if !passed {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Command::Apply { run_id } => {
+            let cfg = config::Config::load(args.config.as_deref())?;
+            let (run, passed) = replay_run(&cfg, &run_id)?;
+            if !passed {
+                anyhow::bail!("replay-verify failed — not applying");
+            }
+            let base_sha = run["base_sha"].as_str().unwrap_or_default();
+            let cwd = std::env::current_dir()?;
+            let head = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&cwd)
+                .output()?;
+            let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+            if head != base_sha {
+                anyhow::bail!(
+                    "HEAD ({head}) has moved off the run's base_sha ({base_sha}) — rebase/re-run instead of applying"
+                );
+            }
+            let patch = std::path::Path::new(&cfg.artifacts.dir).join(&run_id).join("apply.patch");
+            std::fs::write(&patch, run["final_diff"].as_str().unwrap_or_default())?;
+            let st = std::process::Command::new("git")
+                .args(["apply", "--whitespace=nowarn"])
+                .arg(&patch)
+                .current_dir(&cwd)
+                .status()?;
+            if !st.success() {
+                anyhow::bail!("git apply failed");
+            }
+            println!("bob: applied run {run_id} to the working tree (unstaged)");
             Ok(())
         }
     }

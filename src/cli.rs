@@ -99,4 +99,15 @@ pub enum Command {
         #[arg(long)]
         reset: bool,
     },
+    /// Replay-verify a past run: apply its final_diff to a fresh tree at its
+    /// base_sha and re-run its verify gates. Read-only for your working tree.
+    Replay {
+        /// Run id (directory name under the artifacts dir).
+        run_id: String,
+    },
+    /// Replay-verify a past run, then apply its final_diff to the working tree.
+    /// Refuses if HEAD has moved off the run's base_sha.
+    Apply {
+        run_id: String,
+    },
 }
