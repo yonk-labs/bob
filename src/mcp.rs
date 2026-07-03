@@ -57,6 +57,9 @@ pub struct BuildParams {
     /// Judge behavior after verify passes: advisory, blocking, retry_on_fail.
     #[serde(default)]
     pub judge_policy: Option<String>,
+    /// Tier: cheap | large | frontier. Overrides bob.yaml default_tier.
+    #[serde(default)]
+    pub tier: Option<String>,
     /// Try only the selected `model`: no tier escalation, no fallback models.
     #[serde(default)]
     pub skip_escalation: Option<bool>,
@@ -123,7 +126,7 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
             MCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ),
         builder_model: None,
-        tier: None,
+        tier: p.tier,
     };
     let skip_escalation = p.skip_escalation.unwrap_or(false);
     let res = engine::run_opencode_with_fallbacks(&cfg, opts, p.model, fallback_models, skip_escalation)
