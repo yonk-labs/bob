@@ -179,7 +179,7 @@ pub async fn run(campaign: Campaign, base_cfg: &Config) -> anyhow::Result<Campai
 
     let mut campaign_verify = None;
     let mut status = if completed { "completed" } else { "stopped" }.to_string();
-    if completed && !campaign.verify_cmds.is_empty() {
+    if should_run_campaign_verify(&campaign, completed) {
         let cwd = std::env::current_dir()?;
         let vr = crate::verify::run_gates(&campaign.verify_cmds, &cwd);
         if !vr.passed {
@@ -200,6 +200,15 @@ pub async fn run(campaign: Campaign, base_cfg: &Config) -> anyhow::Result<Campai
     };
     write_result_artifact(&result_path, &report)?;
     Ok(report)
+}
+
+/// The campaign-level integration gate is only meaningful once slices have
+/// actually landed in the main tree (auto_apply or auto_commit). In pure
+/// propose mode no slice touches the checkout, so running verify_cmds
+/// against an unmodified tree would be meaningless and potentially
+/// misleading.
+fn should_run_campaign_verify(c: &Campaign, completed: bool) -> bool {
+    completed && !c.verify_cmds.is_empty() && (c.auto_apply || c.auto_commit)
 }
 
 fn validate(c: &Campaign) -> anyhow::Result<()> {
@@ -443,6 +452,56 @@ slices:
         let y = "name: c\nverify_cmds: [\"npm run test:all\"]\nslices:\n  - task: t\n";
         let c: Campaign = serde_yaml::from_str(y).unwrap();
         assert_eq!(c.verify_cmds, vec!["npm run test:all"]);
+    }
+
+    #[test]
+    fn campaign_verify_only_runs_when_slices_land_in_main_tree() {
+        // Propose mode (auto_apply=false, auto_commit=false): no slice ever
+        // touches the checkout, so the gate must be skipped even though
+        // verify_cmds is set and the campaign completed.
+        let propose_mode = Campaign {
+            name: Some("x".into()),
+            auto_apply: false,
+            auto_commit: false,
+            max_slices: None,
+            verify_cmds: vec!["cargo test".into()],
+            slices: vec![slice("a")],
+        };
+        assert!(!should_run_campaign_verify(&propose_mode, true));
+
+        // auto_commit campaigns land slices in the tree, so a completed run
+        // with verify_cmds set should run the gate.
+        let auto_commit = Campaign {
+            name: Some("x".into()),
+            auto_apply: false,
+            auto_commit: true,
+            max_slices: None,
+            verify_cmds: vec!["cargo test".into()],
+            slices: vec![slice("a")],
+        };
+        assert!(should_run_campaign_verify(&auto_commit, true));
+
+        // No verify_cmds configured: nothing to run regardless of mode.
+        let no_cmds = Campaign {
+            name: Some("x".into()),
+            auto_apply: true,
+            auto_commit: true,
+            max_slices: None,
+            verify_cmds: vec![],
+            slices: vec![slice("a")],
+        };
+        assert!(!should_run_campaign_verify(&no_cmds, true));
+
+        // Campaign did not complete: gate must not run even if otherwise eligible.
+        let not_completed = Campaign {
+            name: Some("x".into()),
+            auto_apply: true,
+            auto_commit: true,
+            max_slices: None,
+            verify_cmds: vec!["cargo test".into()],
+            slices: vec![slice("a")],
+        };
+        assert!(!should_run_campaign_verify(&not_completed, false));
     }
 
     fn slice(task: &str) -> Slice {
