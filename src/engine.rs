@@ -1189,9 +1189,32 @@ pub async fn run(
         prompt_est_tokens.push((prompt.len() as u64) / 4);
 
         // BUILD
+        // Emit builder_start BEFORE the (possibly minutes-long) build call, so a
+        // silent stall is visible in events.jsonl within one event of where it
+        // died — the run no longer shows run_start then nothing for the whole
+        // builder.timeout_secs window (findings #28/#31).
+        crate::report::append_event(
+            art,
+            &opts.run_id,
+            serde_json::json!({"event": "builder_start", "iter": state.index, "model": opts.builder_model}),
+        );
+        let build_started = Instant::now();
         let builder_out: BuilderOutcome = match builder.build(&prompt, ws.path()).await {
             Ok(out) => out,
             Err(e) => {
+                let elapsed = build_started.elapsed().as_secs();
+                let timed_out = e.to_string().contains("timed out");
+                crate::report::append_event(
+                    art,
+                    &opts.run_id,
+                    serde_json::json!({
+                        "event": if timed_out { "builder_timeout" } else { "builder_error" },
+                        "iter": state.index,
+                        "model": opts.builder_model,
+                        "elapsed_secs": elapsed,
+                        "detail": e.to_string(),
+                    }),
+                );
                 eprintln!(
                     "bob: builder error — worktree preserved at {}",
                     ws.path().display()
@@ -2864,6 +2887,94 @@ mod flow_tests {
         std::env::set_current_dir(prev).unwrap();
         assert_eq!(res.status, RunStatus::Converged);
         assert_eq!(res.iterations, 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A builder that always errors — models a hung goose the harness had to
+    /// kill (findings #28/#31). The error string mirrors builder.rs so the
+    /// timeout-vs-error classification is exercised for real.
+    struct ErrBuilder {
+        msg: String,
+    }
+    impl Builder for ErrBuilder {
+        async fn build(&self, _p: &str, _w: &Path) -> anyhow::Result<BuilderOutcome> {
+            anyhow::bail!("{}", self.msg)
+        }
+    }
+
+    fn init_repo_here(tmp: &Path) {
+        let _ = std::fs::remove_dir_all(tmp);
+        std::fs::create_dir_all(tmp).unwrap();
+        let g = |a: &[&str]| {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(tmp)
+                .output()
+                .unwrap();
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(tmp.join("seed.txt"), "x\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+    }
+
+    /// Fix 1: a builder timeout emits builder_start (at iteration start) and
+    /// builder_timeout (on the kill) into events.jsonl — a silent 600s stall is
+    /// now visible within one event of where it died.
+    #[tokio::test]
+    async fn builder_timeout_emits_start_and_timeout_events() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-timeout-events-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "timeout-events".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: Some("qwen-193".into()),
+        };
+        let res = run(
+            &cfg,
+            opts,
+            &ErrBuilder {
+                msg: "goose timed out after 5s".into(),
+            },
+            &UncertainJudge,
+        )
+        .await;
+
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/timeout-events/events.jsonl")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        // run() still returns Err so the fallback wrapper can escalate models.
+        assert!(res.is_err(), "builder timeout must surface as an Err");
+        let evs: Vec<serde_json::Value> = events
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let start = evs
+            .iter()
+            .find(|v| v["event"] == "builder_start")
+            .expect("builder_start emitted before the build call");
+        assert_eq!(start["iter"], 0);
+        assert_eq!(start["model"], "qwen-193");
+        let to = evs
+            .iter()
+            .find(|v| v["event"] == "builder_timeout")
+            .expect("builder_timeout emitted on the kill path");
+        assert_eq!(to["iter"], 0);
+        assert_eq!(to["model"], "qwen-193");
+        assert!(to["elapsed_secs"].is_u64(), "elapsed_secs recorded");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
