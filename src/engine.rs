@@ -1010,6 +1010,22 @@ pub async fn run_opencode_with_fallbacks(
             ));
             break;
         }
+        // F5: a multi-model cascade must be readable from the PRIMARY run's
+        // events.jsonl alone — one fallback_start per hop, before any skip
+        // logic, carrying the reason the previous attempt ended.
+        if idx > 0 {
+            crate::report::append_event(
+                std::path::Path::new(&cfg.artifacts.dir),
+                &opts.run_id,
+                serde_json::json!({
+                    "event": "fallback_start",
+                    "attempt": idx,
+                    "model": resolved_model,
+                    "reason": fallback_history.last().cloned().unwrap_or_default(),
+                }),
+            );
+        }
+
         // This attempt (and its inner iteration loop) sees only the time left in
         // the shared budget, so run()'s deadline collapses toward overall_deadline.
         let mut attempt_cfg = cfg.clone();
@@ -3422,6 +3438,20 @@ mod flow_tests {
             .filter(|l| l.contains("\"builder_error\"") && l.contains("endpoint unreachable"))
             .count();
         assert_eq!(dead_events, 2, "one builder_error per dead model:\n{events}");
+        // F5: the hop itself is visible in the PRIMARY run's events.jsonl —
+        // fallback_start names the next model, attempt index, and the reason
+        // the previous attempt ended.
+        let fb: serde_json::Value = events
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .find(|v: &serde_json::Value| v["event"] == "fallback_start")
+            .expect("fallback_start emitted on the hop");
+        assert_eq!(fb["attempt"], 1);
+        assert_eq!(fb["model"], "test-model-2");
+        assert!(
+            fb["reason"].as_str().unwrap().contains("endpoint unreachable"),
+            "reason carries why the previous attempt ended: {fb}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
