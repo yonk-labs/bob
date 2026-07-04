@@ -199,6 +199,9 @@ Searched as `./bob.yaml` then `~/.config/bob/config.yaml` (override with `--conf
 builder:
   cmd: opencode           # builder CLI; invoked as: <cmd> run --dir <wt> --model <id> <args> <prompt>
   timeout_secs: 600       # per build-step wall-clock timeout
+  idle_stall_secs: 120    # goose watchdog: kill early if the endpoint shows NO running request
+                          #   for this long (an idle-wait hang). Never fires while a request is
+                          #   running (busy-loops ride the wall clock). 0 disables.
   model: qwen             # default model: a name from `models`, or a raw provider/model id
   models:                 # named roster — switch with `bob build --model <name>`, list with `bob models`
     qwen:    ollama/Intel/Qwen3-Coder-Next-int4-AutoRound   # legacy form: provider/model id

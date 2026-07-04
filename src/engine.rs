@@ -676,13 +676,15 @@ fn should_try_next_model_after_error(err: &anyhow::Error) -> bool {
     // thin ("thin builder: model API error"). Orchestration errors (git/worktree)
     // don't use these phrases, so they still fail fast.
     // "endpoint unreachable" covers the pre-spawn probe and goose's exit-0
-    // network failure (F2) — both per-model infra errors.
+    // network failure (F2); "idle-stall" covers the F8 watchdog kill — all
+    // per-model infra errors the fallback wrapper should hop on.
     s.contains("timed out")
         || s.contains("exited with status")
         || s.contains("spawning ")
         || s.contains("builder")
         || s.contains("model API error")
         || s.contains("endpoint unreachable")
+        || s.contains("idle-stall")
 }
 
 fn model_label(model: &Option<String>) -> String {
@@ -1161,6 +1163,7 @@ pub async fn run_opencode_with_fallbacks(
                     api_key,
                     toolshim: cfg.builder.goose_toolshim,
                     run_id: Some(attempt_opts.run_id.clone()),
+                    idle_stall: Duration::from_secs(cfg.builder.idle_stall_secs),
                 })
             }
             _ => crate::builder::BuilderKind::Opencode(crate::builder::Opencode {
@@ -1311,16 +1314,29 @@ pub async fn run(
             Ok(out) => out,
             Err(e) => {
                 let elapsed = build_started.elapsed().as_secs();
-                let timed_out = e.to_string().contains("timed out");
+                let detail = e.to_string();
+                // Distinguish the three kill/error shapes for hector: an
+                // idle-stall (F8, watchdog killed a wedged idle-wait) reads
+                // very differently from a wall-clock timeout or a spawn/CLI
+                // error. All three still break to the terminal finalizer.
+                let idle_stalled = detail.contains("idle-stalled");
+                let timed_out = !idle_stalled && detail.contains("timed out");
+                let event = if idle_stalled {
+                    "builder_idle_stall"
+                } else if timed_out {
+                    "builder_timeout"
+                } else {
+                    "builder_error"
+                };
                 crate::report::append_event(
                     art,
                     &opts.run_id,
                     serde_json::json!({
-                        "event": if timed_out { "builder_timeout" } else { "builder_error" },
+                        "event": event,
                         "iter": state.index,
                         "model": opts.builder_model,
                         "elapsed_secs": elapsed,
-                        "detail": e.to_string(),
+                        "detail": detail,
                     }),
                 );
                 eprintln!(
@@ -1360,9 +1376,14 @@ pub async fn run(
                 // after finalizing so the fallback wrapper still escalates models.
                 status = RunStatus::Error;
                 stop_reason = Some(StopReason::BuilderError);
-                builder_snapshot.failure_kind =
-                    if timed_out { "timeout".into() } else { "error".into() };
-                builder_snapshot.stderr_tail = e.to_string();
+                builder_snapshot.failure_kind = if idle_stalled {
+                    "idle_stall".into()
+                } else if timed_out {
+                    "timeout".into()
+                } else {
+                    "error".into()
+                };
+                builder_snapshot.stderr_tail = detail;
                 builder_error = Some(e);
                 break;
             }
@@ -2425,6 +2446,7 @@ mod flow_tests {
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
+            idle_stall_secs: 0,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -2512,6 +2534,7 @@ mod flow_tests {
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
+            idle_stall_secs: 0,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -2605,6 +2628,7 @@ mod flow_tests {
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
+            idle_stall_secs: 0,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -2714,6 +2738,7 @@ mod flow_tests {
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
+            idle_stall_secs: 0,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -2819,6 +2844,7 @@ mod flow_tests {
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
+            idle_stall_secs: 0,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -2970,6 +2996,7 @@ mod flow_tests {
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
+            idle_stall_secs: 0,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -3473,6 +3500,67 @@ mod flow_tests {
         assert!(
             fb["reason"].as_str().unwrap().contains("endpoint unreachable"),
             "reason carries why the previous attempt ended: {fb}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// F8: an idle-stall kill is classified distinctly — builder_idle_stall
+    /// event, failure_kind idle_stall, terminal run.json + Err the fallback
+    /// wrapper hops on — separate from a wall-clock timeout.
+    #[tokio::test]
+    async fn idle_stall_error_is_classified_as_builder_idle_stall() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-idle-stall-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "idle-stall".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: Some("gemma-133".into()),
+        };
+        let res = run(
+            &cfg,
+            opts,
+            &ErrBuilder {
+                msg: "goose idle-stalled after 130s with no running request on the endpoint — killed early".into(),
+            },
+            &UncertainJudge,
+        )
+        .await;
+
+        let run_json_raw =
+            std::fs::read_to_string(tmp.join(".bob/runs/idle-stall/run.json")).unwrap();
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/idle-stall/events.jsonl")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        let err = match res {
+            Ok(_) => panic!("idle-stall must surface as Err"),
+            Err(e) => e,
+        };
+        assert!(
+            should_try_next_model_after_error(&err),
+            "idle-stall is a per-model infra error the fallback hops on"
+        );
+        let rj: serde_json::Value = serde_json::from_str(&run_json_raw).unwrap();
+        assert_eq!(rj["status"], "error");
+        assert_eq!(rj["builder"]["failure_kind"], "idle_stall");
+        // The event is builder_idle_stall, NOT builder_timeout.
+        assert!(
+            events.lines().any(|l| l.contains("\"builder_idle_stall\"")),
+            "builder_idle_stall event emitted:\n{events}"
+        );
+        assert!(
+            !events.lines().any(|l| l.contains("\"builder_timeout\"")),
+            "must not be misclassified as a wall-clock timeout"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -79,6 +79,13 @@ pub struct BuilderCfg {
     /// otherwise goose makes no edits and bob reports EmptyDiffAfterCritique.
     #[serde(default)]
     pub goose_toolshim: bool,
+    /// Idle-stall watchdog: kill a goose attempt early when its endpoint shows
+    /// NO running request continuously for this many seconds (an idle-wait
+    /// hang — the builder ended its turn waiting for input bob can't send).
+    /// Never fires while a request is running (a busy-loop stays governed by
+    /// the no-progress diff check + wall clock). 0 disables. Default 120.
+    #[serde(default = "default_idle_stall")]
+    pub idle_stall_secs: u64,
 }
 
 /// Deserialization shadow for `BuilderCfg`: `cmd` is optional here so it can
@@ -113,6 +120,8 @@ struct BuilderCfgRaw {
     exclude: Vec<String>,
     #[serde(default)]
     goose_toolshim: bool,
+    #[serde(default = "default_idle_stall")]
+    idle_stall_secs: u64,
 }
 
 impl TryFrom<BuilderCfgRaw> for BuilderCfg {
@@ -138,12 +147,16 @@ impl TryFrom<BuilderCfgRaw> for BuilderCfg {
             pin: raw.pin,
             exclude: raw.exclude,
             goose_toolshim: raw.goose_toolshim,
+            idle_stall_secs: raw.idle_stall_secs,
         })
     }
 }
 
 fn default_reliability_weight() -> f64 {
     0.5
+}
+fn default_idle_stall() -> u64 {
+    120
 }
 /// A roster entry: either a bare `provider/model` id (legacy) or the explicit
 /// shape shared with hector/abe. Untagged so both YAML forms just work.

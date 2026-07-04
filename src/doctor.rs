@@ -293,6 +293,59 @@ pub fn endpoint_alive(base_url: &str, bearer: Option<&str>) -> bool {
     }
 }
 
+/// Best-effort "is a request actively running on this endpoint RIGHT NOW?",
+/// used by the goose idle-stall watchdog (F8) to tell an idle-wait hang (no
+/// running request) from a busy-loop (running request advancing). Reads the
+/// vLLM Prometheus metric `vllm:num_requests_running` from `{host}/metrics`
+/// (metrics live at the host root, not under `/v1`). Returns:
+///   Some(true)  — a request is running (busy — never act)
+///   Some(false) — endpoint answered, zero running (idle)
+///   None        — can't tell (no /metrics, parse fail, unreachable): callers
+///                 MUST treat this as active and never kill on it (fail-safe).
+pub fn endpoint_running_request(base_url: &str, bearer: Option<&str>) -> Option<bool> {
+    let host = base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "-m", "3"]);
+    if let Some(token) = bearer {
+        if !token.is_empty() {
+            cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
+        }
+    }
+    cmd.arg(format!("{host}/metrics"));
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_num_requests_running(std::str::from_utf8(&out.stdout).ok()?)
+}
+
+/// Parse `vllm:num_requests_running` from a Prometheus metrics body. Sums
+/// across per-model series (a labeled endpoint emits one line per model);
+/// `Some(true)` if any series is > 0, `Some(false)` if the metric is present
+/// and all zero, `None` if the metric is absent/unparsable.
+fn parse_num_requests_running(metrics: &str) -> Option<bool> {
+    let mut found = false;
+    let mut any_running = false;
+    for line in metrics.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || !line.starts_with("vllm:num_requests_running") {
+            continue;
+        }
+        if let Some(val) = line.split_whitespace().last() {
+            if let Ok(n) = val.parse::<f64>() {
+                found = true;
+                if n > 0.0 {
+                    any_running = true;
+                }
+            }
+        }
+    }
+    found.then_some(any_running)
+}
+
 /// Outcome of probing one endpoint.
 struct ProbeResult {
     target: ProbeTarget,
@@ -401,6 +454,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn parse_num_requests_running_reads_vllm_metric() {
+        // busy: a running series > 0 (labels present)
+        let busy = "\
+# HELP vllm:num_requests_running Number of requests currently running.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name=\"qwen\"} 1.0
+vllm:num_requests_waiting{model_name=\"qwen\"} 0.0
+";
+        assert_eq!(parse_num_requests_running(busy), Some(true));
+
+        // idle: metric present, all zero
+        let idle = "vllm:num_requests_running{model_name=\"qwen\"} 0.0\n";
+        assert_eq!(parse_num_requests_running(idle), Some(false));
+
+        // multi-series: any series running → busy
+        let multi = "\
+vllm:num_requests_running{model_name=\"a\"} 0.0
+vllm:num_requests_running{model_name=\"b\"} 2.0
+";
+        assert_eq!(parse_num_requests_running(multi), Some(true));
+
+        // absent metric → unobservable (None), never mistaken for idle
+        assert_eq!(parse_num_requests_running("# nothing useful here\n"), None);
+        assert_eq!(parse_num_requests_running(""), None);
+    }
+
+    #[test]
+    fn endpoint_running_request_is_none_for_a_dead_endpoint() {
+        // No /metrics reachable → None (unobservable), never Some(false).
+        assert_eq!(endpoint_running_request("http://127.0.0.1:1/v1", None), None);
     }
 
     #[test]

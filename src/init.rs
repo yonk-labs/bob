@@ -282,6 +282,7 @@ pub fn run() -> anyhow::Result<()> {
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
+                idle_stall_secs: 120,
             args: builder_args,
         },
         judge: crate::config::JudgeCfg {
@@ -460,6 +461,7 @@ artifacts:
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
+                idle_stall_secs: 120,
                 args: vec!["--variant".to_string(), "high".to_string()],
             },
             judge: crate::config::JudgeCfg {

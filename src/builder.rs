@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 
 #[derive(Debug, Clone, Default)]
@@ -323,6 +323,9 @@ pub struct GooseBuilder {
     /// When set, write `.bob/runs/<run_id>/goose.pid` for the reaper — same
     /// contract as Opencode's `opencode.pid`.
     pub run_id: Option<String>,
+    /// Idle-stall watchdog threshold (builder.idle_stall_secs). Zero disables.
+    /// Kill early when the endpoint shows no running request for this long.
+    pub idle_stall: Duration,
 }
 
 /// SIGTERM → 200ms grace → SIGKILL, addressed to the PROCESS GROUP (`-pid`).
@@ -346,6 +349,38 @@ fn kill_group_with_escalation(pid: u32) {
 /// Reaper-visible pidfile for a builder child: `.bob/runs/<run_id>/<name>`.
 fn builder_pidfile(run_id: &str, name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(".bob/runs").join(run_id).join(name)
+}
+
+/// What the idle-stall watchdog should do at one poll tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleAction {
+    /// Endpoint is busy or unobservable — reset the idle timer, keep waiting.
+    ResetTimer,
+    /// Confirmed idle, but not long enough yet — keep waiting, keep the timer.
+    Wait,
+    /// Confirmed idle past the threshold — kill the attempt early.
+    KillIdle,
+}
+
+/// Pure idle-stall decision (F8). Kill ONLY when the endpoint answered with
+/// zero running requests (`Some(false)`) continuously for `idle_stall`. A busy
+/// endpoint (`Some(true)`) or an unobservable one (`None`, e.g. no /metrics)
+/// resets the timer and is NEVER killed — a busy-loop stays governed by the
+/// no-progress diff check + wall clock, exactly as the constraint requires.
+/// `idle_stall == 0` disables the watchdog.
+fn idle_watchdog_decision(
+    idle_stall: Duration,
+    idle_elapsed: Duration,
+    running: Option<bool>,
+) -> IdleAction {
+    if idle_stall.is_zero() {
+        return IdleAction::ResetTimer;
+    }
+    match running {
+        Some(true) | None => IdleAction::ResetTimer,
+        Some(false) if idle_elapsed >= idle_stall => IdleAction::KillIdle,
+        Some(false) => IdleAction::Wait,
+    }
 }
 
 impl Builder for GooseBuilder {
@@ -421,8 +456,41 @@ impl Builder for GooseBuilder {
             }
         };
 
-        match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
-            Ok(out) => {
+        // Race the process against the wall-clock deadline AND an idle-stall
+        // watchdog (F8). goose is one-shot (`run --text`, stdin null,
+        // wait_with_output buffers) so bob can't observe incremental output or
+        // poke it — the only bounded response to an idle-wait hang is to kill
+        // early and let the fallback wrapper hop. The watchdog polls the
+        // endpoint's running-request signal; it never acts while a request is
+        // running (busy-loop) or when the signal is unobservable (fail-safe).
+        let deadline = Instant::now() + self.timeout;
+        let poll = self.idle_poll_period();
+        let running_probe = || {
+            self.base_url
+                .as_deref()
+                .and_then(|u| crate::doctor::endpoint_running_request(u, self.api_key.as_deref()))
+        };
+        let wait = child.wait_with_output();
+        tokio::pin!(wait);
+        let mut last_active = Instant::now();
+        let outcome = loop {
+            tokio::select! {
+                out = &mut wait => break WaitOutcome::Done(out),
+                _ = tokio::time::sleep(poll) => {
+                    if Instant::now() >= deadline {
+                        break WaitOutcome::WallTimeout;
+                    }
+                    match idle_watchdog_decision(self.idle_stall, last_active.elapsed(), running_probe()) {
+                        IdleAction::ResetTimer => last_active = Instant::now(),
+                        IdleAction::Wait => {}
+                        IdleAction::KillIdle => break WaitOutcome::IdleStall(last_active.elapsed()),
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            WaitOutcome::Done(out) => {
                 remove_pidfile();
                 let out = out?;
                 let stdout_tail = tail(&String::from_utf8_lossy(&out.stdout), 4000);
@@ -451,18 +519,49 @@ impl Builder for GooseBuilder {
                     },
                 })
             }
-            Err(_) => {
-                // Escalated GROUP kill: kill_on_drop alone SIGKILLs only the
-                // direct goose pid, orphaning any tool child goose spawned —
-                // which keeps running (and writing) after bob reports timeout.
+            // Escalated GROUP kill for both terminal cases: kill_on_drop alone
+            // SIGKILLs only the direct goose pid, orphaning any tool child.
+            WaitOutcome::WallTimeout => {
                 if let Some(pid) = child_pid {
                     kill_group_with_escalation(pid);
                 }
                 remove_pidfile();
                 anyhow::bail!("goose timed out after {:?}", self.timeout)
             }
+            WaitOutcome::IdleStall(elapsed) => {
+                if let Some(pid) = child_pid {
+                    kill_group_with_escalation(pid);
+                }
+                remove_pidfile();
+                // "idle-stall" is the classified marker the engine maps to a
+                // builder_idle_stall event and the fallback wrapper hops on.
+                anyhow::bail!(
+                    "goose idle-stalled after {elapsed:?} with no running request on the endpoint — killed early"
+                )
+            }
         }
     }
+}
+
+impl GooseBuilder {
+    /// Watchdog poll cadence: frequent enough to notice within a fraction of
+    /// the threshold, but never sub-second. Derived from idle_stall (¼ of it,
+    /// clamped [2s, 15s]); when disabled, poll rarely — only the wall-clock
+    /// deadline matters.
+    fn idle_poll_period(&self) -> Duration {
+        if self.idle_stall.is_zero() {
+            return Duration::from_secs(15);
+        }
+        let quarter = self.idle_stall / 4;
+        quarter.clamp(Duration::from_secs(2), Duration::from_secs(15))
+    }
+}
+
+/// Terminal outcome of the goose wait/watchdog race.
+enum WaitOutcome {
+    Done(std::io::Result<std::process::Output>),
+    WallTimeout,
+    IdleStall(Duration),
 }
 
 // ── Opencode builder implementation (unchanged, moved here for cohesion) ────
@@ -676,6 +775,7 @@ class Body { }
             base_url: None,
             api_key: None,
             toolshim: false,
+            idle_stall: Duration::from_secs(0),
             run_id: None,
         };
         b.build("the prompt", &dir).await.unwrap();
@@ -709,6 +809,7 @@ class Body { }
             base_url: None,
             api_key: None,
             toolshim: false,
+            idle_stall: Duration::from_secs(0),
             run_id: None,
         };
         let out = mk(script.to_string_lossy().into_owned())
@@ -726,6 +827,66 @@ class Body { }
             .await
             .unwrap();
         assert_eq!(out.failure_kind, "ok");
+    }
+
+    /// F8: the pure idle-stall decision. The two constraints that matter —
+    /// never act on a busy endpoint, never act on an unobservable one — are
+    /// asserted directly.
+    #[test]
+    fn idle_watchdog_only_kills_confirmed_idle_past_threshold() {
+        let stall = Duration::from_secs(120);
+        let long = Duration::from_secs(200);
+        let short = Duration::from_secs(30);
+
+        // Confirmed idle (no running request) past the threshold → kill.
+        assert_eq!(
+            idle_watchdog_decision(stall, long, Some(false)),
+            IdleAction::KillIdle
+        );
+        // Confirmed idle but not long enough yet → keep waiting.
+        assert_eq!(
+            idle_watchdog_decision(stall, short, Some(false)),
+            IdleAction::Wait
+        );
+        // BUSY (a request IS running), even long past the threshold → never
+        // act; reset the timer. This is the core safety constraint.
+        assert_eq!(
+            idle_watchdog_decision(stall, long, Some(true)),
+            IdleAction::ResetTimer
+        );
+        // UNOBSERVABLE endpoint (no /metrics) → fail-safe: never kill.
+        assert_eq!(
+            idle_watchdog_decision(stall, long, None),
+            IdleAction::ResetTimer
+        );
+        // Disabled (idle_stall == 0) → never accumulate or kill.
+        assert_eq!(
+            idle_watchdog_decision(Duration::ZERO, long, Some(false)),
+            IdleAction::ResetTimer
+        );
+    }
+
+    #[test]
+    fn idle_poll_period_is_bounded() {
+        let mk = |secs| GooseBuilder {
+            cmd: "goose".into(),
+            model: "m".into(),
+            timeout: Duration::from_secs(600),
+            provider: "openai".into(),
+            base_url: None,
+            api_key: None,
+            toolshim: false,
+            idle_stall: Duration::from_secs(secs),
+            run_id: None,
+        };
+        // quarter of 120 = 30 → clamped to the 15s ceiling.
+        assert_eq!(mk(120).idle_poll_period(), Duration::from_secs(15));
+        // quarter of 40 = 10 → within bounds.
+        assert_eq!(mk(40).idle_poll_period(), Duration::from_secs(10));
+        // quarter of 4 = 1 → clamped to the 2s floor (no thrashing).
+        assert_eq!(mk(4).idle_poll_period(), Duration::from_secs(2));
+        // disabled → rare poll, only the wall clock matters.
+        assert_eq!(mk(0).idle_poll_period(), Duration::from_secs(15));
     }
 
     /// F7: a goose timeout must kill the whole PROCESS GROUP, not just the
@@ -752,6 +913,7 @@ class Body { }
             base_url: None,
             api_key: None,
             toolshim: false,
+            idle_stall: Duration::from_secs(0),
             run_id: None,
         };
         let res = b.build("p", &dir).await;
@@ -780,6 +942,37 @@ class Body { }
             }
         }
         assert!(dead, "grandchild pid={gpid} survived the timeout kill");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F8 fail-safe (through the real watchdog loop): a hung goose whose
+    /// endpoint is UNOBSERVABLE (no base_url → running-probe returns None)
+    /// must NOT be idle-killed — it rides to the wall-clock timeout. Proves
+    /// the watchdog never acts on an endpoint it can't read.
+    #[tokio::test]
+    async fn idle_watchdog_never_kills_an_unobservable_endpoint() {
+        let dir = tempdir();
+        let script = dir.join("fake-goose-hang.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 300\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let b = GooseBuilder {
+            cmd: script.to_string_lossy().into_owned(),
+            model: "m".into(),
+            timeout: Duration::from_secs(3), // wall-clock backstop
+            provider: "openai".into(),
+            base_url: None, // unobservable → running-probe is None → fail-safe
+            api_key: None,
+            toolshim: false,
+            idle_stall: Duration::from_secs(1), // would fire fast IF it could observe
+            run_id: None,
+        };
+        let err = b.build("p", &dir).await.unwrap_err().to_string();
+        assert!(
+            err.contains("timed out") && !err.contains("idle-stall"),
+            "unobservable endpoint must hit the WALL timeout, not idle-stall: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -828,6 +1021,7 @@ class Body { }
             base_url: None,
             api_key: None,
             toolshim: false,
+            idle_stall: Duration::from_secs(0),
             run_id: Some("gpid-clean".into()),
         };
         let res = b.build("p", &tmp).await;
