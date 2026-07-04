@@ -825,7 +825,10 @@ fn extract_api_key_env(model_id: &str) -> Option<String> {
 }
 
 /// Combine the tier-derived model chain with explicit per-call overrides:
-/// `--model` leads, the tier chain follows, `--fallback-model` entries trail.
+/// `--model` leads, explicit `--fallback-model` entries follow — the caller's
+/// stated chain outranks tier escalation (F6: a repro passing
+/// `--fallback-model qwen-140` got gemma-133 first because the tier chain
+/// silently won) — and the tier chain trails as the escalation backstop.
 /// Order-preserving dedup keeps the first occurrence so a forced model that
 /// also lives in a tier isn't attempted twice.
 fn apply_overrides(
@@ -835,8 +838,8 @@ fn apply_overrides(
 ) -> Vec<Option<String>> {
     let mut chain: Vec<Option<String>> = Vec::new();
     chain.extend(model_override.map(Some));
-    chain.extend(base);
     chain.extend(fallback_overrides.into_iter().map(Some));
+    chain.extend(base);
     let mut seen: Vec<Option<String>> = Vec::new();
     chain.retain(|item| {
         if seen.contains(item) {
@@ -2134,11 +2137,29 @@ assert!(matches!(
     }
 
     #[test]
-    fn override_appends_extra_fallbacks_after_tier_chain() {
+    fn explicit_fallbacks_precede_tier_chain() {
+        // F6: the caller's stated chain outranks tier escalation; the tier
+        // chain trails as backstop, duplicates dedup to their first position.
         let base = vec![s("qwen")];
         let out = apply_overrides(base, None, vec!["codex".into(), "qwen".into()]);
-        // tier chain first, extra fallback trails, duplicate qwen deduped
-        assert_eq!(out, vec![s("qwen"), s("codex")]);
+        assert_eq!(out, vec![s("codex"), s("qwen")]);
+    }
+
+    #[test]
+    fn repro_shape_fallback_model_is_tried_before_tier_escalation() {
+        // The live repro: --model qwen-193 --fallback-model qwen-140 got
+        // gemma-133 FIRST because the tier chain silently won. The explicit
+        // fallback must be attempt #2; tier escalation follows.
+        let tier_chain = vec![s("gemma-133"), s("qwen-140"), s("minimax")];
+        let out = apply_overrides(
+            tier_chain,
+            Some("qwen-193".into()),
+            vec!["qwen-140".into()],
+        );
+        assert_eq!(
+            out,
+            vec![s("qwen-193"), s("qwen-140"), s("gemma-133"), s("minimax")]
+        );
     }
 
     #[test]
