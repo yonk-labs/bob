@@ -265,6 +265,34 @@ fn classify(http_code: &str) -> ProbeStatus {
     }
 }
 
+/// Pre-spawn endpoint liveness probe (engine, before each builder attempt):
+/// GET {base_url}/models with a 5s timeout, `bearer` attached when the attempt
+/// resolved an API key. Auth-aware like `bob doctor --probe`: 2xx AND 401/403
+/// both mean the endpoint ANSWERED (401/403 = alive, just unauthorized — the
+/// builder itself carries the key), so only a genuine non-answer is dead.
+/// Repro F2a: goose against a dead endpoint exits 0 after "Network error" —
+/// this probe lets the fallback wrapper hop in seconds instead of burning the
+/// full builder timeout on an endpoint that cannot serve.
+pub fn endpoint_alive(base_url: &str, bearer: Option<&str>) -> bool {
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}"]);
+    if let Some(token) = bearer {
+        if !token.is_empty() {
+            cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
+        }
+    }
+    cmd.arg(format!("{}/models", base_url.trim_end_matches('/')));
+    match cmd.output() {
+        Ok(out) if out.status.success() || !out.stdout.is_empty() => {
+            match std::str::from_utf8(&out.stdout) {
+                Ok(code) => classify(code) != ProbeStatus::Unreachable,
+                Err(_) => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Outcome of probing one endpoint.
 struct ProbeResult {
     target: ProbeTarget,
@@ -373,6 +401,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn endpoint_alive_is_false_for_a_dead_endpoint() {
+        // Port 1 refuses instantly — curl reports 000 → Unreachable → dead.
+        assert!(!endpoint_alive("http://127.0.0.1:1/v1", None));
+        assert!(!endpoint_alive("http://127.0.0.1:1/v1", Some("some-token")));
     }
 
     #[test]

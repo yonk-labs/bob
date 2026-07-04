@@ -148,6 +148,18 @@ pub enum StopReason {
     JudgeRejected,
     JudgeUnavailable,
     ReplayVerifyFailed,
+    /// A retry iteration produced a diff BYTE-IDENTICAL to the previous
+    /// iteration's — the model is looping, further iterations can't help.
+    /// Same family as EmptyDiffAfterCritique (escalate to the next model).
+    /// Known ceiling: this only sees progress at iteration BOUNDARIES; a
+    /// builder spinning inside one call (gemma's idempotent-edit loop) is
+    /// bounded by the wall clock — intra-call detection would need goose
+    /// session parsing.
+    NoProgress,
+    /// The builder subprocess errored or was killed on timeout — a terminal,
+    /// per-attempt failure. run() records this, writes a terminal run.json and
+    /// run_end, then still returns Err so the fallback wrapper can escalate.
+    BuilderError,
 }
 
 /// Mutable per-loop history the decision function reads.
@@ -626,6 +638,7 @@ fn result_next_action(
     match stop_reason {
         Some(StopReason::ScopeExceeded) => NextAction::SplitTask,
         Some(StopReason::EmptyDiffAfterCritique) => NextAction::EscalateModel,
+        Some(StopReason::NoProgress) => NextAction::EscalateModel,
         Some(StopReason::RepeatedVerifyFailure) => NextAction::RetryWithVerifyFailure,
         Some(StopReason::JudgeRejected) => NextAction::RetryWithJudgeCritique,
         Some(StopReason::ReplayVerifyFailed) => NextAction::HumanDecisionRequired,
@@ -637,7 +650,11 @@ pub fn should_try_next_model(res: &RunResult) -> bool {
     res.status == RunStatus::NotConverged
         && matches!(
             res.stop_reason,
-            Some(StopReason::EmptyDiffAfterCritique | StopReason::RepeatedVerifyFailure)
+            Some(
+                StopReason::EmptyDiffAfterCritique
+                    | StopReason::RepeatedVerifyFailure
+                    | StopReason::NoProgress
+            )
         )
 }
 
@@ -658,11 +675,14 @@ fn should_try_next_model_after_error(err: &anyhow::Error) -> bool {
     // "spawning goose"), opencode ("builder timed out", "spawning builder"), and
     // thin ("thin builder: model API error"). Orchestration errors (git/worktree)
     // don't use these phrases, so they still fail fast.
+    // "endpoint unreachable" covers the pre-spawn probe and goose's exit-0
+    // network failure (F2) — both per-model infra errors.
     s.contains("timed out")
         || s.contains("exited with status")
         || s.contains("spawning ")
         || s.contains("builder")
         || s.contains("model API error")
+        || s.contains("endpoint unreachable")
 }
 
 fn model_label(model: &Option<String>) -> String {
@@ -762,6 +782,37 @@ fn resolve_endpoint(
     Ok((base_url, api_model, api_key))
 }
 
+/// Added/removed line counts of a unified diff (excluding the +++/--- file
+/// headers) — the cheap "how much work is in here" signal for partial_diff
+/// events.
+fn diff_line_counts(diff: &str) -> (u64, u64) {
+    let mut added = 0u64;
+    let mut removed = 0u64;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+/// The binary an opencode-designated attempt execs. `builder.cmd` may name a
+/// custom opencode wrapper — honored — but NEVER a DIFFERENT builder kind:
+/// with `builder.cmd: goose`, tier escalation to an opencode tier used to exec
+/// goose with opencode's flags (`--pure`/`--dir`) → goose exit 2 → the whole
+/// run aborted as a raw CLI error (repro F1, frontier/MiniMax attempt).
+fn opencode_exec_cmd(cfg_cmd: &str) -> String {
+    match cfg_cmd {
+        "goose" | "thin" => "opencode".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Extract the env var name for the API key (if any) from a model id.
 fn extract_api_key_env(model_id: &str) -> Option<String> {
     if model_id.starts_with("minimax") {
@@ -774,7 +825,10 @@ fn extract_api_key_env(model_id: &str) -> Option<String> {
 }
 
 /// Combine the tier-derived model chain with explicit per-call overrides:
-/// `--model` leads, the tier chain follows, `--fallback-model` entries trail.
+/// `--model` leads, explicit `--fallback-model` entries follow — the caller's
+/// stated chain outranks tier escalation (F6: a repro passing
+/// `--fallback-model qwen-140` got gemma-133 first because the tier chain
+/// silently won) — and the tier chain trails as the escalation backstop.
 /// Order-preserving dedup keeps the first occurrence so a forced model that
 /// also lives in a tier isn't attempted twice.
 fn apply_overrides(
@@ -784,8 +838,8 @@ fn apply_overrides(
 ) -> Vec<Option<String>> {
     let mut chain: Vec<Option<String>> = Vec::new();
     chain.extend(model_override.map(Some));
-    chain.extend(base);
     chain.extend(fallback_overrides.into_iter().map(Some));
+    chain.extend(base);
     let mut seen: Vec<Option<String>> = Vec::new();
     chain.retain(|item| {
         if seen.contains(item) {
@@ -959,6 +1013,22 @@ pub async fn run_opencode_with_fallbacks(
             ));
             break;
         }
+        // F5: a multi-model cascade must be readable from the PRIMARY run's
+        // events.jsonl alone — one fallback_start per hop, before any skip
+        // logic, carrying the reason the previous attempt ended.
+        if idx > 0 {
+            crate::report::append_event(
+                std::path::Path::new(&cfg.artifacts.dir),
+                &opts.run_id,
+                serde_json::json!({
+                    "event": "fallback_start",
+                    "attempt": idx,
+                    "model": resolved_model,
+                    "reason": fallback_history.last().cloned().unwrap_or_default(),
+                }),
+            );
+        }
+
         // This attempt (and its inner iteration loop) sees only the time left in
         // the shared budget, so run()'s deadline collapses toward overall_deadline.
         let mut attempt_cfg = cfg.clone();
@@ -1038,10 +1108,40 @@ pub async fn run_opencode_with_fallbacks(
         };
         eprintln!("bob: builder='{}' for tier='{}'", builder_kind, tier_name);
 
+        // Pre-spawn endpoint probe (F2a): when this attempt's base_url is known
+        // (thin/goose resolve it), verify the endpoint ANSWERS before spawning a
+        // builder against it. A dead endpoint otherwise burns the full builder
+        // timeout — goose even exits 0 after "Network error" with zero work done
+        // (F2b) — before the fallback wrapper can hop; the probe (auth-aware,
+        // 401/403 = alive) makes the hop take seconds and is a per-model INFRA
+        // error, so the chain advances instead of aborting.
+        let endpoint = match builder_kind {
+            "thin" | "goose" => Some(resolve_endpoint(cfg, model_sel.as_deref(), model_id)?),
+            _ => None,
+        };
+        if let Some((base_url, _, api_key)) = &endpoint {
+            if !crate::doctor::endpoint_alive(base_url, api_key.as_deref()) {
+                let detail = format!("endpoint unreachable: {base_url}");
+                eprintln!("bob: skipping {} — {detail}", model_label(&resolved_model));
+                crate::report::append_event(
+                    std::path::Path::new(&cfg.artifacts.dir),
+                    &opts.run_id,
+                    serde_json::json!({
+                        "event": "builder_error",
+                        "model": resolved_model,
+                        "detail": detail,
+                    }),
+                );
+                fallback_history.push(format!("{}: {detail}", model_label(&resolved_model)));
+                last_err = Some(anyhow::anyhow!("{detail}"));
+                continue;
+            }
+        }
+
         let builder: crate::builder::BuilderKind = match builder_kind {
             "thin" => {
                 let (base_url, api_model, api_key) =
-                    resolve_endpoint(cfg, model_sel.as_deref(), model_id)?;
+                    endpoint.clone().expect("endpoint resolved for thin above");
                 crate::builder::BuilderKind::Thin(crate::builder::ThinBuilder {
                     model_id: api_model,
                     base_url,
@@ -1051,7 +1151,7 @@ pub async fn run_opencode_with_fallbacks(
             }
             "goose" => {
                 let (base_url, api_model, api_key) =
-                    resolve_endpoint(cfg, model_sel.as_deref(), model_id)?;
+                    endpoint.clone().expect("endpoint resolved for goose above");
                 crate::builder::BuilderKind::Goose(crate::builder::GooseBuilder {
                     cmd: "goose".to_string(),
                     model: api_model,
@@ -1060,10 +1160,11 @@ pub async fn run_opencode_with_fallbacks(
                     base_url: Some(base_url),
                     api_key,
                     toolshim: cfg.builder.goose_toolshim,
+                    run_id: Some(attempt_opts.run_id.clone()),
                 })
             }
             _ => crate::builder::BuilderKind::Opencode(crate::builder::Opencode {
-                cmd: cfg.builder.cmd.clone(),
+                cmd: opencode_exec_cmd(&cfg.builder.cmd),
                 timeout: builder_timeout,
                 args: cfg.builder.opencode_args(model_sel.as_deref()),
                 run_id: Some(attempt_opts.run_id.clone()),
@@ -1161,6 +1262,11 @@ pub async fn run(
     let mut applied = false;
     let mut stop_reason = None;
     let mut status = RunStatus::NotConverged;
+    // Set when the builder subprocess errors/times out. The loop breaks to the
+    // shared finalizer (run.json + run_end) and then returns THIS error, so a
+    // killed builder still leaves a terminal artifact yet the fallback wrapper
+    // still sees an Err to escalate on (findings #28/#31).
+    let mut builder_error: Option<anyhow::Error> = None;
     let mut last_scope: Option<scope::ScopeReport> = None;
     let mut last_verify: Option<VerifySnapshot> = None;
     let mut last_judge: Option<JudgeSnapshot> = None;
@@ -1173,6 +1279,8 @@ pub async fn run(
     };
     let mut reset_files: std::collections::BTreeSet<String> = Default::default();
     let mut prompt_est_tokens: Vec<u64> = Vec::new();
+    // Previous iteration's captured diff, for the no-progress bail (F3).
+    let mut prev_iter_diff: Option<String> = None;
 
     // Freeze untracked test files BEFORE the builder loop starts. These files
     // were created by hector but never committed. If we don't freeze them now,
@@ -1189,14 +1297,74 @@ pub async fn run(
         prompt_est_tokens.push((prompt.len() as u64) / 4);
 
         // BUILD
+        // Emit builder_start BEFORE the (possibly minutes-long) build call, so a
+        // silent stall is visible in events.jsonl within one event of where it
+        // died — the run no longer shows run_start then nothing for the whole
+        // builder.timeout_secs window (findings #28/#31).
+        crate::report::append_event(
+            art,
+            &opts.run_id,
+            serde_json::json!({"event": "builder_start", "iter": state.index, "model": opts.builder_model}),
+        );
+        let build_started = Instant::now();
         let builder_out: BuilderOutcome = match builder.build(&prompt, ws.path()).await {
             Ok(out) => out,
             Err(e) => {
+                let elapsed = build_started.elapsed().as_secs();
+                let timed_out = e.to_string().contains("timed out");
+                crate::report::append_event(
+                    art,
+                    &opts.run_id,
+                    serde_json::json!({
+                        "event": if timed_out { "builder_timeout" } else { "builder_error" },
+                        "iter": state.index,
+                        "model": opts.builder_model,
+                        "elapsed_secs": elapsed,
+                        "detail": e.to_string(),
+                    }),
+                );
                 eprintln!(
                     "bob: builder error — worktree preserved at {}",
                     ws.path().display()
                 );
-                return Err(e);
+                // Salvage whatever the killed builder left behind (F4): a
+                // near-solution partial diff is evidence for the retry or the
+                // human — the repro showed a +37/-6 qwen draft silently
+                // discarded on timeout. Best-effort; never masks the error.
+                if let Ok(partial) = ws.capture_diff() {
+                    if !partial.trim().is_empty() {
+                        let iter_dir = art
+                            .join(&opts.run_id)
+                            .join(format!("iter-{}", state.index));
+                        let _ = std::fs::create_dir_all(&iter_dir);
+                        let partial_path = iter_dir.join("partial.diff");
+                        if std::fs::write(&partial_path, &partial).is_ok() {
+                            let (added, removed) = diff_line_counts(&partial);
+                            crate::report::append_event(
+                                art,
+                                &opts.run_id,
+                                serde_json::json!({
+                                    "event": "partial_diff",
+                                    "iter": state.index,
+                                    "path": partial_path.to_string_lossy(),
+                                    "added_lines": added,
+                                    "removed_lines": removed,
+                                }),
+                            );
+                        }
+                    }
+                }
+                // Terminal for this attempt: record a terminal status and break to
+                // the shared finalizer so run.json + run_end are ALWAYS written
+                // (hector must always see run_end). The stored error is re-raised
+                // after finalizing so the fallback wrapper still escalates models.
+                status = RunStatus::Error;
+                stop_reason = Some(StopReason::BuilderError);
+                builder_snapshot.failure_kind =
+                    if timed_out { "timeout".into() } else { "error".into() };
+                builder_snapshot.stderr_tail = e.to_string();
+                builder_error = Some(e);
+                break;
             }
         };
         builder_snapshot.stdout_tail = builder_out.stdout_tail;
@@ -1225,6 +1393,32 @@ pub async fn run(
 
         let diff = ws.capture_diff()?;
         final_diff = diff.clone();
+
+        // F2b: goose exit-0 network failure + empty diff = the endpoint died,
+        // not a model that chose to change nothing. Route it through the
+        // builder-error finalizer (terminal run.json + run_end + Err) so the
+        // fallback wrapper hops instead of burning a judge iteration and
+        // ending in a misleading EmptyDiffAfterCritique.
+        if diff.trim().is_empty() && builder_snapshot.failure_kind == "endpoint_error" {
+            let e = anyhow::anyhow!(
+                "goose reported a network error with exit 0 — endpoint unreachable; stdout tail:\n{}",
+                builder_snapshot.stdout_tail
+            );
+            crate::report::append_event(
+                art,
+                &opts.run_id,
+                serde_json::json!({
+                    "event": "builder_error",
+                    "iter": state.index,
+                    "model": opts.builder_model,
+                    "detail": "endpoint unreachable (goose exit 0 + network error + empty diff)",
+                }),
+            );
+            status = RunStatus::Error;
+            stop_reason = Some(StopReason::BuilderError);
+            builder_error = Some(e);
+            break;
+        }
 
         // STEP OUTCOME
         let step = if diff.trim().is_empty() {
@@ -1334,6 +1528,26 @@ pub async fn run(
         );
 
         let action = next_action(&state, &step, cfg.judge.policy);
+        // No-progress bail (F3): a retry that reproduced a BYTE-IDENTICAL diff
+        // will keep reproducing it — stop and escalate instead of burning the
+        // remaining iterations (same family as EmptyDiffAfterCritique). Never
+        // overrides Apply/Stop, only a would-be retry.
+        let action = if matches!(action, LoopAction::Continue { .. })
+            && !diff.trim().is_empty()
+            && prev_iter_diff.as_deref() == Some(diff.as_str())
+        {
+            eprintln!(
+                "bob: iteration {} produced a byte-identical diff to iteration {} — no progress, stopping",
+                state.index,
+                state.index - 1
+            );
+            LoopAction::Stop {
+                reason: StopReason::NoProgress,
+            }
+        } else {
+            action
+        };
+        prev_iter_diff = Some(diff.clone());
 
         // update streaks AFTER deciding
         if let StepOutcome::Judged {
@@ -1492,6 +1706,11 @@ pub async fn run(
         eprintln!("worktree preserved at {}", ws.path().display());
     } else {
         ws.cleanup()?;
+    }
+    // A killed/errored builder is reported as Err (fallback wrapper escalates on
+    // it) — but only AFTER the terminal run.json + run_end above were written.
+    if let Some(e) = builder_error {
+        return Err(e);
     }
     Ok(result)
 }
@@ -1919,11 +2138,56 @@ assert!(matches!(
     }
 
     #[test]
-    fn override_appends_extra_fallbacks_after_tier_chain() {
+    fn explicit_fallbacks_precede_tier_chain() {
+        // F6: the caller's stated chain outranks tier escalation; the tier
+        // chain trails as backstop, duplicates dedup to their first position.
         let base = vec![s("qwen")];
         let out = apply_overrides(base, None, vec!["codex".into(), "qwen".into()]);
-        // tier chain first, extra fallback trails, duplicate qwen deduped
-        assert_eq!(out, vec![s("qwen"), s("codex")]);
+        assert_eq!(out, vec![s("codex"), s("qwen")]);
+    }
+
+    #[test]
+    fn repro_shape_fallback_model_is_tried_before_tier_escalation() {
+        // The live repro: --model qwen-193 --fallback-model qwen-140 got
+        // gemma-133 FIRST because the tier chain silently won. The explicit
+        // fallback must be attempt #2; tier escalation follows.
+        let tier_chain = vec![s("gemma-133"), s("qwen-140"), s("minimax")];
+        let out = apply_overrides(
+            tier_chain,
+            Some("qwen-193".into()),
+            vec!["qwen-140".into()],
+        );
+        assert_eq!(
+            out,
+            vec![s("qwen-193"), s("qwen-140"), s("gemma-133"), s("minimax")]
+        );
+    }
+
+    #[test]
+    fn diff_line_counts_skips_file_headers() {
+        let diff = "\
+diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ b/f.txt
+@@ -1,2 +1,3 @@
+ context
++added one
++added two
+-removed one
+";
+        assert_eq!(diff_line_counts(diff), (2, 1));
+        assert_eq!(diff_line_counts(""), (0, 0));
+    }
+
+    #[test]
+    fn opencode_arm_never_execs_a_different_builder_binary() {
+        // repro F1: builder.cmd=goose + tier builder "opencode" exec'd goose
+        // with opencode's flags (--pure) → exit 2 → run aborted.
+        assert_eq!(opencode_exec_cmd("goose"), "opencode");
+        assert_eq!(opencode_exec_cmd("thin"), "opencode");
+        // Custom opencode wrappers are still honored.
+        assert_eq!(opencode_exec_cmd("opencode"), "opencode");
+        assert_eq!(opencode_exec_cmd("/usr/local/bin/my-opencode"), "/usr/local/bin/my-opencode");
     }
 
     #[test]
@@ -2864,6 +3128,405 @@ mod flow_tests {
         std::env::set_current_dir(prev).unwrap();
         assert_eq!(res.status, RunStatus::Converged);
         assert_eq!(res.iterations, 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A builder that always errors — models a hung goose the harness had to
+    /// kill (findings #28/#31). The error string mirrors builder.rs so the
+    /// timeout-vs-error classification is exercised for real.
+    struct ErrBuilder {
+        msg: String,
+    }
+    impl Builder for ErrBuilder {
+        async fn build(&self, _p: &str, _w: &Path) -> anyhow::Result<BuilderOutcome> {
+            anyhow::bail!("{}", self.msg)
+        }
+    }
+
+    fn init_repo_here(tmp: &Path) {
+        let _ = std::fs::remove_dir_all(tmp);
+        std::fs::create_dir_all(tmp).unwrap();
+        let g = |a: &[&str]| {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(tmp)
+                .output()
+                .unwrap();
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(tmp.join("seed.txt"), "x\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+    }
+
+    /// Fix 1: a builder timeout emits builder_start (at iteration start) and
+    /// builder_timeout (on the kill) into events.jsonl — a silent 600s stall is
+    /// now visible within one event of where it died.
+    #[tokio::test]
+    async fn builder_timeout_emits_start_and_timeout_events() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-timeout-events-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "timeout-events".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: Some("qwen-193".into()),
+        };
+        let res = run(
+            &cfg,
+            opts,
+            &ErrBuilder {
+                msg: "goose timed out after 5s".into(),
+            },
+            &UncertainJudge,
+        )
+        .await;
+
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/timeout-events/events.jsonl")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        // run() still returns Err so the fallback wrapper can escalate models.
+        assert!(res.is_err(), "builder timeout must surface as an Err");
+        let evs: Vec<serde_json::Value> = events
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let start = evs
+            .iter()
+            .find(|v| v["event"] == "builder_start")
+            .expect("builder_start emitted before the build call");
+        assert_eq!(start["iter"], 0);
+        assert_eq!(start["model"], "qwen-193");
+        let to = evs
+            .iter()
+            .find(|v| v["event"] == "builder_timeout")
+            .expect("builder_timeout emitted on the kill path");
+        assert_eq!(to["iter"], 0);
+        assert_eq!(to["model"], "qwen-193");
+        assert!(to["elapsed_secs"].is_u64(), "elapsed_secs recorded");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Writes a file, then errors — models goose killed mid-iteration AFTER
+    /// doing real work (repro F4: a +37/-6 near-solution discarded on timeout).
+    struct WriteThenErrBuilder;
+    impl Builder for WriteThenErrBuilder {
+        async fn build(&self, _p: &str, workdir: &Path) -> anyhow::Result<BuilderOutcome> {
+            std::fs::write(workdir.join("partial-work.txt"), "half a solution\n")?;
+            anyhow::bail!("goose timed out after 5s")
+        }
+    }
+
+    /// F4: a builder timeout salvages the worktree's partial work into
+    /// <run_dir>/iter-N/partial.diff and emits a partial_diff event with
+    /// line counts — near-solutions are evidence, not garbage.
+    #[tokio::test]
+    async fn builder_timeout_salvages_partial_diff() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-partial-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "partial".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let res = run(&cfg, opts, &WriteThenErrBuilder, &UncertainJudge).await;
+
+        let partial =
+            std::fs::read_to_string(tmp.join(".bob/runs/partial/iter-0/partial.diff")).unwrap();
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/partial/events.jsonl")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        assert!(res.is_err(), "timeout still surfaces as Err");
+        assert!(
+            partial.contains("partial-work.txt") && partial.contains("half a solution"),
+            "salvaged diff carries the builder's work:\n{partial}"
+        );
+        let ev: serde_json::Value = events
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .find(|v: &serde_json::Value| v["event"] == "partial_diff")
+            .expect("partial_diff event emitted");
+        assert_eq!(ev["iter"], 0);
+        assert!(ev["path"].as_str().unwrap().ends_with("iter-0/partial.diff"));
+        assert!(ev["added_lines"].as_u64().unwrap() >= 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Writes the SAME content every call — models a builder that "retries" by
+    /// reproducing its rejected draft byte-for-byte (repro F3).
+    struct SameDiffBuilder;
+    impl Builder for SameDiffBuilder {
+        async fn build(&self, _p: &str, workdir: &Path) -> anyhow::Result<BuilderOutcome> {
+            std::fs::write(workdir.join("out.txt"), "the same change\n")?;
+            Ok(BuilderOutcome {
+                failure_kind: "ok".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    struct AlwaysFailJudge;
+    impl Judge for AlwaysFailJudge {
+        async fn judge(&self, _s: &str, _d: &str, _v: &str) -> anyhow::Result<JudgeOutcome> {
+            Ok(JudgeOutcome {
+                verdict: Verdict::Fail,
+                critique: "wrong approach".into(),
+            })
+        }
+    }
+
+    /// F3: a retry that reproduces a byte-identical diff stops with NoProgress
+    /// at the second iteration instead of burning max_iterations.
+    #[tokio::test]
+    async fn byte_identical_retry_diff_stops_with_no_progress() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-noprogress-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let mut cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        cfg.judge.policy = crate::config::JudgePolicy::RetryOnFail;
+        cfg.loop_cfg.max_iterations = 6;
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "noprogress".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let res = run(&cfg, opts, &SameDiffBuilder, &AlwaysFailJudge)
+            .await
+            .unwrap();
+
+        std::env::set_current_dir(prev).unwrap();
+        // iter-0: judge fail → retry; iter-1: identical diff → NoProgress.
+        assert_eq!(res.status, RunStatus::NotConverged);
+        assert_eq!(res.stop_reason, Some(StopReason::NoProgress));
+        assert_eq!(res.iterations, 2, "must not burn the remaining iterations");
+        assert_eq!(res.next_action, NextAction::EscalateModel);
+        assert!(
+            should_try_next_model(&res),
+            "NoProgress joins the fallback-hop family"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Models goose's exit-0 network failure (repro F2b): Ok outcome, no edits,
+    /// failure_kind endpoint_error, "Network error" banner in stdout.
+    struct EndpointErrBuilder;
+    impl Builder for EndpointErrBuilder {
+        async fn build(&self, _p: &str, _w: &Path) -> anyhow::Result<BuilderOutcome> {
+            Ok(BuilderOutcome {
+                stdout_tail: "Network error: Request timed out — check your network connection and try again.".into(),
+                stderr_tail: String::new(),
+                failure_kind: "endpoint_error".into(),
+            })
+        }
+    }
+
+    /// F2b: goose exit-0 + network-error marker + empty diff is an INFRA error
+    /// — terminal run.json + builder_error event + Err — not failure_kind "ok"
+    /// burning a judge iteration toward EmptyDiffAfterCritique.
+    #[tokio::test]
+    async fn goose_exit_zero_network_error_with_empty_diff_is_builder_error() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-endpoint-err-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "endpoint-err".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: Some("qwen-140".into()),
+        };
+        let res = run(&cfg, opts, &EndpointErrBuilder, &UncertainJudge).await;
+
+        let run_json_raw =
+            std::fs::read_to_string(tmp.join(".bob/runs/endpoint-err/run.json")).unwrap();
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/endpoint-err/events.jsonl")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        let err = match res {
+            Ok(_) => panic!("endpoint failure must surface as Err"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("endpoint unreachable"),
+            "error is classified for model escalation: {err}"
+        );
+        assert!(
+            should_try_next_model_after_error(&err),
+            "fallback wrapper must hop on it"
+        );
+        let rj: serde_json::Value = serde_json::from_str(&run_json_raw).unwrap();
+        assert_eq!(rj["status"], "error");
+        assert_eq!(rj["stop_reason"], "BuilderError");
+        assert!(
+            events.lines().any(|l| l.contains("\"builder_error\"")
+                && l.contains("endpoint unreachable")),
+            "builder_error event emitted:\n{events}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// F2a: the pre-spawn probe skips a dead endpoint in seconds — the fallback
+    /// wrapper hops without spawning a builder, emits builder_error per dead
+    /// model, and surfaces "endpoint unreachable" when the chain is exhausted.
+    #[tokio::test]
+    async fn dead_endpoint_probe_hops_without_spawning_builder() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-probe-hop-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let mut cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        cfg.builder.cmd = "goose".into();
+        for (name, model) in [("m1", "test-model-1"), ("m2", "test-model-2")] {
+            cfg.builder.models.insert(
+                name.into(),
+                crate::config::ModelDef::Full {
+                    model: model.into(),
+                    base_url: Some("http://127.0.0.1:1/v1".into()), // dead port
+                    api_key_env: None,
+                },
+            );
+        }
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "probe-hop".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let started = std::time::Instant::now();
+        let res =
+            run_opencode_with_fallbacks(&cfg, opts, Some("m1".into()), vec!["m2".into()], false)
+                .await;
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/probe-hop/events.jsonl")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        let err = match res {
+            Ok(_) => panic!("all-dead chain must surface an Err"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("endpoint unreachable"), "{err}");
+        // Probe hop is seconds, not builder timeouts (2 × 5s probe max + slack).
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "hop must not burn builder timeouts"
+        );
+        let dead_events = events
+            .lines()
+            .filter(|l| l.contains("\"builder_error\"") && l.contains("endpoint unreachable"))
+            .count();
+        assert_eq!(dead_events, 2, "one builder_error per dead model:\n{events}");
+        // F5: the hop itself is visible in the PRIMARY run's events.jsonl —
+        // fallback_start names the next model, attempt index, and the reason
+        // the previous attempt ended.
+        let fb: serde_json::Value = events
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .find(|v: &serde_json::Value| v["event"] == "fallback_start")
+            .expect("fallback_start emitted on the hop");
+        assert_eq!(fb["attempt"], 1);
+        assert_eq!(fb["model"], "test-model-2");
+        assert!(
+            fb["reason"].as_str().unwrap().contains("endpoint unreachable"),
+            "reason carries why the previous attempt ended: {fb}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Fix 2: a builder timeout terminates the run WITH a terminal run.json and
+    /// a run_end event — hector tailing events.jsonl always sees run_end, and
+    /// the run.json exists with an error status. run() still returns Err.
+    #[tokio::test]
+    async fn builder_timeout_writes_terminal_run_json_and_run_end() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-timeout-terminal-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "timeout-terminal".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: Some("qwen-193".into()),
+        };
+        let res = run(
+            &cfg,
+            opts,
+            &ErrBuilder {
+                msg: "goose timed out after 5s".into(),
+            },
+            &UncertainJudge,
+        )
+        .await;
+
+        let run_json_raw =
+            std::fs::read_to_string(tmp.join(".bob/runs/timeout-terminal/run.json")).unwrap();
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/timeout-terminal/events.jsonl")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        // Err still surfaces (fallback wrapper escalates on it).
+        assert!(res.is_err());
+        // run.json written with a terminal error status + BuilderError stop_reason.
+        let rj: serde_json::Value = serde_json::from_str(&run_json_raw).unwrap();
+        assert_eq!(rj["status"], "error");
+        assert_eq!(rj["stop_reason"], "BuilderError");
+        assert_eq!(rj["builder"]["failure_kind"], "timeout");
+        // run_end is the LAST event — consumers always see it.
+        let last: serde_json::Value =
+            serde_json::from_str(events.lines().last().unwrap()).unwrap();
+        assert_eq!(last["event"], "run_end");
+        assert_eq!(last["status"], "error");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -320,6 +320,32 @@ pub struct GooseBuilder {
     /// Set GOOSE_TOOLSHIM=true — interpret tool calls from plain-text output when
     /// the endpoint can't return structured tool_calls (see builder.goose_toolshim).
     pub toolshim: bool,
+    /// When set, write `.bob/runs/<run_id>/goose.pid` for the reaper — same
+    /// contract as Opencode's `opencode.pid`.
+    pub run_id: Option<String>,
+}
+
+/// SIGTERM → 200ms grace → SIGKILL, addressed to the PROCESS GROUP (`-pid`).
+/// Both builders are setsid'd, so pgid == pid and group signals reach
+/// grandchildren — a killed goose must not leave a tool child alive and
+/// writing (finding #31's orphan risk). The direct pid is signaled too as a
+/// belt-and-suspenders for a child that somehow isn't a group leader.
+fn kill_group_with_escalation(pid: u32) {
+    let pgid = -(pid as i32);
+    unsafe {
+        let _ = libc::kill(pgid, libc::SIGTERM);
+        let _ = libc::kill(pid as i32, libc::SIGTERM);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    unsafe {
+        let _ = libc::kill(pgid, libc::SIGKILL);
+        let _ = libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+/// Reaper-visible pidfile for a builder child: `.bob/runs/<run_id>/<name>`.
+fn builder_pidfile(run_id: &str, name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(".bob/runs").join(run_id).join(name)
 }
 
 impl Builder for GooseBuilder {
@@ -378,9 +404,26 @@ impl Builder for GooseBuilder {
         let child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawning goose '{}': {e}", self.cmd))?;
+        let child_pid = child.id();
+
+        // Pidfile for the reaper (same contract as opencode.pid): if bob dies
+        // without cleaning up, reap_orphans can find and kill this goose.
+        if let (Some(run_id), Some(pid)) = (&self.run_id, child_pid) {
+            let pid_path = builder_pidfile(run_id, "goose.pid");
+            if let Some(parent) = pid_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&pid_path, pid.to_string());
+        }
+        let remove_pidfile = || {
+            if let Some(run_id) = &self.run_id {
+                let _ = std::fs::remove_file(builder_pidfile(run_id, "goose.pid"));
+            }
+        };
 
         match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
             Ok(out) => {
+                remove_pidfile();
                 let out = out?;
                 let stdout_tail = tail(&String::from_utf8_lossy(&out.stdout), 4000);
                 let stderr_tail = tail(&String::from_utf8_lossy(&out.stderr), 4000);
@@ -391,13 +434,33 @@ impl Builder for GooseBuilder {
                         stderr_tail
                     );
                 }
+                // goose exits 0 after "Network error: Request timed out — …"
+                // against a dead endpoint, with zero tool calls made (repro
+                // F2b). Surface that as endpoint_error instead of "ok" so the
+                // engine can classify marker + empty diff as an INFRA error
+                // and hop models, not burn a judge iteration on nothing.
+                let network_err = stdout_tail.contains("Network error:")
+                    || stderr_tail.contains("Network error:");
                 Ok(BuilderOutcome {
                     stdout_tail,
                     stderr_tail,
-                    failure_kind: "ok".into(),
+                    failure_kind: if network_err {
+                        "endpoint_error".into()
+                    } else {
+                        "ok".into()
+                    },
                 })
             }
-            Err(_) => anyhow::bail!("goose timed out after {:?}", self.timeout),
+            Err(_) => {
+                // Escalated GROUP kill: kill_on_drop alone SIGKILLs only the
+                // direct goose pid, orphaning any tool child goose spawned —
+                // which keeps running (and writing) after bob reports timeout.
+                if let Some(pid) = child_pid {
+                    kill_group_with_escalation(pid);
+                }
+                remove_pidfile();
+                anyhow::bail!("goose timed out after {:?}", self.timeout)
+            }
         }
     }
 }
@@ -466,10 +529,10 @@ impl Builder for Opencode {
                 })
             }
             Err(_) => {
+                // Group kill: opencode is setsid'd too — signaling only the
+                // direct pid orphans its grandchildren.
                 if let Some(pid) = child_pid {
-                    let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                    std::thread::sleep(Duration::from_millis(200));
-                    let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                    kill_group_with_escalation(pid);
                 }
                 if let Some(run_id) = &self.run_id {
                     let pid_path = std::path::PathBuf::from(".bob/runs")
@@ -572,6 +635,211 @@ class Body { }
         assert_eq!(extract_path_delimiter("const x = 1;"), None);
     }
 
+    /// Write an executable fake builder script that records its argv (one per
+    /// line) to `args.txt` in its cwd, then exits 0.
+    fn write_argv_recorder(dir: &Path) -> std::path::PathBuf {
+        let script = dir.join("fake-builder.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$@\" > args.txt\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// repro F1: each builder kind must exec with ITS OWN flag set — goose
+    /// must never receive opencode's `--pure`/`--dir`, opencode must.
+    #[tokio::test]
+    async fn opencode_and_goose_compose_their_own_argv() {
+        // opencode: run --pure --dir <workdir> ... prompt
+        let dir = tempdir();
+        let script = write_argv_recorder(&dir);
+        let b = Opencode {
+            cmd: script.to_string_lossy().into_owned(),
+            timeout: Duration::from_secs(5),
+            args: vec![],
+            run_id: None,
+        };
+        b.build("the prompt", &dir).await.unwrap();
+        let argv = std::fs::read_to_string(dir.join("args.txt")).unwrap();
+        let args: Vec<&str> = argv.lines().collect();
+        assert_eq!(args[0], "run");
+        assert!(args.contains(&"--pure"), "opencode gets --pure: {args:?}");
+        assert!(args.contains(&"--dir"), "opencode gets --dir: {args:?}");
+
+        // goose: run --no-profile ... --provider <p>, and NEVER opencode flags
+        let dir = tempdir();
+        let script = write_argv_recorder(&dir);
+        let b = GooseBuilder {
+            cmd: script.to_string_lossy().into_owned(),
+            model: "m".into(),
+            timeout: Duration::from_secs(5),
+            provider: "openai".into(),
+            base_url: None,
+            api_key: None,
+            toolshim: false,
+            run_id: None,
+        };
+        b.build("the prompt", &dir).await.unwrap();
+        let argv = std::fs::read_to_string(dir.join("args.txt")).unwrap();
+        let args: Vec<&str> = argv.lines().collect();
+        assert_eq!(args[0], "run");
+        assert!(args.contains(&"--no-profile"), "goose gets --no-profile: {args:?}");
+        assert!(args.contains(&"--provider"), "goose gets --provider: {args:?}");
+        assert!(!args.contains(&"--pure"), "goose must NOT get opencode's --pure: {args:?}");
+        assert!(!args.contains(&"--dir"), "goose must NOT get opencode's --dir: {args:?}");
+    }
+
+    /// repro F2b: goose exits 0 after "Network error: Request timed out" with
+    /// zero tokens — that must surface as endpoint_error, never "ok".
+    #[tokio::test]
+    async fn goose_exit_zero_network_error_is_endpoint_error_not_ok() {
+        let dir = tempdir();
+        let script = dir.join("fake-goose.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'Network error: Request timed out — check your network connection and try again.'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mk = |cmd: String| GooseBuilder {
+            cmd,
+            model: "m".into(),
+            timeout: Duration::from_secs(5),
+            provider: "openai".into(),
+            base_url: None,
+            api_key: None,
+            toolshim: false,
+            run_id: None,
+        };
+        let out = mk(script.to_string_lossy().into_owned())
+            .build("p", &dir)
+            .await
+            .unwrap();
+        assert_eq!(out.failure_kind, "endpoint_error");
+
+        // Healthy exit-0 output stays "ok".
+        let script_ok = dir.join("fake-goose-ok.sh");
+        std::fs::write(&script_ok, "#!/bin/sh\necho 'done editing'\n").unwrap();
+        std::fs::set_permissions(&script_ok, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = mk(script_ok.to_string_lossy().into_owned())
+            .build("p", &dir)
+            .await
+            .unwrap();
+        assert_eq!(out.failure_kind, "ok");
+    }
+
+    /// F7: a goose timeout must kill the whole PROCESS GROUP, not just the
+    /// direct child — a surviving grandchild is exactly the #31 orphan risk.
+    #[tokio::test]
+    async fn goose_timeout_kills_the_whole_process_group() {
+        let dir = tempdir();
+        let script = dir.join("fake-goose-hang.sh");
+        // Backgrounds a long-lived grandchild (same setsid'd process group),
+        // records its pid, then hangs until killed.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nsleep 300 &\necho $! > grandchild.pid\nwait\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let b = GooseBuilder {
+            cmd: script.to_string_lossy().into_owned(),
+            model: "m".into(),
+            timeout: Duration::from_millis(500),
+            provider: "openai".into(),
+            base_url: None,
+            api_key: None,
+            toolshim: false,
+            run_id: None,
+        };
+        let res = b.build("p", &dir).await;
+        assert!(res.is_err(), "hung goose must time out");
+
+        let gpid: i32 = std::fs::read_to_string(dir.join("grandchild.pid"))
+            .expect("grandchild pid recorded before the hang")
+            .trim()
+            .parse()
+            .unwrap();
+        // The group SIGKILL must take the grandchild down (allow reaping lag;
+        // a zombie counts as dead — it can't write anything).
+        let mut dead = false;
+        for _ in 0..30 {
+            let stat = std::fs::read_to_string(format!("/proc/{gpid}/stat"));
+            match stat {
+                Err(_) => {
+                    dead = true;
+                    break;
+                }
+                Ok(s) if s.contains(") Z ") => {
+                    dead = true;
+                    break;
+                }
+                Ok(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        assert!(dead, "grandchild pid={gpid} survived the timeout kill");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F7: reap_orphans covers goose.pid with the same contract as opencode.pid.
+    #[test]
+    fn reaper_cleans_dead_goose_pidfile() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let run_dir = tmp.join(".bob/runs/r-goose");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // A pid that cannot exist (> kernel pid_max) — reads as dead.
+        std::fs::write(run_dir.join("goose.pid"), "999999999").unwrap();
+
+        let report = reap_orphans().unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        assert!(report.cleaned >= 1, "dead goose pidfile counted as cleaned");
+        assert!(
+            !run_dir.join("goose.pid").exists(),
+            "dead goose pidfile removed"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// F7: goose writes its reaper pidfile under .bob/runs/<run_id>/ and
+    /// removes it on a clean exit.
+    #[tokio::test]
+    async fn goose_pidfile_removed_after_clean_exit() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let script = tmp.join("fake-goose-ok.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let b = GooseBuilder {
+            cmd: script.to_string_lossy().into_owned(),
+            model: "m".into(),
+            timeout: Duration::from_secs(5),
+            provider: "openai".into(),
+            base_url: None,
+            api_key: None,
+            toolshim: false,
+            run_id: Some("gpid-clean".into()),
+        };
+        let res = b.build("p", &tmp).await;
+        let pidfile = tmp.join(".bob/runs/gpid-clean/goose.pid");
+        let pidfile_exists = pidfile.exists();
+        std::env::set_current_dir(prev).unwrap();
+
+        res.unwrap();
+        assert!(!pidfile_exists, "goose.pid removed after clean exit");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[tokio::test]
     async fn times_out_a_hung_builder() {
         let b = ShimSleep { timeout: Duration::from_millis(200) };
@@ -613,26 +881,29 @@ pub fn reap_orphans() -> anyhow::Result<ReapReport> {
     if runs_dir.exists() {
         for entry in std::fs::read_dir(&runs_dir)? {
             let entry = entry?;
-            let pid_file = entry.path().join("opencode.pid");
-            if !pid_file.exists() { continue; }
-            let pid_str = std::fs::read_to_string(&pid_file)?;
-            let Ok(pid) = pid_str.trim().parse::<u32>() else { continue };
-            let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-            if !alive {
-                let _ = std::fs::remove_file(&pid_file);
-                report.cleaned += 1;
-                continue;
-            }
-            let ppid = read_ppid(pid);
-            if let Some(ppid) = ppid {
-                let parent_alive = unsafe { libc::kill(ppid as i32, 0) == 0 };
-                if !parent_alive {
-                    let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                    std::thread::sleep(Duration::from_millis(200));
-                    let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            // Both builder kinds write a reaper pidfile (goose since F7).
+            for name in ["opencode.pid", "goose.pid"] {
+                let pid_file = entry.path().join(name);
+                if !pid_file.exists() { continue; }
+                let pid_str = std::fs::read_to_string(&pid_file)?;
+                let Ok(pid) = pid_str.trim().parse::<u32>() else { continue };
+                let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+                if !alive {
                     let _ = std::fs::remove_file(&pid_file);
-                    report.orphans_killed += 1;
-                    eprintln!("reaper: killed orphan opencode pid={pid} (parent {ppid} dead)");
+                    report.cleaned += 1;
+                    continue;
+                }
+                let ppid = read_ppid(pid);
+                if let Some(ppid) = ppid {
+                    let parent_alive = unsafe { libc::kill(ppid as i32, 0) == 0 };
+                    if !parent_alive {
+                        // Builders are setsid'd — group kill reaches their
+                        // grandchildren, not just the leader.
+                        kill_group_with_escalation(pid);
+                        let _ = std::fs::remove_file(&pid_file);
+                        report.orphans_killed += 1;
+                        eprintln!("reaper: killed orphan builder pid={pid} (parent {ppid} dead, {name})");
+                    }
                 }
             }
         }
