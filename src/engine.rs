@@ -933,9 +933,37 @@ pub async fn run_opencode_with_fallbacks(
     let mut last_err: Option<anyhow::Error> = None;
     let mut current_tier_idx: usize = 0;
 
+    // One shared walltime budget for the WHOLE build (primary + every fallback).
+    // run() derives its per-attempt deadline from cfg.loop_cfg.max_walltime_secs;
+    // without a shared budget each fallback got a FRESH max_walltime, so a looping
+    // model plus fallbacks ran N×max_walltime and blew a dispatch's external
+    // timeout (#27). We give each successive attempt only the REMAINING budget and
+    // stop spawning fallbacks once it's spent, so max_walltime_secs bounds the
+    // TOTAL build — a slice can be given a tight budget the dispatch can rely on.
+    let overall_deadline = Instant::now() + Duration::from_secs(cfg.loop_cfg.max_walltime_secs);
+
     for (idx, model_sel) in sequence.iter().enumerate() {
         let resolved_model = cfg.builder.resolved_model(model_sel.as_deref());
         let model_id = resolved_model.as_deref().unwrap_or("default");
+
+        let remaining = overall_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            eprintln!(
+                "bob: walltime budget ({}s) exhausted — not trying {}",
+                cfg.loop_cfg.max_walltime_secs,
+                model_label(&resolved_model)
+            );
+            fallback_history.push(format!(
+                "{}: walltime_budget_exhausted",
+                model_label(&resolved_model)
+            ));
+            break;
+        }
+        // This attempt (and its inner iteration loop) sees only the time left in
+        // the shared budget, so run()'s deadline collapses toward overall_deadline.
+        let mut attempt_cfg = cfg.clone();
+        attempt_cfg.loop_cfg.max_walltime_secs = remaining.as_secs();
+        let cfg = &attempt_cfg;
 
         // HEALTH CHECK: skip dead endpoints instantly (3s probe, not 300s timeout)
         if !crate::model_stats::StatsStore::health_check(model_id) {
@@ -2355,6 +2383,134 @@ mod flow_tests {
         assert!(
             worktree.exists(),
             "non-converged worktree should be preserved by default"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    struct OutOfScopeBuilder;
+    impl Builder for OutOfScopeBuilder {
+        async fn build(&self, _p: &str, workdir: &Path) -> anyhow::Result<BuilderOutcome> {
+            // Simulates a builder editing a file OUTSIDE the run's
+            // editable_paths/allow_paths — the reported shape of bug #26.
+            std::fs::create_dir_all(workdir.join("packages/worldgen/src"))?;
+            std::fs::write(
+                workdir.join("packages/worldgen/src/index.ts"),
+                "export const leaked = true;\n",
+            )?;
+            Ok(BuilderOutcome {
+                failure_kind: "ok".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn propose_mode_out_of_scope_edit_never_reaches_main() {
+        // Regression guard for bug #26: under `--propose` (apply=false), a
+        // builder that edits a file OUTSIDE editable_paths/allow_paths must
+        // trip ScopeExceeded, and the main working tree must show no trace of
+        // that edit. apply_to_main is reachable only from the Apply branch of
+        // `next_action`, which ScopeExceeded can never produce, and is further
+        // gated on `opts.apply` — this test proves the observable outcome
+        // end-to-end rather than trusting that code path alone.
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-scope-leak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let g = |a: &[&str]| {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("src/seed.txt"), "x\n").unwrap();
+        std::fs::write(tmp.join(".gitignore"), "/.bob\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = crate::config::Config {
+            builder: crate::config::BuilderCfg {
+                cmd: "opencode".into(),
+                timeout_secs: 5,
+                args: vec![],
+                model: None,
+                models: Default::default(),
+                fallback_models: vec![],
+                tiers: Default::default(),
+                escalation_policy: "tier".into(),
+                reliability_weight: 0.5,
+                pin: vec![],
+                exclude: vec![],
+                goose_toolshim: false,
+            },
+            judge: crate::config::JudgeCfg {
+                cmd: "abe".into(),
+                mode: crate::config::JudgeMode::Validate,
+                timeout_secs: 600,
+                policy: crate::config::JudgePolicy::Advisory,
+            },
+            verify: crate::config::VerifyCfg {
+                cmds: vec![],
+                replay: true,
+                focused_cmds: vec![],
+            },
+            loop_cfg: crate::config::LoopCfg {
+                max_iterations: 1,
+                max_walltime_secs: 60,
+            },
+            scope: crate::config::ScopeCfg {
+                max_changed_files: 10,
+                max_changed_lines: 100,
+                allow_paths: vec!["src/".into()],
+            },
+            apply: false,
+            artifacts: Default::default(),
+            context: Default::default(),
+            worktree: Default::default(),
+        };
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false, // --propose: never apply to main
+            editable_paths: vec!["src/".into()],
+            tier: None,
+            keep_worktree: false,
+            run_id: "scope-leak".into(),
+            builder_model: None,
+        };
+        let res = run(&cfg, opts, &OutOfScopeBuilder, &UncertainJudge)
+            .await
+            .unwrap();
+
+        let main_status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&tmp)
+            .output()
+            .unwrap();
+        let leaked_path = tmp.join("packages/worldgen/src/index.ts");
+        std::env::set_current_dir(prev).unwrap();
+
+        assert_eq!(res.status, RunStatus::NotConverged);
+        assert_eq!(res.stop_reason, Some(StopReason::ScopeExceeded));
+        assert!(!res.applied, "propose run must never mark applied");
+        assert!(
+            String::from_utf8_lossy(&main_status.stdout)
+                .trim()
+                .is_empty(),
+            "main tree must stay clean under propose: {}",
+            String::from_utf8_lossy(&main_status.stdout)
+        );
+        assert!(
+            !leaked_path.exists(),
+            "out-of-scope file must never reach the main working tree"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -221,7 +221,10 @@ verify:
                           # re-run the gates there before reporting converged (default: true)
 loop:
   max_iterations: 3
-  max_walltime_secs: 1800
+  max_walltime_secs: 1800   # bounds the TOTAL build — primary + every fallback share
+                            # this one budget, so a looping model can't run N×. Set it
+                            # tight per dispatched slice and the caller can rely on bob
+                            # returning within it.
 context:
   soft_tokens: 16000       # warn when the estimated builder prompt exceeds this
   hard_tokens: 32000       # refuse the run outright past this

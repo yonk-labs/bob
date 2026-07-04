@@ -98,6 +98,116 @@ printf '{{"agreements":["ok"],"disagreements":[]}}\n'
 }
 
 #[test]
+#[cfg(unix)]
+fn propose_out_of_scope_edit_never_leaks_into_main_bug_26() {
+    // Regression guard for bug #26: `bob build --propose --jobs 2` (two
+    // concurrent, unapplied builds sharing one repo) reportedly leaked a
+    // NON-editable file edit outside the run's editable_paths/allow_paths
+    // allowlist into the MAIN working tree. Drives the real CLI end-to-end
+    // (fake `opencode` plays the builder) with a scope that only allows
+    // `src/`, while the fake builder always edits `packages/worldgen/...`
+    // (outside the allowlist) — exactly the reported shape. Runs two
+    // concurrent `bob build` invocations against one shared repo, looped,
+    // since #26 was reported under --jobs 2 concurrency.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".bob")
+        .join(format!("bug26-fixture-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+
+    let fake_builder = dir.join("bin/opencode");
+    write_exe(
+        &fake_builder,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+d=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--dir" ]; then
+    shift
+    d="$1"
+  fi
+  shift || true
+done
+test -n "$d"
+mkdir -p "$d/packages/worldgen/src"
+printf 'export const leaked = true;\n' > "$d/packages/worldgen/src/index.ts"
+"#,
+    );
+
+    git(&dir, &["init", "-q"]);
+    git(&dir, &["config", "user.email", "t@t"]);
+    git(&dir, &["config", "user.name", "t"]);
+    std::fs::write(dir.join("src/seed.txt"), "x\n").unwrap();
+    std::fs::write(dir.join(".gitignore"), "/.bob\n").unwrap();
+    std::fs::write(
+        dir.join("bob.yaml"),
+        format!(
+            "builder:\n  cmd: {}\n  timeout_secs: 5\n\
+             judge:\n  cmd: abe\n  mode: validate\n  timeout_secs: 5\n\
+             verify:\n  cmds: []\n\
+             loop:\n  max_iterations: 1\n  max_walltime_secs: 60\n\
+             scope:\n  max_changed_files: 10\n  max_changed_lines: 200\n  allow_paths: [\"src/\"]\n\
+             apply: false\n\
+             artifacts:\n  dir: .bob/runs\n",
+            fake_builder.display(),
+        ),
+    )
+    .unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-qm", "init"]);
+
+    let leaked = dir.join("packages/worldgen/src/index.ts");
+    for i in 0..20 {
+        let spawn_one = || {
+            Command::new(env!("CARGO_BIN_EXE_bob"))
+                .args(["build", "change something", "--allow-path", "src/", "--json"])
+                .current_dir(&dir)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        // Two concurrent, unapplied ("propose") builds sharing one repo — the
+        // --jobs 2 shape #26 was reported under.
+        let a = spawn_one();
+        let b = spawn_one();
+        let oa = a.wait_with_output().unwrap();
+        let ob = b.wait_with_output().unwrap();
+
+        for (who, out) in [("A", &oa), ("B", &ob)] {
+            assert!(
+                !out.status.success(),
+                "iter {i} build {who}: expected non-zero exit (scope-exceeded), got success: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains("ScopeExceeded"),
+                "iter {i} build {who}: expected ScopeExceeded stop_reason: {stdout}"
+            );
+        }
+
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "iter {i}: main tree dirty (bug #26 reproduced):\n{}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        assert!(
+            !leaked.exists(),
+            "iter {i}: out-of-scope file leaked into main working tree (bug #26 reproduced)"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn builds_and_converges_on_a_trivial_task() {
     if std::env::var("BOB_INTEGRATION").is_err() {
         eprintln!("skipping: set BOB_INTEGRATION=1 with opencode+abe configured");
