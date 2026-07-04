@@ -572,6 +572,58 @@ class Body { }
         assert_eq!(extract_path_delimiter("const x = 1;"), None);
     }
 
+    /// Write an executable fake builder script that records its argv (one per
+    /// line) to `args.txt` in its cwd, then exits 0.
+    fn write_argv_recorder(dir: &Path) -> std::path::PathBuf {
+        let script = dir.join("fake-builder.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$@\" > args.txt\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// repro F1: each builder kind must exec with ITS OWN flag set — goose
+    /// must never receive opencode's `--pure`/`--dir`, opencode must.
+    #[tokio::test]
+    async fn opencode_and_goose_compose_their_own_argv() {
+        // opencode: run --pure --dir <workdir> ... prompt
+        let dir = tempdir();
+        let script = write_argv_recorder(&dir);
+        let b = Opencode {
+            cmd: script.to_string_lossy().into_owned(),
+            timeout: Duration::from_secs(5),
+            args: vec![],
+            run_id: None,
+        };
+        b.build("the prompt", &dir).await.unwrap();
+        let argv = std::fs::read_to_string(dir.join("args.txt")).unwrap();
+        let args: Vec<&str> = argv.lines().collect();
+        assert_eq!(args[0], "run");
+        assert!(args.contains(&"--pure"), "opencode gets --pure: {args:?}");
+        assert!(args.contains(&"--dir"), "opencode gets --dir: {args:?}");
+
+        // goose: run --no-profile ... --provider <p>, and NEVER opencode flags
+        let dir = tempdir();
+        let script = write_argv_recorder(&dir);
+        let b = GooseBuilder {
+            cmd: script.to_string_lossy().into_owned(),
+            model: "m".into(),
+            timeout: Duration::from_secs(5),
+            provider: "openai".into(),
+            base_url: None,
+            api_key: None,
+            toolshim: false,
+        };
+        b.build("the prompt", &dir).await.unwrap();
+        let argv = std::fs::read_to_string(dir.join("args.txt")).unwrap();
+        let args: Vec<&str> = argv.lines().collect();
+        assert_eq!(args[0], "run");
+        assert!(args.contains(&"--no-profile"), "goose gets --no-profile: {args:?}");
+        assert!(args.contains(&"--provider"), "goose gets --provider: {args:?}");
+        assert!(!args.contains(&"--pure"), "goose must NOT get opencode's --pure: {args:?}");
+        assert!(!args.contains(&"--dir"), "goose must NOT get opencode's --dir: {args:?}");
+    }
+
     #[tokio::test]
     async fn times_out_a_hung_builder() {
         let b = ShimSleep { timeout: Duration::from_millis(200) };

@@ -766,6 +766,18 @@ fn resolve_endpoint(
     Ok((base_url, api_model, api_key))
 }
 
+/// The binary an opencode-designated attempt execs. `builder.cmd` may name a
+/// custom opencode wrapper — honored — but NEVER a DIFFERENT builder kind:
+/// with `builder.cmd: goose`, tier escalation to an opencode tier used to exec
+/// goose with opencode's flags (`--pure`/`--dir`) → goose exit 2 → the whole
+/// run aborted as a raw CLI error (repro F1, frontier/MiniMax attempt).
+fn opencode_exec_cmd(cfg_cmd: &str) -> String {
+    match cfg_cmd {
+        "goose" | "thin" => "opencode".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Extract the env var name for the API key (if any) from a model id.
 fn extract_api_key_env(model_id: &str) -> Option<String> {
     if model_id.starts_with("minimax") {
@@ -1067,7 +1079,7 @@ pub async fn run_opencode_with_fallbacks(
                 })
             }
             _ => crate::builder::BuilderKind::Opencode(crate::builder::Opencode {
-                cmd: cfg.builder.cmd.clone(),
+                cmd: opencode_exec_cmd(&cfg.builder.cmd),
                 timeout: builder_timeout,
                 args: cfg.builder.opencode_args(model_sel.as_deref()),
                 run_id: Some(attempt_opts.run_id.clone()),
@@ -1971,6 +1983,17 @@ assert!(matches!(
         let out = apply_overrides(base, None, vec!["codex".into(), "qwen".into()]);
         // tier chain first, extra fallback trails, duplicate qwen deduped
         assert_eq!(out, vec![s("qwen"), s("codex")]);
+    }
+
+    #[test]
+    fn opencode_arm_never_execs_a_different_builder_binary() {
+        // repro F1: builder.cmd=goose + tier builder "opencode" exec'd goose
+        // with opencode's flags (--pure) → exit 2 → run aborted.
+        assert_eq!(opencode_exec_cmd("goose"), "opencode");
+        assert_eq!(opencode_exec_cmd("thin"), "opencode");
+        // Custom opencode wrappers are still honored.
+        assert_eq!(opencode_exec_cmd("opencode"), "opencode");
+        assert_eq!(opencode_exec_cmd("/usr/local/bin/my-opencode"), "/usr/local/bin/my-opencode");
     }
 
     #[test]
