@@ -988,6 +988,12 @@ pub async fn run_opencode_with_fallbacks(
     let mut fallback_history = Vec::new();
     let mut last_err: Option<anyhow::Error> = None;
     let mut current_tier_idx: usize = 0;
+    // Did any attempt reach engine::run() for the PRIMARY run_id (idx 0)? Only
+    // idx 0 uses opts.run_id; fallbacks use `<run_id>-fbN`. run() writes its own
+    // terminal run.json + run_end for whatever run_id it's handed. If every model
+    // is probe-skipped/errored before idx 0 reaches run(), opts.run_id would
+    // otherwise get NO run_end — the exact #28 signature hector can't close on.
+    let mut primary_reached_run = false;
 
     // One shared walltime budget for the WHOLE build (primary + every fallback).
     // run() derives its per-attempt deadline from cfg.loop_cfg.max_walltime_secs;
@@ -1179,6 +1185,12 @@ pub async fn run_opencode_with_fallbacks(
             timeout: Duration::from_secs(cfg.judge.timeout_secs),
         };
 
+        // Reached engine::run() for this run_id — it will write its own terminal
+        // run.json + run_end. Record it for idx 0 so the exhaustion finalizer
+        // below doesn't double-emit for opts.run_id.
+        if idx == 0 {
+            primary_reached_run = true;
+        }
         let run_start = std::time::Instant::now();
         match run(cfg, attempt_opts, &builder, &judge).await {
             Ok(mut res) => {
@@ -1204,11 +1216,96 @@ pub async fn run_opencode_with_fallbacks(
                 last_err = Some(e);
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
         }
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no builder model attempts ran")))
+    let err = last_err.unwrap_or_else(|| anyhow::anyhow!("no builder model attempts ran"));
+    // The chain is spent. If NO attempt reached engine::run() for the primary
+    // run_id, no run() finalizer wrote its run.json/run_end — write a terminal
+    // one here so hector always sees run_end (batch-1 guarantee), then return
+    // the Err. When idx 0 DID reach run(), it already finalized opts.run_id;
+    // don't double-emit.
+    if !primary_reached_run {
+        let result = exhausted_chain_result(cfg, &opts.run_id, &fallback_history, &err);
+        finalize_run_artifacts(std::path::Path::new(&cfg.artifacts.dir), &result);
+    }
+    Err(err)
+}
+
+/// Emit `run_end` and write `run.json` for a run_id. The SINGLE finalizer both
+/// engine::run() and the fallback-exhaustion path go through, so every run_id
+/// bob touches ends its events.jsonl with run_end and gets a run.json — hector
+/// can always treat run_end as closure (the batch-1 guarantee). `art_base` is
+/// the artifacts root (cfg.artifacts.dir); run.json lands at result.artifact_dir.
+fn finalize_run_artifacts(art_base: &Path, result: &RunResult) {
+    let status_str = match result.status {
+        RunStatus::Converged => "converged",
+        RunStatus::NeedsReview => "needs_review",
+        RunStatus::NotConverged => "not_converged",
+        RunStatus::Error => "error",
+    };
+    let stop_reason_str = result
+        .stop_reason
+        .map(|r| format!("{r:?}"))
+        .unwrap_or_default();
+    crate::report::append_event(
+        art_base,
+        &result.run_id,
+        serde_json::json!({"event": "run_end", "status": status_str, "stop_reason": stop_reason_str}),
+    );
+    let _ = std::fs::create_dir_all(std::path::Path::new(&result.artifact_dir));
+    let _ = std::fs::write(
+        std::path::Path::new(&result.artifact_dir).join("run.json"),
+        crate::report::to_json(result),
+    );
+}
+
+/// Terminal RunResult for `run_id` when the fallback chain was exhausted WITHOUT
+/// any attempt reaching engine::run() for it (every model probe-skipped or
+/// errored before a run() finalizer ran). Carries the chain's failure reasons
+/// (`fallback_history` + `err`) so the terminal artifact says WHY. No worktree
+/// was created, so base_sha/worktree are empty and iterations is 0.
+fn exhausted_chain_result(
+    cfg: &Config,
+    run_id: &str,
+    fallback_history: &[String],
+    err: &anyhow::Error,
+) -> RunResult {
+    let artifact_dir = std::path::Path::new(&cfg.artifacts.dir)
+        .join(run_id)
+        .to_string_lossy()
+        .to_string();
+    RunResult {
+        status: RunStatus::Error,
+        next_action: result_next_action(RunStatus::Error, false, Some(StopReason::BuilderError)),
+        run_id: run_id.to_string(),
+        base_sha: String::new(),
+        worktree: String::new(),
+        artifact_dir,
+        iterations: 0,
+        final_diff: String::new(),
+        applied: false,
+        stop_reason: Some(StopReason::BuilderError),
+        changed_files: vec![],
+        scope: None,
+        verify: None,
+        judge: None,
+        builder: BuilderSnapshot {
+            model: None,
+            stdout_tail: String::new(),
+            stderr_tail: err.to_string(),
+            failure_kind: "endpoint_error".into(),
+            fallbacks_tried: fallback_history.to_vec(),
+        },
+        reset_test_files: vec![],
+        context_est_tokens: 0,
+        prompt_est_tokens: vec![],
+        verify_cmds: cfg.verify.cmds.clone(),
+    }
 }
 
 #[allow(unused_assignments)] // final_diff init is dead; loop always overwrites before any break
@@ -1706,23 +1803,7 @@ pub async fn run(
         prompt_est_tokens,
         verify_cmds: cfg.verify.cmds.clone(),
     };
-    let status_str = match status {
-        RunStatus::Converged => "converged",
-        RunStatus::NeedsReview => "needs_review",
-        RunStatus::NotConverged => "not_converged",
-        RunStatus::Error => "error",
-    };
-    let stop_reason_str = stop_reason.map(|r| format!("{r:?}")).unwrap_or_default();
-    crate::report::append_event(
-        art,
-        &opts.run_id,
-        serde_json::json!({"event": "run_end", "status": status_str, "stop_reason": stop_reason_str}),
-    );
-    let _ = std::fs::create_dir_all(std::path::Path::new(&result.artifact_dir));
-    let _ = std::fs::write(
-        std::path::Path::new(&result.artifact_dir).join("run.json"),
-        crate::report::to_json(&result),
-    );
+    finalize_run_artifacts(art, &result);
     if should_keep_worktree(opts.keep_worktree, status) {
         eprintln!("worktree preserved at {}", ws.path().display());
     } else {
@@ -3500,6 +3581,75 @@ mod flow_tests {
         assert!(
             fb["reason"].as_str().unwrap().contains("endpoint unreachable"),
             "reason carries why the previous attempt ended: {fb}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// F9: an all-dead chain — every model probe-skipped before reaching
+    /// engine::run() — must STILL leave a terminal run.json and a run_end for
+    /// opts.run_id. Before this, the probe `continue`d past run()'s finalizer,
+    /// so the run dir had only a bare builder_error event: the #28 signature
+    /// hector can't close on ("hector must ALWAYS see run_end").
+    #[tokio::test]
+    async fn exhausted_dead_chain_still_writes_run_json_and_run_end() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-all-dead-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let mut cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        cfg.builder.cmd = "goose".into();
+        // A single model whose only endpoint is dead — the live `--model
+        // qwen-140` shape.
+        cfg.builder.models.insert(
+            "dead".into(),
+            crate::config::ModelDef::Full {
+                model: "test-model-dead".into(),
+                base_url: Some("http://127.0.0.1:1/v1".into()), // dead port
+                api_key_env: None,
+            },
+        );
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "all-dead".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let res = run_opencode_with_fallbacks(&cfg, opts, Some("dead".into()), vec![], false).await;
+
+        let run_json_raw =
+            std::fs::read_to_string(tmp.join(".bob/runs/all-dead/run.json")).unwrap();
+        let events = std::fs::read_to_string(tmp.join(".bob/runs/all-dead/events.jsonl")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        assert!(res.is_err(), "all-dead chain surfaces an Err");
+        // Terminal run.json with an error status + a reason that says WHY.
+        let rj: serde_json::Value = serde_json::from_str(&run_json_raw).unwrap();
+        assert_eq!(rj["status"], "error");
+        assert_eq!(rj["stop_reason"], "BuilderError");
+        assert!(
+            rj["builder"]["fallbacks_tried"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str().unwrap().contains("endpoint unreachable")),
+            "terminal artifact records the exhausted-chain reason: {rj}"
+        );
+        // events.jsonl ENDS with run_end (status error) — hector's closure signal.
+        let last: serde_json::Value =
+            serde_json::from_str(events.lines().last().unwrap()).unwrap();
+        assert_eq!(last["event"], "run_end");
+        assert_eq!(last["status"], "error");
+        // Exactly one run_end (no double-emit).
+        assert_eq!(
+            events.lines().filter(|l| l.contains("\"run_end\"")).count(),
+            1,
+            "exactly one run_end for opts.run_id:\n{events}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
