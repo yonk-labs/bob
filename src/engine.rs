@@ -148,6 +148,10 @@ pub enum StopReason {
     JudgeRejected,
     JudgeUnavailable,
     ReplayVerifyFailed,
+    /// The builder subprocess errored or was killed on timeout — a terminal,
+    /// per-attempt failure. run() records this, writes a terminal run.json and
+    /// run_end, then still returns Err so the fallback wrapper can escalate.
+    BuilderError,
 }
 
 /// Mutable per-loop history the decision function reads.
@@ -1161,6 +1165,11 @@ pub async fn run(
     let mut applied = false;
     let mut stop_reason = None;
     let mut status = RunStatus::NotConverged;
+    // Set when the builder subprocess errors/times out. The loop breaks to the
+    // shared finalizer (run.json + run_end) and then returns THIS error, so a
+    // killed builder still leaves a terminal artifact yet the fallback wrapper
+    // still sees an Err to escalate on (findings #28/#31).
+    let mut builder_error: Option<anyhow::Error> = None;
     let mut last_scope: Option<scope::ScopeReport> = None;
     let mut last_verify: Option<VerifySnapshot> = None;
     let mut last_judge: Option<JudgeSnapshot> = None;
@@ -1219,7 +1228,17 @@ pub async fn run(
                     "bob: builder error — worktree preserved at {}",
                     ws.path().display()
                 );
-                return Err(e);
+                // Terminal for this attempt: record a terminal status and break to
+                // the shared finalizer so run.json + run_end are ALWAYS written
+                // (hector must always see run_end). The stored error is re-raised
+                // after finalizing so the fallback wrapper still escalates models.
+                status = RunStatus::Error;
+                stop_reason = Some(StopReason::BuilderError);
+                builder_snapshot.failure_kind =
+                    if timed_out { "timeout".into() } else { "error".into() };
+                builder_snapshot.stderr_tail = e.to_string();
+                builder_error = Some(e);
+                break;
             }
         };
         builder_snapshot.stdout_tail = builder_out.stdout_tail;
@@ -1515,6 +1534,11 @@ pub async fn run(
         eprintln!("worktree preserved at {}", ws.path().display());
     } else {
         ws.cleanup()?;
+    }
+    // A killed/errored builder is reported as Err (fallback wrapper escalates on
+    // it) — but only AFTER the terminal run.json + run_end above were written.
+    if let Some(e) = builder_error {
+        return Err(e);
     }
     Ok(result)
 }
@@ -2975,6 +2999,59 @@ mod flow_tests {
         assert_eq!(to["iter"], 0);
         assert_eq!(to["model"], "qwen-193");
         assert!(to["elapsed_secs"].is_u64(), "elapsed_secs recorded");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Fix 2: a builder timeout terminates the run WITH a terminal run.json and
+    /// a run_end event — hector tailing events.jsonl always sees run_end, and
+    /// the run.json exists with an error status. run() still returns Err.
+    #[tokio::test]
+    async fn builder_timeout_writes_terminal_run_json_and_run_end() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-timeout-terminal-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "timeout-terminal".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: Some("qwen-193".into()),
+        };
+        let res = run(
+            &cfg,
+            opts,
+            &ErrBuilder {
+                msg: "goose timed out after 5s".into(),
+            },
+            &UncertainJudge,
+        )
+        .await;
+
+        let run_json_raw =
+            std::fs::read_to_string(tmp.join(".bob/runs/timeout-terminal/run.json")).unwrap();
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/timeout-terminal/events.jsonl")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        // Err still surfaces (fallback wrapper escalates on it).
+        assert!(res.is_err());
+        // run.json written with a terminal error status + BuilderError stop_reason.
+        let rj: serde_json::Value = serde_json::from_str(&run_json_raw).unwrap();
+        assert_eq!(rj["status"], "error");
+        assert_eq!(rj["stop_reason"], "BuilderError");
+        assert_eq!(rj["builder"]["failure_kind"], "timeout");
+        // run_end is the LAST event — consumers always see it.
+        let last: serde_json::Value =
+            serde_json::from_str(events.lines().last().unwrap()).unwrap();
+        assert_eq!(last["event"], "run_end");
+        assert_eq!(last["status"], "error");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
