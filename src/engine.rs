@@ -1160,6 +1160,7 @@ pub async fn run_opencode_with_fallbacks(
                     base_url: Some(base_url),
                     api_key,
                     toolshim: cfg.builder.goose_toolshim,
+                    run_id: Some(attempt_opts.run_id.clone()),
                 })
             }
             _ => crate::builder::BuilderKind::Opencode(crate::builder::Opencode {
