@@ -391,10 +391,21 @@ impl Builder for GooseBuilder {
                         stderr_tail
                     );
                 }
+                // goose exits 0 after "Network error: Request timed out — …"
+                // against a dead endpoint, with zero tool calls made (repro
+                // F2b). Surface that as endpoint_error instead of "ok" so the
+                // engine can classify marker + empty diff as an INFRA error
+                // and hop models, not burn a judge iteration on nothing.
+                let network_err = stdout_tail.contains("Network error:")
+                    || stderr_tail.contains("Network error:");
                 Ok(BuilderOutcome {
                     stdout_tail,
                     stderr_tail,
-                    failure_kind: "ok".into(),
+                    failure_kind: if network_err {
+                        "endpoint_error".into()
+                    } else {
+                        "ok".into()
+                    },
                 })
             }
             Err(_) => anyhow::bail!("goose timed out after {:?}", self.timeout),
@@ -622,6 +633,45 @@ class Body { }
         assert!(args.contains(&"--provider"), "goose gets --provider: {args:?}");
         assert!(!args.contains(&"--pure"), "goose must NOT get opencode's --pure: {args:?}");
         assert!(!args.contains(&"--dir"), "goose must NOT get opencode's --dir: {args:?}");
+    }
+
+    /// repro F2b: goose exits 0 after "Network error: Request timed out" with
+    /// zero tokens — that must surface as endpoint_error, never "ok".
+    #[tokio::test]
+    async fn goose_exit_zero_network_error_is_endpoint_error_not_ok() {
+        let dir = tempdir();
+        let script = dir.join("fake-goose.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'Network error: Request timed out — check your network connection and try again.'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mk = |cmd: String| GooseBuilder {
+            cmd,
+            model: "m".into(),
+            timeout: Duration::from_secs(5),
+            provider: "openai".into(),
+            base_url: None,
+            api_key: None,
+            toolshim: false,
+        };
+        let out = mk(script.to_string_lossy().into_owned())
+            .build("p", &dir)
+            .await
+            .unwrap();
+        assert_eq!(out.failure_kind, "endpoint_error");
+
+        // Healthy exit-0 output stays "ok".
+        let script_ok = dir.join("fake-goose-ok.sh");
+        std::fs::write(&script_ok, "#!/bin/sh\necho 'done editing'\n").unwrap();
+        std::fs::set_permissions(&script_ok, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = mk(script_ok.to_string_lossy().into_owned())
+            .build("p", &dir)
+            .await
+            .unwrap();
+        assert_eq!(out.failure_kind, "ok");
     }
 
     #[tokio::test]

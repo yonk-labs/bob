@@ -662,11 +662,14 @@ fn should_try_next_model_after_error(err: &anyhow::Error) -> bool {
     // "spawning goose"), opencode ("builder timed out", "spawning builder"), and
     // thin ("thin builder: model API error"). Orchestration errors (git/worktree)
     // don't use these phrases, so they still fail fast.
+    // "endpoint unreachable" covers the pre-spawn probe and goose's exit-0
+    // network failure (F2) — both per-model infra errors.
     s.contains("timed out")
         || s.contains("exited with status")
         || s.contains("spawning ")
         || s.contains("builder")
         || s.contains("model API error")
+        || s.contains("endpoint unreachable")
 }
 
 fn model_label(model: &Option<String>) -> String {
@@ -1054,10 +1057,40 @@ pub async fn run_opencode_with_fallbacks(
         };
         eprintln!("bob: builder='{}' for tier='{}'", builder_kind, tier_name);
 
+        // Pre-spawn endpoint probe (F2a): when this attempt's base_url is known
+        // (thin/goose resolve it), verify the endpoint ANSWERS before spawning a
+        // builder against it. A dead endpoint otherwise burns the full builder
+        // timeout — goose even exits 0 after "Network error" with zero work done
+        // (F2b) — before the fallback wrapper can hop; the probe (auth-aware,
+        // 401/403 = alive) makes the hop take seconds and is a per-model INFRA
+        // error, so the chain advances instead of aborting.
+        let endpoint = match builder_kind {
+            "thin" | "goose" => Some(resolve_endpoint(cfg, model_sel.as_deref(), model_id)?),
+            _ => None,
+        };
+        if let Some((base_url, _, api_key)) = &endpoint {
+            if !crate::doctor::endpoint_alive(base_url, api_key.as_deref()) {
+                let detail = format!("endpoint unreachable: {base_url}");
+                eprintln!("bob: skipping {} — {detail}", model_label(&resolved_model));
+                crate::report::append_event(
+                    std::path::Path::new(&cfg.artifacts.dir),
+                    &opts.run_id,
+                    serde_json::json!({
+                        "event": "builder_error",
+                        "model": resolved_model,
+                        "detail": detail,
+                    }),
+                );
+                fallback_history.push(format!("{}: {detail}", model_label(&resolved_model)));
+                last_err = Some(anyhow::anyhow!("{detail}"));
+                continue;
+            }
+        }
+
         let builder: crate::builder::BuilderKind = match builder_kind {
             "thin" => {
                 let (base_url, api_model, api_key) =
-                    resolve_endpoint(cfg, model_sel.as_deref(), model_id)?;
+                    endpoint.clone().expect("endpoint resolved for thin above");
                 crate::builder::BuilderKind::Thin(crate::builder::ThinBuilder {
                     model_id: api_model,
                     base_url,
@@ -1067,7 +1100,7 @@ pub async fn run_opencode_with_fallbacks(
             }
             "goose" => {
                 let (base_url, api_model, api_key) =
-                    resolve_endpoint(cfg, model_sel.as_deref(), model_id)?;
+                    endpoint.clone().expect("endpoint resolved for goose above");
                 crate::builder::BuilderKind::Goose(crate::builder::GooseBuilder {
                     cmd: "goose".to_string(),
                     model: api_model,
@@ -1279,6 +1312,32 @@ pub async fn run(
 
         let diff = ws.capture_diff()?;
         final_diff = diff.clone();
+
+        // F2b: goose exit-0 network failure + empty diff = the endpoint died,
+        // not a model that chose to change nothing. Route it through the
+        // builder-error finalizer (terminal run.json + run_end + Err) so the
+        // fallback wrapper hops instead of burning a judge iteration and
+        // ending in a misleading EmptyDiffAfterCritique.
+        if diff.trim().is_empty() && builder_snapshot.failure_kind == "endpoint_error" {
+            let e = anyhow::anyhow!(
+                "goose reported a network error with exit 0 — endpoint unreachable; stdout tail:\n{}",
+                builder_snapshot.stdout_tail
+            );
+            crate::report::append_event(
+                art,
+                &opts.run_id,
+                serde_json::json!({
+                    "event": "builder_error",
+                    "iter": state.index,
+                    "model": opts.builder_model,
+                    "detail": "endpoint unreachable (goose exit 0 + network error + empty diff)",
+                }),
+            );
+            status = RunStatus::Error;
+            stop_reason = Some(StopReason::BuilderError);
+            builder_error = Some(e);
+            break;
+        }
 
         // STEP OUTCOME
         let step = if diff.trim().is_empty() {
@@ -3022,6 +3081,131 @@ mod flow_tests {
         assert_eq!(to["iter"], 0);
         assert_eq!(to["model"], "qwen-193");
         assert!(to["elapsed_secs"].is_u64(), "elapsed_secs recorded");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Models goose's exit-0 network failure (repro F2b): Ok outcome, no edits,
+    /// failure_kind endpoint_error, "Network error" banner in stdout.
+    struct EndpointErrBuilder;
+    impl Builder for EndpointErrBuilder {
+        async fn build(&self, _p: &str, _w: &Path) -> anyhow::Result<BuilderOutcome> {
+            Ok(BuilderOutcome {
+                stdout_tail: "Network error: Request timed out — check your network connection and try again.".into(),
+                stderr_tail: String::new(),
+                failure_kind: "endpoint_error".into(),
+            })
+        }
+    }
+
+    /// F2b: goose exit-0 + network-error marker + empty diff is an INFRA error
+    /// — terminal run.json + builder_error event + Err — not failure_kind "ok"
+    /// burning a judge iteration toward EmptyDiffAfterCritique.
+    #[tokio::test]
+    async fn goose_exit_zero_network_error_with_empty_diff_is_builder_error() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-endpoint-err-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "endpoint-err".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: Some("qwen-140".into()),
+        };
+        let res = run(&cfg, opts, &EndpointErrBuilder, &UncertainJudge).await;
+
+        let run_json_raw =
+            std::fs::read_to_string(tmp.join(".bob/runs/endpoint-err/run.json")).unwrap();
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/endpoint-err/events.jsonl")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        let err = match res {
+            Ok(_) => panic!("endpoint failure must surface as Err"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("endpoint unreachable"),
+            "error is classified for model escalation: {err}"
+        );
+        assert!(
+            should_try_next_model_after_error(&err),
+            "fallback wrapper must hop on it"
+        );
+        let rj: serde_json::Value = serde_json::from_str(&run_json_raw).unwrap();
+        assert_eq!(rj["status"], "error");
+        assert_eq!(rj["stop_reason"], "BuilderError");
+        assert!(
+            events.lines().any(|l| l.contains("\"builder_error\"")
+                && l.contains("endpoint unreachable")),
+            "builder_error event emitted:\n{events}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// F2a: the pre-spawn probe skips a dead endpoint in seconds — the fallback
+    /// wrapper hops without spawning a builder, emits builder_error per dead
+    /// model, and surfaces "endpoint unreachable" when the chain is exhausted.
+    #[tokio::test]
+    async fn dead_endpoint_probe_hops_without_spawning_builder() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-probe-hop-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let mut cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        cfg.builder.cmd = "goose".into();
+        for (name, model) in [("m1", "test-model-1"), ("m2", "test-model-2")] {
+            cfg.builder.models.insert(
+                name.into(),
+                crate::config::ModelDef::Full {
+                    model: model.into(),
+                    base_url: Some("http://127.0.0.1:1/v1".into()), // dead port
+                    api_key_env: None,
+                },
+            );
+        }
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "probe-hop".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let started = std::time::Instant::now();
+        let res =
+            run_opencode_with_fallbacks(&cfg, opts, Some("m1".into()), vec!["m2".into()], false)
+                .await;
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/probe-hop/events.jsonl")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        let err = match res {
+            Ok(_) => panic!("all-dead chain must surface an Err"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("endpoint unreachable"), "{err}");
+        // Probe hop is seconds, not builder timeouts (2 × 5s probe max + slack).
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "hop must not burn builder timeouts"
+        );
+        let dead_events = events
+            .lines()
+            .filter(|l| l.contains("\"builder_error\"") && l.contains("endpoint unreachable"))
+            .count();
+        assert_eq!(dead_events, 2, "one builder_error per dead model:\n{events}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
