@@ -782,6 +782,25 @@ fn resolve_endpoint(
     Ok((base_url, api_model, api_key))
 }
 
+/// Added/removed line counts of a unified diff (excluding the +++/--- file
+/// headers) — the cheap "how much work is in here" signal for partial_diff
+/// events.
+fn diff_line_counts(diff: &str) -> (u64, u64) {
+    let mut added = 0u64;
+    let mut removed = 0u64;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
 /// The binary an opencode-designated attempt execs. `builder.cmd` may name a
 /// custom opencode wrapper — honored — but NEVER a DIFFERENT builder kind:
 /// with `builder.cmd: goose`, tier escalation to an opencode tier used to exec
@@ -1288,6 +1307,33 @@ pub async fn run(
                     "bob: builder error — worktree preserved at {}",
                     ws.path().display()
                 );
+                // Salvage whatever the killed builder left behind (F4): a
+                // near-solution partial diff is evidence for the retry or the
+                // human — the repro showed a +37/-6 qwen draft silently
+                // discarded on timeout. Best-effort; never masks the error.
+                if let Ok(partial) = ws.capture_diff() {
+                    if !partial.trim().is_empty() {
+                        let iter_dir = art
+                            .join(&opts.run_id)
+                            .join(format!("iter-{}", state.index));
+                        let _ = std::fs::create_dir_all(&iter_dir);
+                        let partial_path = iter_dir.join("partial.diff");
+                        if std::fs::write(&partial_path, &partial).is_ok() {
+                            let (added, removed) = diff_line_counts(&partial);
+                            crate::report::append_event(
+                                art,
+                                &opts.run_id,
+                                serde_json::json!({
+                                    "event": "partial_diff",
+                                    "iter": state.index,
+                                    "path": partial_path.to_string_lossy(),
+                                    "added_lines": added,
+                                    "removed_lines": removed,
+                                }),
+                            );
+                        }
+                    }
+                }
                 // Terminal for this attempt: record a terminal status and break to
                 // the shared finalizer so run.json + run_end are ALWAYS written
                 // (hector must always see run_end). The stored error is re-raised
@@ -2077,6 +2123,22 @@ assert!(matches!(
         let out = apply_overrides(base, None, vec!["codex".into(), "qwen".into()]);
         // tier chain first, extra fallback trails, duplicate qwen deduped
         assert_eq!(out, vec![s("qwen"), s("codex")]);
+    }
+
+    #[test]
+    fn diff_line_counts_skips_file_headers() {
+        let diff = "\
+diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ b/f.txt
+@@ -1,2 +1,3 @@
+ context
++added one
++added two
+-removed one
+";
+        assert_eq!(diff_line_counts(diff), (2, 1));
+        assert_eq!(diff_line_counts(""), (0, 0));
     }
 
     #[test]
@@ -3116,6 +3178,62 @@ mod flow_tests {
         assert_eq!(to["iter"], 0);
         assert_eq!(to["model"], "qwen-193");
         assert!(to["elapsed_secs"].is_u64(), "elapsed_secs recorded");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Writes a file, then errors — models goose killed mid-iteration AFTER
+    /// doing real work (repro F4: a +37/-6 near-solution discarded on timeout).
+    struct WriteThenErrBuilder;
+    impl Builder for WriteThenErrBuilder {
+        async fn build(&self, _p: &str, workdir: &Path) -> anyhow::Result<BuilderOutcome> {
+            std::fs::write(workdir.join("partial-work.txt"), "half a solution\n")?;
+            anyhow::bail!("goose timed out after 5s")
+        }
+    }
+
+    /// F4: a builder timeout salvages the worktree's partial work into
+    /// <run_dir>/iter-N/partial.diff and emits a partial_diff event with
+    /// line counts — near-solutions are evidence, not garbage.
+    #[tokio::test]
+    async fn builder_timeout_salvages_partial_diff() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-partial-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "partial".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let res = run(&cfg, opts, &WriteThenErrBuilder, &UncertainJudge).await;
+
+        let partial =
+            std::fs::read_to_string(tmp.join(".bob/runs/partial/iter-0/partial.diff")).unwrap();
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/partial/events.jsonl")).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+
+        assert!(res.is_err(), "timeout still surfaces as Err");
+        assert!(
+            partial.contains("partial-work.txt") && partial.contains("half a solution"),
+            "salvaged diff carries the builder's work:\n{partial}"
+        );
+        let ev: serde_json::Value = events
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .find(|v: &serde_json::Value| v["event"] == "partial_diff")
+            .expect("partial_diff event emitted");
+        assert_eq!(ev["iter"], 0);
+        assert!(ev["path"].as_str().unwrap().ends_with("iter-0/partial.diff"));
+        assert!(ev["added_lines"].as_u64().unwrap() >= 1);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
