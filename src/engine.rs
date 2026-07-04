@@ -148,6 +148,14 @@ pub enum StopReason {
     JudgeRejected,
     JudgeUnavailable,
     ReplayVerifyFailed,
+    /// A retry iteration produced a diff BYTE-IDENTICAL to the previous
+    /// iteration's — the model is looping, further iterations can't help.
+    /// Same family as EmptyDiffAfterCritique (escalate to the next model).
+    /// Known ceiling: this only sees progress at iteration BOUNDARIES; a
+    /// builder spinning inside one call (gemma's idempotent-edit loop) is
+    /// bounded by the wall clock — intra-call detection would need goose
+    /// session parsing.
+    NoProgress,
     /// The builder subprocess errored or was killed on timeout — a terminal,
     /// per-attempt failure. run() records this, writes a terminal run.json and
     /// run_end, then still returns Err so the fallback wrapper can escalate.
@@ -630,6 +638,7 @@ fn result_next_action(
     match stop_reason {
         Some(StopReason::ScopeExceeded) => NextAction::SplitTask,
         Some(StopReason::EmptyDiffAfterCritique) => NextAction::EscalateModel,
+        Some(StopReason::NoProgress) => NextAction::EscalateModel,
         Some(StopReason::RepeatedVerifyFailure) => NextAction::RetryWithVerifyFailure,
         Some(StopReason::JudgeRejected) => NextAction::RetryWithJudgeCritique,
         Some(StopReason::ReplayVerifyFailed) => NextAction::HumanDecisionRequired,
@@ -641,7 +650,11 @@ pub fn should_try_next_model(res: &RunResult) -> bool {
     res.status == RunStatus::NotConverged
         && matches!(
             res.stop_reason,
-            Some(StopReason::EmptyDiffAfterCritique | StopReason::RepeatedVerifyFailure)
+            Some(
+                StopReason::EmptyDiffAfterCritique
+                    | StopReason::RepeatedVerifyFailure
+                    | StopReason::NoProgress
+            )
         )
 }
 
@@ -1227,6 +1240,8 @@ pub async fn run(
     };
     let mut reset_files: std::collections::BTreeSet<String> = Default::default();
     let mut prompt_est_tokens: Vec<u64> = Vec::new();
+    // Previous iteration's captured diff, for the no-progress bail (F3).
+    let mut prev_iter_diff: Option<String> = None;
 
     // Freeze untracked test files BEFORE the builder loop starts. These files
     // were created by hector but never committed. If we don't freeze them now,
@@ -1447,6 +1462,26 @@ pub async fn run(
         );
 
         let action = next_action(&state, &step, cfg.judge.policy);
+        // No-progress bail (F3): a retry that reproduced a BYTE-IDENTICAL diff
+        // will keep reproducing it — stop and escalate instead of burning the
+        // remaining iterations (same family as EmptyDiffAfterCritique). Never
+        // overrides Apply/Stop, only a would-be retry.
+        let action = if matches!(action, LoopAction::Continue { .. })
+            && !diff.trim().is_empty()
+            && prev_iter_diff.as_deref() == Some(diff.as_str())
+        {
+            eprintln!(
+                "bob: iteration {} produced a byte-identical diff to iteration {} — no progress, stopping",
+                state.index,
+                state.index - 1
+            );
+            LoopAction::Stop {
+                reason: StopReason::NoProgress,
+            }
+        } else {
+            action
+        };
+        prev_iter_diff = Some(diff.clone());
 
         // update streaks AFTER deciding
         if let StepOutcome::Judged {
@@ -3081,6 +3116,69 @@ mod flow_tests {
         assert_eq!(to["iter"], 0);
         assert_eq!(to["model"], "qwen-193");
         assert!(to["elapsed_secs"].is_u64(), "elapsed_secs recorded");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Writes the SAME content every call — models a builder that "retries" by
+    /// reproducing its rejected draft byte-for-byte (repro F3).
+    struct SameDiffBuilder;
+    impl Builder for SameDiffBuilder {
+        async fn build(&self, _p: &str, workdir: &Path) -> anyhow::Result<BuilderOutcome> {
+            std::fs::write(workdir.join("out.txt"), "the same change\n")?;
+            Ok(BuilderOutcome {
+                failure_kind: "ok".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    struct AlwaysFailJudge;
+    impl Judge for AlwaysFailJudge {
+        async fn judge(&self, _s: &str, _d: &str, _v: &str) -> anyhow::Result<JudgeOutcome> {
+            Ok(JudgeOutcome {
+                verdict: Verdict::Fail,
+                critique: "wrong approach".into(),
+            })
+        }
+    }
+
+    /// F3: a retry that reproduces a byte-identical diff stops with NoProgress
+    /// at the second iteration instead of burning max_iterations.
+    #[tokio::test]
+    async fn byte_identical_retry_diff_stops_with_no_progress() {
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("bob-noprogress-{}", std::process::id()));
+        init_repo_here(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let mut cfg = focused_test_cfg(vec!["true".into()], vec![], true);
+        cfg.judge.policy = crate::config::JudgePolicy::RetryOnFail;
+        cfg.loop_cfg.max_iterations = 6;
+        let opts = RunOpts {
+            spec: "do the thing".into(),
+            context_files: vec![],
+            apply: false,
+            keep_worktree: false,
+            run_id: "noprogress".into(),
+            editable_paths: vec![],
+            tier: None,
+            builder_model: None,
+        };
+        let res = run(&cfg, opts, &SameDiffBuilder, &AlwaysFailJudge)
+            .await
+            .unwrap();
+
+        std::env::set_current_dir(prev).unwrap();
+        // iter-0: judge fail → retry; iter-1: identical diff → NoProgress.
+        assert_eq!(res.status, RunStatus::NotConverged);
+        assert_eq!(res.stop_reason, Some(StopReason::NoProgress));
+        assert_eq!(res.iterations, 2, "must not burn the remaining iterations");
+        assert_eq!(res.next_action, NextAction::EscalateModel);
+        assert!(
+            should_try_next_model(&res),
+            "NoProgress joins the fallback-hop family"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
