@@ -61,6 +61,7 @@ pub fn run_gates(cmds: &[String], workdir: &Path) -> VerifyResult {
 ///      bob would "converge" on an empty diff having built nothing.
 ///   2. The gate ERRORS (command not found, bad flags) rather than failing tests →
 ///      it can never pass, so bob loops forever feeding the error back to the builder.
+///
 /// A normal test failure on base is EXPECTED (bob builds to turn it green) → no warning.
 /// Returns a warning message to surface, or None when the gate looks healthy.
 pub fn preflight_diagnose(cmds: &[String], workdir: &Path) -> Option<String> {

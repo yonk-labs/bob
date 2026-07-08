@@ -232,7 +232,8 @@ mod tests {
 
     #[test]
     fn fail_with_empty_disagreements_falls_back_to_take() {
-        let j = r#"{"verdict":"fail","take":"the diff duplicates the slow tests","disagreements":[]}"#;
+        let j =
+            r#"{"verdict":"fail","take":"the diff duplicates the slow tests","disagreements":[]}"#;
         let o = parse_abe_validate(j).unwrap();
         assert!(matches!(o.verdict, Verdict::Fail));
         assert_eq!(o.critique, "the diff duplicates the slow tests");

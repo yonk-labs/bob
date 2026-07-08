@@ -8,10 +8,7 @@ fn which(cmd: &str) -> bool {
             .map(|p| {
                 p.split(';')
                     .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        let stripped = if s.starts_with('.') { &s[1..] } else { s };
-                        stripped.to_string()
-                    })
+                    .map(|s| s.strip_prefix('.').unwrap_or(s).to_string())
                     .collect::<Vec<String>>()
             })
             .unwrap_or_default()
@@ -74,11 +71,7 @@ pub(crate) fn append_to_gitignore(dir: &std::path::Path, lines: &[&str]) -> std:
     let to_add: Vec<&str> = lines
         .iter()
         .copied()
-        .filter(|l| {
-            !existing
-                .lines()
-                .any(|e| e.trim() == l.trim())
-        })
+        .filter(|l| !existing.lines().any(|e| e.trim() == l.trim()))
         .collect();
     for line in to_add {
         new_text.push_str(line);
@@ -160,7 +153,9 @@ pub fn run(probe: bool) -> anyhow::Result<()> {
         println!("       Add `/.bob` to avoid test runner/module-map collisions.");
         println!("       Also exclude `.bob/**` in your test runner config (e.g. vitest");
         println!("       `--exclude '.bob/**'` or `exclude: ['.bob/**']` in vitest.config) —");
-        println!("       .gitignore alone won't stop it from picking up worktree copies of the suite.");
+        println!(
+            "       .gitignore alone won't stop it from picking up worktree copies of the suite."
+        );
     }
     if looks_like_js_repo(&cwd) && !gitignore_ignores_node_modules(&cwd) {
         println!("[warn] package.json present, but .gitignore does not ignore node_modules/");
@@ -172,7 +167,9 @@ pub fn run(probe: bool) -> anyhow::Result<()> {
                 println!("[ok] appended node_modules/ and package-lock.json to .gitignore");
             }
         } else {
-            println!("       Set BOB_DOCTOR_FIX=1 to auto-append, or add `node_modules/` manually.");
+            println!(
+                "       Set BOB_DOCTOR_FIX=1 to auto-append, or add `node_modules/` manually."
+            );
         }
     }
     if ok {
@@ -238,7 +235,12 @@ fn probe_targets(cfg: &crate::config::Config) -> Vec<ProbeTarget> {
             let api_key_env = models
                 .iter()
                 .find_map(|m| cfg.builder.entry_api_key_env(Some(m)));
-            ProbeTarget { base_url, models, tiers, api_key_env }
+            ProbeTarget {
+                base_url,
+                models,
+                tiers,
+                api_key_env,
+            }
         })
         .collect()
 }
@@ -265,6 +267,21 @@ fn classify(http_code: &str) -> ProbeStatus {
     }
 }
 
+/// Attach `Authorization: Bearer <token>` to a curl command via a 0600 header
+/// file (`-H @file`) so the secret never appears on the argv (B20 — `ps` on a
+/// shared host shows every argument). Returns the guard the caller must hold
+/// until the command has run; dropping it deletes the file. If the file can't
+/// be created, the probe goes out unauthenticated (a 401 beats a leaked key).
+fn attach_bearer(
+    cmd: &mut std::process::Command,
+    bearer: Option<&str>,
+) -> Option<crate::safety::BearerHeaderFile> {
+    let token = bearer.filter(|t| !t.is_empty())?;
+    let header = crate::safety::BearerHeaderFile::new(token).ok()?;
+    cmd.args(header.curl_args());
+    Some(header)
+}
+
 /// Pre-spawn endpoint liveness probe (engine, before each builder attempt):
 /// GET {base_url}/models with a 5s timeout, `bearer` attached when the attempt
 /// resolved an API key. Auth-aware like `bob doctor --probe`: 2xx AND 401/403
@@ -276,11 +293,7 @@ fn classify(http_code: &str) -> ProbeStatus {
 pub fn endpoint_alive(base_url: &str, bearer: Option<&str>) -> bool {
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}"]);
-    if let Some(token) = bearer {
-        if !token.is_empty() {
-            cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
-        }
-    }
+    let _header = attach_bearer(&mut cmd, bearer);
     cmd.arg(format!("{}/models", base_url.trim_end_matches('/')));
     match cmd.output() {
         Ok(out) if out.status.success() || !out.stdout.is_empty() => {
@@ -309,11 +322,7 @@ pub fn endpoint_running_request(base_url: &str, bearer: Option<&str>) -> Option<
         .trim_end_matches('/');
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-s", "-m", "3"]);
-    if let Some(token) = bearer {
-        if !token.is_empty() {
-            cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
-        }
-    }
+    let _header = attach_bearer(&mut cmd, bearer);
     cmd.arg(format!("{host}/metrics"));
     let out = cmd.output().ok()?;
     if !out.status.success() {
@@ -375,13 +384,11 @@ fn run_probes(
 fn curl_probe(target: &ProbeTarget) -> ProbeStatus {
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-s", "-m", "3", "-o", "/dev/null", "-w", "%{http_code}"]);
-    if let Some(env_var) = &target.api_key_env {
-        if let Ok(token) = std::env::var(env_var) {
-            if !token.is_empty() {
-                cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
-            }
-        }
-    }
+    let token = target
+        .api_key_env
+        .as_ref()
+        .and_then(|env_var| std::env::var(env_var).ok());
+    let _header = attach_bearer(&mut cmd, token.as_deref());
     cmd.arg(format!("{}/models", target.base_url.trim_end_matches('/')));
     match cmd.output() {
         Ok(out) if out.status.success() || !out.stdout.is_empty() => {
@@ -407,12 +414,18 @@ fn print_probe_results(results: &[ProbeResult]) -> bool {
     for r in results {
         match r.status {
             ProbeStatus::Alive => {
-                println!("[ok] endpoint {} alive ({})", r.target.base_url, r.target.describe());
+                println!(
+                    "[ok] endpoint {} alive ({})",
+                    r.target.base_url,
+                    r.target.describe()
+                );
             }
             ProbeStatus::NeedsAuth => {
                 let hint = match &r.target.api_key_env {
                     Some(env_var) => {
-                        let set = std::env::var(env_var).map(|v| !v.is_empty()).unwrap_or(false);
+                        let set = std::env::var(env_var)
+                            .map(|v| !v.is_empty())
+                            .unwrap_or(false);
                         if set {
                             format!("(${env_var} rejected — check the key)")
                         } else {
@@ -446,14 +459,39 @@ mod tests {
     use super::*;
 
     fn tmp() -> std::path::PathBuf {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // Atomic counter, not the clock: parallel tests on the same tick used to
+        // collide on one dir and delete each other's fixtures mid-run.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("bob-doctor-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn probe_argv_never_contains_bearer_token() {
+        // B20: the token rides a header FILE, so the curl argv carries only
+        // `-H @<path>` — nothing `ps` could read the key from.
+        let mut cmd = std::process::Command::new("curl");
+        let guard = attach_bearer(&mut cmd, Some("sk-VERYSECRETVERYSECRETVERYSECRET"));
+        assert!(guard.is_some());
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter().all(|a| !a.contains("VERYSECRET")),
+            "token leaked onto curl argv: {args:?}"
+        );
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "-H" && w[1].starts_with('@')));
+        // empty/absent token attaches nothing
+        let mut bare = std::process::Command::new("curl");
+        assert!(attach_bearer(&mut bare, Some("")).is_none());
+        assert!(attach_bearer(&mut bare, None).is_none());
+        assert_eq!(bare.get_args().count(), 0);
     }
 
     #[test]
@@ -486,7 +524,10 @@ vllm:num_requests_running{model_name=\"b\"} 2.0
     #[test]
     fn endpoint_running_request_is_none_for_a_dead_endpoint() {
         // No /metrics reachable → None (unobservable), never Some(false).
-        assert_eq!(endpoint_running_request("http://127.0.0.1:1/v1", None), None);
+        assert_eq!(
+            endpoint_running_request("http://127.0.0.1:1/v1", None),
+            None
+        );
     }
 
     #[test]
@@ -566,8 +607,15 @@ judge:
         );
         let mut targets = probe_targets(&cfg);
         targets.sort_by(|a, b| a.base_url.cmp(&b.base_url));
-        assert_eq!(targets.len(), 2, "same base_url must be deduped into one target");
-        let host = targets.iter().find(|t| t.base_url == "http://host:8000/v1").unwrap();
+        assert_eq!(
+            targets.len(),
+            2,
+            "same base_url must be deduped into one target"
+        );
+        let host = targets
+            .iter()
+            .find(|t| t.base_url == "http://host:8000/v1")
+            .unwrap();
         assert_eq!(host.models, vec!["qwen", "qwen-alt"]);
         assert_eq!(host.api_key_env, None);
         let cloud = targets
@@ -577,7 +625,9 @@ judge:
         assert_eq!(cloud.models, vec!["cloud"]);
         assert_eq!(cloud.api_key_env.as_deref(), Some("MINIMAX_API_KEY"));
         // "legacy" has no explicit base_url — never guessed, never probed.
-        assert!(targets.iter().all(|t| !t.models.contains(&"legacy".to_string())));
+        assert!(targets
+            .iter()
+            .all(|t| !t.models.contains(&"legacy".to_string())));
     }
 
     #[test]
@@ -631,11 +681,19 @@ judge:
             }
         });
         assert_eq!(
-            results.iter().find(|r| r.target.base_url.contains("alive")).unwrap().status,
+            results
+                .iter()
+                .find(|r| r.target.base_url.contains("alive"))
+                .unwrap()
+                .status,
             ProbeStatus::Alive
         );
         assert_eq!(
-            results.iter().find(|r| r.target.base_url.contains("dead")).unwrap().status,
+            results
+                .iter()
+                .find(|r| r.target.base_url.contains("dead"))
+                .unwrap()
+                .status,
             ProbeStatus::Unreachable
         );
     }

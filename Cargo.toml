@@ -1,6 +1,6 @@
 [package]
 name = "bob"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Autonomous build-verify-judge loop over opencode + abe"
 license = "Apache-2.0"
@@ -21,5 +21,6 @@ rmcp = { version = "0.16", features = ["server", "macros", "transport-io"] }
 schemars = "0.8"
 libc = "0.2"
 
+# In the Route monorepo this lives at the workspace root; standalone builds need it here.
 [profile.release]
 strip = true

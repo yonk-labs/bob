@@ -8,7 +8,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::Duration;
 
 /// Local vLLM endpoint base (`.../v1`) from `BOB_VLLM_URL`, normalized so
 /// common typos still work (missing scheme, trailing slash, missing `/v1`).
@@ -65,11 +64,6 @@ impl ModelStats {
         }
     }
 
-    /// Higher = better. Balanced reliability × speed (weight 0.5).
-    pub fn score(&self) -> f64 {
-        self.score_weighted(0.5)
-    }
-
     /// Ranking score with a tunable reliability/speed bias.
     /// `weight` in [0,1]: 0.0 = pure speed, 0.5 = balanced (= reliability × speed,
     /// the historical formula), 1.0 = pure reliability. Implemented as
@@ -79,19 +73,6 @@ impl ModelStats {
         let reliability = self.success_rate();
         let speed = 1.0 / self.avg_latency_secs.max(1.0);
         reliability.powf(2.0 * w) * speed.powf(2.0 * (1.0 - w)) * 100.0
-    }
-
-    /// Adaptive timeout: 2× historical avg, clamped to [30s, 180s].
-    /// A model that usually takes 40s gets killed at 80s, not 180s.
-    pub fn adaptive_timeout(&self) -> Duration {
-        let timeout = (self.avg_latency_secs * 2.0).max(30.0).min(180.0);
-        Duration::from_secs(timeout as u64)
-    }
-
-    /// Should we pivot to another model? True if elapsed exceeds 1.5× the
-    /// adaptive timeout (model is stuck well beyond its normal range).
-    pub fn should_pivot(&self, elapsed: Duration) -> bool {
-        elapsed.as_secs_f64() > self.avg_latency_secs * 1.5
     }
 
     pub fn record(&mut self, latency_secs: f64, success: bool) {
@@ -168,6 +149,7 @@ impl StatsStore {
         }
         let lock = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false) // lock file: only its existence matters
             .write(true)
             .open(path.with_extension("lock"))
             .ok();
@@ -180,12 +162,8 @@ impl StatsStore {
         // Lock releases when `lock` (the open File) drops here.
     }
 
-    /// Rank models by score (best first). Models with no history get neutral score.
-    pub fn rank(&self, models: &[String]) -> Vec<String> {
-        self.rank_weighted(models, 0.5)
-    }
-
     /// Rank models best-first by `score_weighted(weight)`.
+    /// Models with no history get a neutral score.
     pub fn rank_weighted(&self, models: &[String], weight: f64) -> Vec<String> {
         let mut scored: Vec<(String, f64)> = models
             .iter()
@@ -220,7 +198,16 @@ impl StatsStore {
 
     fn curl_health(url: &str) -> bool {
         let result = std::process::Command::new("curl")
-            .args(["-s", "--max-time", "3", "-o", "/dev/null", "-w", "%{http_code}", url])
+            .args([
+                "-s",
+                "--max-time",
+                "3",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                url,
+            ])
             .output();
         match result {
             Ok(out) => {
@@ -238,8 +225,10 @@ impl StatsStore {
             return;
         }
         if (weight - 0.5).abs() > f64::EPSILON {
-            println!("(reliability_weight = {weight:.2}: scores biased toward {})",
-                if weight > 0.5 { "reliability" } else { "speed" });
+            println!(
+                "(reliability_weight = {weight:.2}: scores biased toward {})",
+                if weight > 0.5 { "reliability" } else { "speed" }
+            );
         }
         println!(
             "{:<45} {:>5} {:>6} {:>8} {:>8} {:>6}",
@@ -288,32 +277,47 @@ mod tests {
 
     #[test]
     fn score_balances_speed_and_reliability() {
-        let fast_reliable = ModelStats { runs: 10, successes: 10, avg_latency_secs: 20.0, ..Default::default() };
-        let slow_reliable = ModelStats { runs: 10, successes: 10, avg_latency_secs: 120.0, ..Default::default() };
-        let fast_unreliable = ModelStats { runs: 10, successes: 3, avg_latency_secs: 20.0, ..Default::default() };
-        assert!(fast_reliable.score() > slow_reliable.score());
-        assert!(fast_reliable.score() > fast_unreliable.score());
+        let fast_reliable = ModelStats {
+            runs: 10,
+            successes: 10,
+            avg_latency_secs: 20.0,
+            ..Default::default()
+        };
+        let slow_reliable = ModelStats {
+            runs: 10,
+            successes: 10,
+            avg_latency_secs: 120.0,
+            ..Default::default()
+        };
+        let fast_unreliable = ModelStats {
+            runs: 10,
+            successes: 3,
+            avg_latency_secs: 20.0,
+            ..Default::default()
+        };
+        assert!(fast_reliable.score_weighted(0.5) > slow_reliable.score_weighted(0.5));
+        assert!(fast_reliable.score_weighted(0.5) > fast_unreliable.score_weighted(0.5));
     }
 
     #[test]
     fn reliability_weight_steers_ranking() {
         // fast-but-flaky (90% would be... here 50%, 10s) vs slow-but-solid (100%, 60s)
-        let flaky_fast = ModelStats { runs: 10, successes: 5, avg_latency_secs: 10.0, ..Default::default() };
-        let solid_slow = ModelStats { runs: 10, successes: 10, avg_latency_secs: 60.0, ..Default::default() };
-        // weight 0.5 = exactly the old balanced score (no behavior change by default)
-        assert!((flaky_fast.score_weighted(0.5) - flaky_fast.score()).abs() < 1e-9);
+        let flaky_fast = ModelStats {
+            runs: 10,
+            successes: 5,
+            avg_latency_secs: 10.0,
+            ..Default::default()
+        };
+        let solid_slow = ModelStats {
+            runs: 10,
+            successes: 10,
+            avg_latency_secs: 60.0,
+            ..Default::default()
+        };
         // bias to speed -> the fast model wins
         assert!(flaky_fast.score_weighted(0.0) > solid_slow.score_weighted(0.0));
         // bias to reliability -> the solid model wins
         assert!(solid_slow.score_weighted(1.0) > flaky_fast.score_weighted(1.0));
-    }
-
-    #[test]
-    fn adaptive_timeout_uses_history() {
-        let fast = ModelStats { runs: 5, successes: 5, avg_latency_secs: 20.0, ..Default::default() };
-        let slow = ModelStats { runs: 5, successes: 5, avg_latency_secs: 90.0, ..Default::default() };
-        assert_eq!(fast.adaptive_timeout(), Duration::from_secs(40)); // 20*2
-        assert_eq!(slow.adaptive_timeout(), Duration::from_secs(180)); // 90*2 = 180, clamped
     }
 
     #[test]
@@ -323,18 +327,27 @@ mod tests {
         store.record("fast", 20.0, true);
         store.record("slow", 100.0, true);
         store.record("slow", 100.0, true);
-        let ranked = store.rank(&["slow".into(), "fast".into()]);
+        let ranked = store.rank_weighted(&["slow".into(), "fast".into()], 0.5);
         assert_eq!(ranked[0], "fast");
     }
 
     #[test]
     fn normalize_vllm_url_fixes_common_typos() {
         // missing scheme
-        assert_eq!(normalize_vllm_url("192.168.1.50:8000/v1"), "http://192.168.1.50:8000/v1");
+        assert_eq!(
+            normalize_vllm_url("192.168.1.50:8000/v1"),
+            "http://192.168.1.50:8000/v1"
+        );
         // missing /v1 suffix
-        assert_eq!(normalize_vllm_url("http://host:8000"), "http://host:8000/v1");
+        assert_eq!(
+            normalize_vllm_url("http://host:8000"),
+            "http://host:8000/v1"
+        );
         // trailing slash
-        assert_eq!(normalize_vllm_url("http://host:8000/v1/"), "http://host:8000/v1");
+        assert_eq!(
+            normalize_vllm_url("http://host:8000/v1/"),
+            "http://host:8000/v1"
+        );
         // missing scheme AND /v1
         assert_eq!(normalize_vllm_url("host:8000"), "http://host:8000/v1");
         // https preserved, already correct
@@ -359,12 +372,5 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(loaded.get("m1").runs, 2);
         assert_eq!(loaded.get("m1").successes, 2);
-    }
-
-    #[test]
-    fn should_pivot_when_beyond_normal_range() {
-        let stats = ModelStats { runs: 5, successes: 5, avg_latency_secs: 30.0, ..Default::default() };
-        assert!(!stats.should_pivot(Duration::from_secs(30)));
-        assert!(stats.should_pivot(Duration::from_secs(50))); // > 30*1.5=45
     }
 }

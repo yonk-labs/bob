@@ -12,6 +12,9 @@ pub struct Cli {
     pub command: Command,
 }
 
+// One instance of this enum ever exists (parsed argv) — the size skew
+// between variants is irrelevant, and boxing fields fights clap's derive.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum Command {
     /// Run the build-verify-judge loop on a task/spec.
@@ -120,7 +123,5 @@ pub enum Command {
     },
     /// Replay-verify a past run, then apply its final_diff to the working tree.
     /// Refuses if HEAD has moved off the run's base_sha.
-    Apply {
-        run_id: String,
-    },
+    Apply { run_id: String },
 }

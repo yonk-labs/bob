@@ -133,20 +133,48 @@ fn bob_branches(repo: &Path) -> anyhow::Result<Vec<String>> {
 /// it to avoid reclaiming a worktree whose build is still in flight.
 fn worktree_pidfile(worktree: &Path) -> Option<PathBuf> {
     let name = worktree.file_name()?;
-    Some(worktree.parent()?.join(format!("{}.pid", name.to_string_lossy())))
+    Some(
+        worktree
+            .parent()?
+            .join(format!("{}.pid", name.to_string_lossy())),
+    )
+}
+
+/// Is `pid` a live process? Linux: `/proc/<pid>` (cheap, no signal perms
+/// needed). Other unix (macOS): `kill(pid, 0)` with `Ok`/`EPERM` = alive,
+/// `ESRCH` = dead — the same probe reap_orphans uses.
+/// On PID reuse the worst case is gc SKIPPING a stale worktree (safe, leaves
+/// cruft) rather than deleting a live one — deliberately biased that way.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // A pid that can't fit a positive i32 can't exist — and must never
+        // reach kill(): u32::MAX would wrap to -1, probing EVERY process.
+        let Ok(p) = i32::try_from(pid) else {
+            return false;
+        };
+        if p <= 0 {
+            return false;
+        }
+        if unsafe { libc::kill(p, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
 }
 
 /// Is the build process that owns `worktree` still running? Reads the sibling
-/// pidfile and checks `/proc/<pid>`.
-/// ponytail: Linux-only /proc check (bob already assumes it — opencode sandbox).
-/// On PID reuse the worst case is gc SKIPPING a stale worktree (safe, leaves
-/// cruft) rather than deleting a live one — deliberately biased that way.
+/// pidfile and checks [`pid_alive`].
 fn worktree_owner_alive(worktree: &Path) -> bool {
     worktree_pidfile(worktree)
         .filter(|p| p.exists())
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| s.trim().parse::<u32>().ok())
-        .is_some_and(|pid| Path::new("/proc").join(pid.to_string()).exists())
+        .is_some_and(pid_alive)
 }
 
 pub fn gc(dry_run: bool) -> anyhow::Result<GcReport> {
@@ -155,8 +183,9 @@ pub fn gc(dry_run: bool) -> anyhow::Result<GcReport> {
     // DURING a live `--jobs N` campaign must not force-remove in-flight peers (it
     // would delete their worktree + branch wholesale). Partition first, act only
     // on the dead-owner ones.
-    let (live, worktrees): (Vec<PathBuf>, Vec<PathBuf>) =
-        bob_worktrees(&repo)?.into_iter().partition(|p| worktree_owner_alive(p));
+    let (live, worktrees): (Vec<PathBuf>, Vec<PathBuf>) = bob_worktrees(&repo)?
+        .into_iter()
+        .partition(|p| worktree_owner_alive(p));
     let live_ids: std::collections::HashSet<String> = live
         .iter()
         .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
@@ -171,7 +200,10 @@ pub fn gc(dry_run: bool) -> anyhow::Result<GcReport> {
         eprintln!(
             "bob gc: skipping {} in-use worktree(s) with a live build: {}",
             live.len(),
-            live.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            live.iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 
@@ -339,15 +371,55 @@ impl Workspace {
         &self.base_sha
     }
 
+    /// Stage all worktree changes (incl. untracked) for diff/commit, with two
+    /// exclusion families:
+    /// - NEVER the repo's `.bob/` tree (where sibling build worktrees live).
+    ///   The `,top` anchors the exclude at the repo root, so even if this
+    ///   worktree's git resolution has fallen back to the MAIN repo — e.g. its
+    ///   registration was pruned by a concurrent build — `git add -A` cannot
+    ///   stage another build's files or pollute the main index (bug #20 / #21).
+    /// - NEVER well-known build/gate artifacts (`target/`, `__pycache__/`, …).
+    ///   Running the verify gates CREATES these in the worktree; without a
+    ///   .gitignore in the user's repo they were attributed to the model's
+    ///   diff — blowing scope limits (false ScopeExceeded) and bloating
+    ///   `changed_files`/envelopes to tens of KB (live find: a failure
+    ///   envelope carrying 179 cargo `target/` paths). These dirs are gate
+    ///   artifacts by convention and never legitimate model deliverables;
+    ///   capture_diff and commit_candidate MUST share the list, or excluded
+    ///   junk could still ride the candidate commit into main.
+    fn stage_all(&self) -> anyhow::Result<()> {
+        const GATE_ARTIFACT_DIRS: [&str; 6] = [
+            "target", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv",
+        ];
+        // Lockfiles the gate itself generates (`cargo test` writes Cargo.lock).
+        // Excluded ONLY when untracked at base: a tracked lockfile's legitimate
+        // update must keep flowing through diff/commit — but a gate-created one
+        // in a repo that doesn't track it is scope-blowing junk (live find:
+        // rs-csv/rs-duration ScopeExceeded on a 7-line "@generated" Cargo.lock,
+        // while a sibling accept silently committed the same junk).
+        const GATE_LOCKFILES: [&str; 4] =
+            ["Cargo.lock", "package-lock.json", "uv.lock", "poetry.lock"];
+        let mut args: Vec<String> =
+            vec!["add".into(), "-A".into(), "--".into(), ".".into(), ":(exclude,top).bob".into()];
+        args.extend(
+            GATE_ARTIFACT_DIRS
+                .iter()
+                .map(|d| format!(":(exclude,glob)**/{d}/**")),
+        );
+        for lf in GATE_LOCKFILES {
+            let tracked = git(&["ls-files", "--error-unmatch", lf], &self.dir).is_ok();
+            if !tracked {
+                args.push(format!(":(exclude,glob)**/{lf}"));
+            }
+        }
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        git(&argv, &self.dir)?;
+        Ok(())
+    }
+
     /// Diff of all changes in the worktree vs base, including untracked files.
     pub fn capture_diff(&self) -> anyhow::Result<String> {
-        // Stage all worktree changes (incl. untracked) but NEVER the repo's
-        // `.bob/` tree (where sibling build worktrees live). The `,top` anchors
-        // the exclude at the repo root, so even if this worktree's git
-        // resolution has fallen back to the MAIN repo — e.g. its registration
-        // was pruned by a concurrent build — `git add -A` cannot stage another
-        // build's files or pollute the main index (bug #20 / #21).
-        git(&["add", "-A", "--", ".", ":(exclude,top).bob"], &self.dir)?;
+        self.stage_all()?;
         git_stdout(
             &["diff", "--cached", "--no-renames", &self.base_sha],
             &self.dir,
@@ -355,9 +427,7 @@ impl Workspace {
     }
 
     pub fn commit_candidate(&self, msg: &str) -> anyhow::Result<()> {
-        // Exclude `.bob/` for the same reason as capture_diff — a candidate
-        // commit must never absorb sibling build worktrees (bug #20 / #21).
-        git(&["add", "-A", "--", ".", ":(exclude,top).bob"], &self.dir)?;
+        self.stage_all()?;
         // allow empty so callers don't have to special-case no-op
         git(&["commit", "-q", "--allow-empty", "-m", msg], &self.dir)?;
         Ok(())
@@ -628,20 +698,37 @@ mod tests {
 
         let ws = Workspace::create("gc-live", &[]).unwrap();
         let report = gc(false).unwrap();
-        assert!(ws.path().exists(), "gc must not remove a worktree with a live owner");
         assert!(
-            !report.worktrees.iter().any(|p| p.ends_with(".bob/worktrees/gc-live")),
+            ws.path().exists(),
+            "gc must not remove a worktree with a live owner"
+        );
+        assert!(
+            !report
+                .worktrees
+                .iter()
+                .any(|p| p.ends_with(".bob/worktrees/gc-live")),
             "live worktree must not be reported as reclaimed"
         );
         let branches = git(&["branch", "--format=%(refname:short)"], &tmp).unwrap();
-        assert!(branches.lines().any(|b| b == "bob/gc-live"), "live branch must survive");
+        assert!(
+            branches.lines().any(|b| b == "bob/gc-live"),
+            "live branch must survive"
+        );
 
         ws.cleanup().unwrap();
         std::env::set_current_dir(prev).unwrap();
     }
 
     fn sh(cmd: &str, cwd: &Path) {
-        assert!(Command::new("sh").args(["-c", cmd]).current_dir(cwd).status().unwrap().success(), "{cmd}");
+        assert!(
+            Command::new("sh")
+                .args(["-c", cmd])
+                .current_dir(cwd)
+                .status()
+                .unwrap()
+                .success(),
+            "{cmd}"
+        );
     }
 
     #[test]
@@ -651,13 +738,34 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         sh("git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", &tmp);
         std::fs::write(tmp.join("a.txt"), "one\n").unwrap();
-        sh("git add -A && git -c user.email=t@t -c user.name=t commit -q -m base", &tmp);
-        let base = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&tmp).output().unwrap().stdout).unwrap().trim().to_string();
+        sh(
+            "git add -A && git -c user.email=t@t -c user.name=t commit -q -m base",
+            &tmp,
+        );
+        let base = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
         // build a diff: modify a.txt and add b.txt
         std::fs::write(tmp.join("a.txt"), "two\n").unwrap();
         std::fs::write(tmp.join("b.txt"), "new\n").unwrap();
         sh("git add -A", &tmp);
-        let diff = String::from_utf8(Command::new("git").args(["diff", "--cached", "--no-renames", &base]).current_dir(&tmp).output().unwrap().stdout).unwrap();
+        let diff = String::from_utf8(
+            Command::new("git")
+                .args(["diff", "--cached", "--no-renames", &base])
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
         sh("git reset -q --hard && git clean -qfd", &tmp);
 
         // gate that only passes if BOTH the modification and the new file landed
@@ -666,7 +774,8 @@ mod tests {
         assert!(vr.passed);
 
         // a gate that fails is reported as failed, not as an error
-        let vr = replay_verify_at_with_setup(&tmp, &base, "t2", &diff, &["false".to_string()], &[]).unwrap();
+        let vr = replay_verify_at_with_setup(&tmp, &base, "t2", &diff, &["false".to_string()], &[])
+            .unwrap();
         assert!(!vr.passed);
 
         // garbage diff is an error
@@ -723,7 +832,10 @@ mod tests {
         // No leaked artifacts: the fresh worktree and its bob/<run_id> branch
         // are removed (a checkout that never ran a builder has no value).
         assert!(
-            !tmp.join(".bob").join("worktrees").join("setup-fail").exists(),
+            !tmp.join(".bob")
+                .join("worktrees")
+                .join("setup-fail")
+                .exists(),
             "worktree removed on setup failure"
         );
         let branches = Command::new("git")
@@ -746,11 +858,32 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         sh("git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", &tmp);
         std::fs::write(tmp.join("a.txt"), "one\n").unwrap();
-        sh("git add -A && git -c user.email=t@t -c user.name=t commit -q -m base", &tmp);
-        let base = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&tmp).output().unwrap().stdout).unwrap().trim().to_string();
+        sh(
+            "git add -A && git -c user.email=t@t -c user.name=t commit -q -m base",
+            &tmp,
+        );
+        let base = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
         std::fs::write(tmp.join("a.txt"), "two\n").unwrap();
         sh("git add -A", &tmp);
-        let diff = String::from_utf8(Command::new("git").args(["diff", "--cached", "--no-renames", &base]).current_dir(&tmp).output().unwrap().stdout).unwrap();
+        let diff = String::from_utf8(
+            Command::new("git")
+                .args(["diff", "--cached", "--no-renames", &base])
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
         sh("git reset -q --hard && git clean -qfd", &tmp);
 
         // The gate checks BOTH the diff landed AND the file the setup cmd created —
@@ -758,9 +891,76 @@ mod tests {
         let setup_cmds = vec!["echo ready > setup-marker.txt".to_string()];
         let cmds = vec!["grep -q two a.txt && test -f setup-marker.txt".to_string()];
         let vr = replay_verify_at_with_setup(&tmp, &base, "s1", &diff, &cmds, &setup_cmds).unwrap();
-        assert!(vr.passed, "gate sees the file the setup cmd created: {}", vr.output);
+        assert!(
+            vr.passed,
+            "gate sees the file the setup cmd created: {}",
+            vr.output
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn capture_diff_excludes_gate_artifacts() {
+        // Live find (bench v1 + v3 audit): running the verify gates CREATES
+        // build junk in the worktree — cargo `target/`, `__pycache__`, venvs.
+        // In repos without a .gitignore that junk was attributed to the
+        // model's diff: false ScopeExceeded (a failure envelope carried 179
+        // cargo target/ paths, 47KB) and polluted changed_files.
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir_unique();
+        init_repo(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let ws = Workspace::create("bldJunk", &[]).unwrap();
+        std::fs::write(ws.path().join("real.py"), "x = 1\n").unwrap();
+        std::fs::create_dir_all(ws.path().join("target/debug")).unwrap();
+        std::fs::write(ws.path().join("target/debug/junk.bin"), "j").unwrap();
+        std::fs::create_dir_all(ws.path().join("sub/__pycache__")).unwrap();
+        std::fs::write(ws.path().join("sub/__pycache__/m.pyc"), "j").unwrap();
+
+        // Gate-created lockfile (untracked at base) must be excluded too —
+        // the dir list missed it: rs-csv/rs-duration ScopeExceeded on a
+        // cargo-@generated Cargo.lock.
+        std::fs::write(ws.path().join("Cargo.lock"), "# @generated\n").unwrap();
+
+        let diff = ws.capture_diff().unwrap();
+        let _ = ws.cleanup();
+        std::env::set_current_dir(prev).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(diff.contains("real.py"), "real change missing: {diff}");
+        assert!(!diff.contains("target/debug"), "gate junk leaked: {diff}");
+        assert!(!diff.contains("__pycache__"), "gate junk leaked: {diff}");
+        assert!(!diff.contains("Cargo.lock"), "gate lockfile leaked: {diff}");
+    }
+
+    #[test]
+    fn tracked_lockfile_updates_still_flow_through() {
+        // The lockfile exclusion is conditional: a repo that TRACKS its
+        // Cargo.lock must see legitimate lock updates in the candidate diff.
+        let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir_unique();
+        init_repo(&tmp);
+        std::fs::write(tmp.join("Cargo.lock"), "version = 1\n").unwrap();
+        sh("git add -A", &tmp);
+        sh("git -c user.name=t -c user.email=t@t commit -qm lock", &tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let ws = Workspace::create("bldLock", &[]).unwrap();
+        std::fs::write(ws.path().join("Cargo.lock"), "version = 2\n").unwrap();
+
+        let diff = ws.capture_diff().unwrap();
+        let _ = ws.cleanup();
+        std::env::set_current_dir(prev).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            diff.contains("Cargo.lock"),
+            "tracked lockfile update must not be excluded: {diff}"
+        );
     }
 
     #[test]
@@ -829,7 +1029,11 @@ mod tests {
         std::fs::write(tmp.join(".gitignore"), "/.bob\n").unwrap();
         {
             let run = |args: &[&str]| {
-                Command::new("git").args(args).current_dir(&tmp).output().unwrap();
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&tmp)
+                    .output()
+                    .unwrap();
             };
             run(&["add", ".gitignore"]);
             run(&["commit", "-qm", "gitignore .bob"]);
@@ -890,20 +1094,38 @@ mod tests {
 
     #[test]
     fn replay_verify_at_with_setup_cmd_failure_is_infra_error_not_a_failed_gate() {
-        let tmp = std::env::temp_dir().join(format!("bob-replay-setup-fail-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("bob-replay-setup-fail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         sh("git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", &tmp);
         std::fs::write(tmp.join("a.txt"), "one\n").unwrap();
-        sh("git add -A && git -c user.email=t@t -c user.name=t commit -q -m base", &tmp);
-        let base = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&tmp).output().unwrap().stdout).unwrap().trim().to_string();
+        sh(
+            "git add -A && git -c user.email=t@t -c user.name=t commit -q -m base",
+            &tmp,
+        );
+        let base = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&tmp)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
 
         let setup_cmds = vec!["echo setup-boom 1>&2 && exit 9".to_string()];
         // A gate that would pass, to prove the failure is the setup cmd's, not the gate's.
         let cmds = vec!["true".to_string()];
-        let err = replay_verify_at_with_setup(&tmp, &base, "s2", "", &cmds, &setup_cmds).unwrap_err();
+        let err =
+            replay_verify_at_with_setup(&tmp, &base, "s2", "", &cmds, &setup_cmds).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("setup-boom"), "error surfaces setup cmd stderr: {msg}");
+        assert!(
+            msg.contains("setup-boom"),
+            "error surfaces setup cmd stderr: {msg}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

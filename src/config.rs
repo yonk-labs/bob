@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub builder: BuilderCfg,
+    /// Absent (or `cmd: ""`) = no inner judge: verify is the sole authority
+    /// and judge steps resolve as JudgeUnavailable (advisory/retry_on_fail
+    /// apply on green; blocking stops).
+    #[serde(default)]
     pub judge: JudgeCfg,
     #[serde(default)]
     pub verify: VerifyCfg,
@@ -40,10 +44,6 @@ pub struct BuilderCfg {
     /// thin/goose builders reach an endpoint without the hardcoded prefix guess.
     #[serde(default)]
     pub models: BTreeMap<String, ModelDef>,
-    /// Ordered fallback model names/raw ids to try when the selected model stalls or errors.
-    #[deprecated(note = "Use `tiers` and `escalation_policy: tier` instead")]
-    #[serde(default)]
-    pub fallback_models: Vec<String>,
     /// Tiered model assignment. Models within a tier are tried in order (ranked
     /// by model_stats); when a tier fails entirely, escalation moves to the next tier.
     ///
@@ -52,9 +52,11 @@ pub struct BuilderCfg {
     #[serde(default)]
     pub tiers: TierCfg,
     /// How to escalate when the current model/tier fails:
-    ///   "tier"   — exhaust all models in tier, then move to next tier (recommended)
-    ///   "model"  — try each next model in order across all tiers (legacy behavior)
-    ///   "none"   — try only the selected model, no escalation
+    ///   "tier"   — exhaust all models in tier, then move to next tier (default)
+    ///   "model"  — legacy alias; same chain as "tier"
+    ///   "none"   — never leave the slice's tier: its models are still tried in
+    ///              ranked order, but a tier failure stops instead of escalating
+    ///              (cost safety — a cheap slice can't wander into paid tiers)
     #[serde(default = "default_escalation_policy")]
     pub escalation_policy: String,
     /// Extra builder flags before the prompt, e.g. ["--variant", "high"].
@@ -105,8 +107,6 @@ struct BuilderCfgRaw {
     #[serde(default)]
     models: BTreeMap<String, ModelDef>,
     #[serde(default)]
-    fallback_models: Vec<String>,
-    #[serde(default)]
     tiers: TierCfg,
     #[serde(default = "default_escalation_policy")]
     escalation_policy: String,
@@ -133,13 +133,11 @@ impl TryFrom<BuilderCfgRaw> for BuilderCfg {
             None if raw.tiers.any_configured() => "goose".to_string(),
             None => return Err("missing field `cmd`".to_string()),
         };
-        #[allow(deprecated)]
         Ok(BuilderCfg {
             cmd,
             timeout_secs: raw.timeout_secs,
             model: raw.model,
             models: raw.models,
-            fallback_models: raw.fallback_models,
             tiers: raw.tiers,
             escalation_policy: raw.escalation_policy,
             args: raw.args,
@@ -172,6 +170,11 @@ pub enum ModelDef {
         base_url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_key_env: Option<String>,
+        /// Per-model completion cap (thin builder request `max_tokens`).
+        /// Unset → the builder default (65536). Reasoning models spend
+        /// output budget thinking before emitting content — size for both.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<u32>,
     },
 }
 
@@ -333,6 +336,15 @@ impl BuilderCfg {
         }
     }
 
+    /// Per-model completion cap for a listed Full-form model. `None` → the
+    /// builder default applies.
+    pub fn entry_max_tokens(&self, sel: Option<&str>) -> Option<u32> {
+        match self.entry(sel)? {
+            ModelDef::Full { max_tokens, .. } => *max_tokens,
+            ModelDef::Id(_) => None,
+        }
+    }
+
     /// The bare API model id for a listed Full-form model (no provider prefix to
     /// strip). `None` for the legacy string form → caller uses extract_model_name.
     pub fn entry_api_model(&self, sel: Option<&str>) -> Option<String> {
@@ -354,30 +366,11 @@ impl BuilderCfg {
         out
     }
 
-    pub fn model_sequence(
-        &self,
-        override_sel: Option<&str>,
-        override_fallbacks: &[String],
-    ) -> Vec<Option<String>> {
-        let mut out = vec![override_sel
-            .map(str::to_string)
-            .or_else(|| self.model.clone())];
-        let fallbacks = if override_fallbacks.is_empty() {
-            &self.fallback_models
-        } else {
-            override_fallbacks
-        };
-        out.extend(fallbacks.iter().cloned().map(Some));
-        out.dedup();
-        out
-    }
-
     pub fn unresolved_aliases(&self) -> Vec<String> {
         let mut refs = Vec::new();
         if let Some(model) = &self.model {
             refs.push(model);
         }
-        refs.extend(self.fallback_models.iter());
         refs.into_iter()
             .filter(|name| !self.models.contains_key(name.as_str()) && !name.contains('/'))
             .cloned()
@@ -387,6 +380,7 @@ impl BuilderCfg {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JudgeCfg {
+    #[serde(default)]
     pub cmd: String,
     #[serde(default)]
     pub mode: JudgeMode,
@@ -397,6 +391,17 @@ pub struct JudgeCfg {
 }
 fn default_judge_timeout() -> u64 {
     600
+}
+
+impl Default for JudgeCfg {
+    fn default() -> Self {
+        JudgeCfg {
+            cmd: String::new(),
+            mode: JudgeMode::default(),
+            timeout_secs: default_judge_timeout(),
+            policy: JudgePolicy::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -517,7 +522,10 @@ pub struct ContextCfg {
 }
 impl Default for ContextCfg {
     fn default() -> Self {
-        Self { soft_tokens: default_soft_tokens(), hard_tokens: default_hard_tokens() }
+        Self {
+            soft_tokens: default_soft_tokens(),
+            hard_tokens: default_hard_tokens(),
+        }
     }
 }
 fn default_soft_tokens() -> u64 {
@@ -665,7 +673,6 @@ judge: { cmd: abe }
 builder:
   cmd: opencode
   model: qwen
-  fallback_models: [m3]
   models:
     qwen: ollama/Intel/Qwen3-Coder
     m3: minimax/MiniMax-M3
@@ -694,17 +701,10 @@ judge:
             b.opencode_args(None),
             vec!["--model", "ollama/Intel/Qwen3-Coder", "--variant", "high"]
         );
-        assert_eq!(
-            b.model_sequence(None, &[]),
-            vec![Some("qwen".into()), Some("m3".into())]
-        );
-        assert_eq!(
-            b.model_sequence(Some("raw/model"), &["m3".into()]),
-            vec![Some("raw/model".into()), Some("m3".into())]
-        );
         assert!(b.unresolved_aliases().is_empty());
+        // a default model alias not in the roster (and not a raw id) is flagged
         let mut b3 = b.clone();
-        b3.fallback_models = vec!["typo".into(), "raw/model".into()];
+        b3.model = Some("typo".into());
         assert_eq!(b3.unresolved_aliases(), vec!["typo"]);
         // no default + no override => no --model (opencode's own default)
         let b2 = serde_yaml::from_str::<Config>("builder: { cmd: opencode }\njudge: { cmd: abe }")
@@ -729,11 +729,23 @@ judge:
 "#;
         let b = serde_yaml::from_str::<Config>(yaml).unwrap().builder;
         // resolved_model returns the bare model id for the Full form.
-        assert_eq!(b.resolved_model(Some("qwen")).as_deref(), Some("Intel/Qwen3"));
+        assert_eq!(
+            b.resolved_model(Some("qwen")).as_deref(),
+            Some("Intel/Qwen3")
+        );
         // explicit endpoint + key are exposed (no prefix guessing needed).
-        assert_eq!(b.entry_base_url(Some("qwen")).as_deref(), Some("http://host:8000/v1"));
-        assert_eq!(b.entry_api_model(Some("qwen")).as_deref(), Some("Intel/Qwen3"));
-        assert_eq!(b.entry_api_key_env(Some("cloud")).as_deref(), Some("MINIMAX_API_KEY"));
+        assert_eq!(
+            b.entry_base_url(Some("qwen")).as_deref(),
+            Some("http://host:8000/v1")
+        );
+        assert_eq!(
+            b.entry_api_model(Some("qwen")).as_deref(),
+            Some("Intel/Qwen3")
+        );
+        assert_eq!(
+            b.entry_api_key_env(Some("cloud")).as_deref(),
+            Some("MINIMAX_API_KEY")
+        );
         // legacy string form carries no explicit endpoint → caller falls back.
         assert!(b.entry_base_url(Some("legacy")).is_none());
         assert!(b.entry_api_model(Some("legacy")).is_none());
@@ -784,7 +796,8 @@ worktree:
 
     #[test]
     fn focused_cmds_defaults_to_empty() {
-        let yaml = "builder: { cmd: opencode }\njudge: { cmd: abe }\nverify: { cmds: [cargo test] }";
+        let yaml =
+            "builder: { cmd: opencode }\njudge: { cmd: abe }\nverify: { cmds: [cargo test] }";
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.verify.focused_cmds.is_empty());
     }
@@ -803,7 +816,10 @@ verify:
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(
             cfg.verify.focused_cmds,
-            vec!["cargo check".to_string(), "cargo test --lib fast_case".to_string()]
+            vec![
+                "cargo check".to_string(),
+                "cargo test --lib fast_case".to_string()
+            ]
         );
         assert_eq!(cfg.verify.cmds, vec!["cargo test".to_string()]);
     }

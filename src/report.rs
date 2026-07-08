@@ -214,9 +214,12 @@ mod tests {
             prompt_est_tokens: vec![],
             verify_cmds: vec![],
         };
-        assert!(to_json(&mk(RunStatus::Converged, NextAction::Done)).contains("\"status\":\"converged\""));
-        assert!(to_json(&mk(RunStatus::NeedsReview, NextAction::ReviewCandidate))
-            .contains("\"status\":\"needs_review\""));
+        assert!(to_json(&mk(RunStatus::Converged, NextAction::Done))
+            .contains("\"status\":\"converged\""));
+        assert!(
+            to_json(&mk(RunStatus::NeedsReview, NextAction::ReviewCandidate))
+                .contains("\"status\":\"needs_review\"")
+        );
     }
 
     #[test]
@@ -235,8 +238,16 @@ mod tests {
     fn append_event_writes_jsonl() {
         let tmp = std::env::temp_dir().join(format!("bob-ev-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        append_event(&tmp, "r1", serde_json::json!({"event": "verify", "passed": true}));
-        append_event(&tmp, "r1", serde_json::json!({"event": "judge", "verdict": "pass"}));
+        append_event(
+            &tmp,
+            "r1",
+            serde_json::json!({"event": "verify", "passed": true}),
+        );
+        append_event(
+            &tmp,
+            "r1",
+            serde_json::json!({"event": "judge", "verdict": "pass"}),
+        );
         let text = std::fs::read_to_string(tmp.join("r1/events.jsonl")).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);

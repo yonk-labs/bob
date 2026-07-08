@@ -161,7 +161,13 @@ printf 'export const leaked = true;\n' > "$d/packages/worldgen/src/index.ts"
     for i in 0..20 {
         let spawn_one = || {
             Command::new(env!("CARGO_BIN_EXE_bob"))
-                .args(["build", "change something", "--allow-path", "src/", "--json"])
+                .args([
+                    "build",
+                    "change something",
+                    "--allow-path",
+                    "src/",
+                    "--json",
+                ])
                 .current_dir(&dir)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())

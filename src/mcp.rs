@@ -124,7 +124,8 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
     let run_id = match p.run_id {
         Some(id) => {
             engine::validate_run_id(&id).map_err(|e| anyhow::anyhow!(e))?;
-            engine::check_run_id_collision(&cfg.artifacts.dir, &id).map_err(|e| anyhow::anyhow!(e))?;
+            engine::check_run_id_collision(&cfg.artifacts.dir, &id)
+                .map_err(|e| anyhow::anyhow!(e))?;
             id
         }
         None => format!(
@@ -144,8 +145,9 @@ async fn run_build(p: BuildParams) -> anyhow::Result<String> {
         tier: p.tier,
     };
     let skip_escalation = p.skip_escalation.unwrap_or(false);
-    let res = engine::run_opencode_with_fallbacks(&cfg, opts, p.model, fallback_models, skip_escalation)
-        .await?;
+    let res =
+        engine::run_opencode_with_fallbacks(&cfg, opts, p.model, fallback_models, skip_escalation)
+            .await?;
     Ok(report::to_json(&res))
 }
 

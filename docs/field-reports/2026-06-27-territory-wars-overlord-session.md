@@ -3,7 +3,7 @@
 **Date:** 2026-06-27
 **Operator:** Claude Code (Opus 4.8), acting as orchestrator
 **Target repo:** `~/yonk-apps/territory-wars` (Node/Express/better-sqlite3/Jest wrestling sim)
-**bob version:** local build at `~/yonk-tools/bob`, builder = `opencode` → `ollama/Intel/Qwen3-Coder-Next-int4-AutoRound` (192.168.1.193 vLLM), judge = `abe validate`
+**bob version:** local build at `~/yonk-tools/bob`, builder = `opencode` → `ollama/Intel/Qwen3-Coder-Next-int4-AutoRound` (your-model-host vLLM), judge = `abe validate`
 
 This documents a real session where I drove bob as a subagent to implement a slice of feature
 work (Plan 2: a JSON API over a roster-as-divisions engine model), while I stayed at the level of
@@ -29,7 +29,7 @@ design, spec-writing, verification, and integration.
 4. Optionally keep farming **single-file** API slices to bob (dashboard slice, etc.).
 
 **Environment notes for the next operator:**
-- bob default builder = the 192.168.1.193 qwen (vLLM on :8000 via opencode's `ollama` provider). `ollama` is NOT installed locally; a native ollama on :11434 is a fallback endpoint.
+- bob default builder = the your-model-host qwen (vLLM on :8000 via opencode's `ollama` provider). `ollama` is NOT installed locally; a native ollama on :11434 is a fallback endpoint.
 - Never run two `npm test` concurrently (CPU oversubscription → false failures). A run takes ~170–320s at low load.
 - If a bob run does not converge, it leaves `.bob/worktrees/*` + `bob/*` branches; clean them or jest throws a Haste collision on `@mod-games/sim-kernel`.
 

@@ -12,10 +12,7 @@ fn which(cmd: &str) -> bool {
             .map(|p| {
                 p.split(';')
                     .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        let stripped = if s.starts_with('.') { &s[1..] } else { s };
-                        stripped.to_string()
-                    })
+                    .map(|s| s.strip_prefix('.').unwrap_or(s).to_string())
                     .collect::<Vec<String>>()
             })
             .unwrap_or_default()
@@ -68,10 +65,6 @@ fn ask_bool(prompt: &str, default: bool) -> bool {
 
 fn detect_git() -> bool {
     which("git")
-}
-
-fn detect_bob() -> bool {
-    which("bob")
 }
 
 fn detect_abe() -> bool {
@@ -180,7 +173,7 @@ pub fn run() -> anyhow::Result<()> {
     };
 
     let judge_mode = {
-        let d = if detect_abe() { "validate" } else { "validate" };
+        let d = "validate";
         let s = ask("Judge mode: validate | debate (default: validate)", d);
         match s.to_lowercase().as_str() {
             "debate" => JudgeMode::Debate,
@@ -275,14 +268,13 @@ pub fn run() -> anyhow::Result<()> {
                         .collect()
                 })
                 .unwrap_or_default(),
-            fallback_models: vec![],
-                tiers: Default::default(),
-                escalation_policy: "tier".into(),
-                reliability_weight: 0.5,
-                pin: vec![],
-                exclude: vec![],
-                goose_toolshim: false,
-                idle_stall_secs: 120,
+            tiers: Default::default(),
+            escalation_policy: "tier".into(),
+            reliability_weight: 0.5,
+            pin: vec![],
+            exclude: vec![],
+            goose_toolshim: false,
+            idle_stall_secs: 120,
             args: builder_args,
         },
         judge: crate::config::JudgeCfg {
@@ -352,10 +344,9 @@ mod tests {
     }
 
     fn tmp_dir(label: &str) -> std::path::PathBuf {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // Atomic counter, not the clock — same-tick parallel tests collided (see doctor.rs tmp()).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("bob-init-{label}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -403,7 +394,6 @@ builder:
   models:
     qwen: ollama/Intel/Qwen3-Coder
     minimax: minimax/MiniMax-M3
-  fallback_models: ["minimax"]
 judge:
   cmd: abe
   mode: validate
@@ -428,7 +418,6 @@ artifacts:
         assert_eq!(cfg.builder.args, vec!["--variant", "high"]);
         assert_eq!(cfg.builder.model, Some("qwen".to_string()));
         assert_eq!(cfg.builder.models.len(), 2);
-        assert_eq!(cfg.builder.fallback_models, vec!["minimax"]);
         assert_eq!(cfg.judge.cmd, "abe");
         assert_eq!(cfg.judge.mode, JudgeMode::Validate);
         assert_eq!(cfg.judge.timeout_secs, 600);
@@ -454,7 +443,6 @@ artifacts:
                     "qwen".to_string(),
                     crate::config::ModelDef::Id("ollama/Intel/Qwen3-Coder".to_string()),
                 )]),
-                fallback_models: vec![],
                 tiers: Default::default(),
                 escalation_policy: "tier".into(),
                 reliability_weight: 0.5,

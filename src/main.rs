@@ -1,4 +1,3 @@
-#![allow(dead_code)] // interface stubs consumed by later tasks
 mod builder;
 mod campaign;
 mod cli;
@@ -7,8 +6,8 @@ mod doctor;
 mod engine;
 mod init;
 mod judge;
-mod model_stats;
 mod mcp;
+mod model_stats;
 mod report;
 mod safety;
 mod scope;
@@ -21,7 +20,9 @@ use cli::{Cli, Command};
 static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn load_run_json(artifacts_dir: &str, run_id: &str) -> anyhow::Result<serde_json::Value> {
-    let path = std::path::Path::new(artifacts_dir).join(run_id).join("run.json");
+    let path = std::path::Path::new(artifacts_dir)
+        .join(run_id)
+        .join("run.json");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("no run.json for {run_id} at {}: {e}", path.display()))?;
     Ok(serde_json::from_str(&text)?)
@@ -41,7 +42,9 @@ fn models_json(cfg: &config::Config) -> serde_json::Value {
             tiers.insert(tier.to_string(), serde_json::json!(models));
         }
     }
-    let default_tier = tiers_cfg.any_configured().then(|| tiers_cfg.default_tier.clone());
+    let default_tier = tiers_cfg
+        .any_configured()
+        .then(|| tiers_cfg.default_tier.clone());
 
     let mut models = serde_json::Map::new();
     for (name, def) in &cfg.builder.models {
@@ -54,15 +57,11 @@ fn models_json(cfg: &config::Config) -> serde_json::Value {
         );
     }
 
-    #[allow(deprecated)]
-    let fallback_models = cfg.builder.fallback_models.clone();
-
     serde_json::json!({
         "default_model": cfg.builder.model,
         "default_tier": default_tier,
         "tiers": tiers,
         "models": models,
-        "fallback_models": fallback_models,
     })
 }
 
@@ -75,9 +74,17 @@ fn replay_run(cfg: &config::Config, run_id: &str) -> anyhow::Result<(serde_json:
     }
     let cmds: Vec<String> = run["verify_cmds"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-    let cmds = if cmds.is_empty() { cfg.verify.cmds.clone() } else { cmds };
+    let cmds = if cmds.is_empty() {
+        cfg.verify.cmds.clone()
+    } else {
+        cmds
+    };
     let repo = std::env::current_dir()?;
     let vr = worktree::replay_verify_at_with_setup(
         &repo,
@@ -132,22 +139,6 @@ async fn main() -> anyhow::Result<()> {
                     }
                 } else {
                     println!("No default set (builder.model) — opencode uses its own default.");
-                }
-            }
-            if cfg.builder.fallback_models.is_empty() {
-                println!("Fallbacks: none");
-            } else {
-                println!("Fallbacks:");
-                for name in &cfg.builder.fallback_models {
-                    let resolved = cfg
-                        .builder
-                        .resolved_model(Some(name))
-                        .unwrap_or_else(|| name.clone());
-                    if cfg.builder.models.contains_key(name) {
-                        println!("  {name:<14} {resolved}");
-                    } else {
-                        println!("  {name:<14} {resolved}  (raw id)");
-                    }
                 }
             }
             Ok(())
@@ -228,9 +219,14 @@ async fn main() -> anyhow::Result<()> {
                 editable_paths: allow_paths.clone(),
                 tier,
             };
-            let res =
-                engine::run_opencode_with_fallbacks(&cfg, opts, model, fallback_models, skip_escalation)
-                    .await?;
+            let res = engine::run_opencode_with_fallbacks(
+                &cfg,
+                opts,
+                model,
+                fallback_models,
+                skip_escalation,
+            )
+            .await?;
             if json {
                 // Machine contract: JSON only, diff is in `final_diff`.
                 println!("{}", crate::report::to_json(&res));
@@ -288,7 +284,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Stats { reset } => {
             if reset {
                 match model_stats::StatsStore::reset() {
-                    Some(p) => println!("reset: removed {} — rankings back to cold start", p.display()),
+                    Some(p) => println!(
+                        "reset: removed {} — rankings back to cold start",
+                        p.display()
+                    ),
                     None => println!("nothing to reset (.bob/model-stats.json not found)"),
                 }
             } else {
@@ -325,7 +324,9 @@ async fn main() -> anyhow::Result<()> {
                     "HEAD ({head}) has moved off the run's base_sha ({base_sha}) — rebase/re-run instead of applying"
                 );
             }
-            let patch = std::path::Path::new(&cfg.artifacts.dir).join(&run_id).join("apply.patch");
+            let patch = std::path::Path::new(&cfg.artifacts.dir)
+                .join(&run_id)
+                .join("apply.patch");
             std::fs::write(&patch, run["final_diff"].as_str().unwrap_or_default())?;
             let st = std::process::Command::new("git")
                 .args(["apply", "--whitespace=nowarn"])
@@ -371,7 +372,10 @@ verify: { cmds: [] }
         assert!(v["tiers"].get("large").is_none());
         assert_eq!(v["models"]["qwen"]["id"], "Intel/Qwen3");
         assert_eq!(v["models"]["qwen"]["base_url"], "http://host:8000/v1");
-        assert_eq!(v["models"]["codex"]["base_url"], "https://api.openai.com/v1");
+        assert_eq!(
+            v["models"]["codex"]["base_url"],
+            "https://api.openai.com/v1"
+        );
     }
 
     #[test]
@@ -404,6 +408,5 @@ verify: { cmds: [] }
         assert!(v["default_tier"].is_null());
         assert_eq!(v["tiers"], serde_json::json!({}));
         assert_eq!(v["models"], serde_json::json!({}));
-        assert_eq!(v["fallback_models"], serde_json::json!([]));
     }
 }

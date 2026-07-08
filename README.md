@@ -8,6 +8,11 @@ the result on **your objective verify command** (e.g. `cargo test`), optionally 
 bob is the *worker* counterpart to [`abe`](../debator) (the *judge*): abe checks work,
 bob produces it. It owns no model logic — it orchestrates two CLIs you already have.
 
+**The envelope: one file per slice.** Bob's reliable working envelope is a
+single-file change (or one file plus a trivial mount, e.g. an export line) with
+one objective gate. Multi-file wiring is the orchestrator's job — split the work
+into Bob-sized slices (Hector does this) rather than handing bob a multi-file task.
+
 ```
   task + repo
       │
@@ -209,7 +214,10 @@ builder:
     # builders an exact endpoint instead of guessing from the id prefix:
     local:   { model: "Intel/Qwen3-...", base_url: "http://your-vllm-host:8000/v1" }
     minimax: { model: "MiniMax-M3", base_url: "https://api.minimax.io/v1", api_key_env: MINIMAX_API_KEY }
-  fallback_models: []     # roster aliases or raw ids; example ["minimax"] resolves above
+  escalation_policy: tier # tier (default): a failed tier escalates to the next one
+                          #   (cheap → medium → large → frontier). none: never leave the
+                          #   slice's tier — a hard cap on surprise cloud spend when
+                          #   higher tiers are paid models.
   args: []                # extra opencode flags (not the model), e.g. ["--variant", "high"]
 judge:
   cmd: abe                # judge CLI. validate = one reviewer (light); debate = multi-model panel (heavy)
@@ -231,6 +239,11 @@ loop:
 context:
   soft_tokens: 16000       # warn when the estimated builder prompt exceeds this
   hard_tokens: 32000       # refuse the run outright past this
+                           # builder prompt floors (measured): thin ≈0K · goose <3K ·
+                           # opencode 10-12K. Qwen-class local models run well to ~64K —
+                           # on such hardware raise toward soft 32000 / hard 64000, use
+                           # goose/thin for small slices (the floor shouldn't eat the
+                           # budget), opencode when the context is big enough to earn it.
 scope:
   max_changed_files: 20   # reject a runaway diff
   max_changed_lines: 800
@@ -245,10 +258,10 @@ id, from `opencode models`) and set the default with `builder.model`. Switch per
 `bob build --model <name-or-id>` (MCP: a `model` param), and list the roster with `bob models`.
 A `--model` value that isn't a roster name is passed through as a raw id. Omit `builder.model`
 entirely to use opencode's own default. The *judge's* models live in abe's config (`abe.yaml`), not here.
-Set `builder.fallback_models` or pass `--fallback-model <name-or-id>` to retry on builder errors
+Pass `--fallback-model <name-or-id>` to retry on builder errors
 or clear stuck results (`EmptyDiffAfterCritique`, repeated verify failure). Fallback entries are
-either roster aliases from `builder.models` or raw provider/model ids; `bob doctor` warns on likely
-alias typos.
+either roster aliases from `builder.models` or raw provider/model ids. Tiered configs escalate on
+their own — `escalation_policy: none` caps that (see below).
 
 **Model selection & stats — how bob prioritizes.** Within a tier, bob doesn't try models in
 config order — it **re-ranks them every run by measured performance**. Config order is only the
@@ -264,7 +277,7 @@ first run, flock-serialized so parallel bob runs don't clobber it):
       "runs": 10, "successes": 9, "avg_latency_secs": 40.0,
       "last_latency_secs": 38.2, "last_success": true
     },
-    "192.168.1.133/cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit": {
+    "your-model-host/cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit": {
       "runs": 10, "successes": 3, "avg_latency_secs": 20.0,
       "last_latency_secs": 21.1, "last_success": false
     }
@@ -290,11 +303,10 @@ the run log: `bob: tier='medium' chain (ranked by stats): [qwen, gemma]`. A flak
 sinks on its own; a fast reliable one floats up. An **unseen** model is neutral (success_rate 0.5,
 assumed 45s latency → score ≈ 1.1), so it's tried but not blindly trusted.
 
-Two more stat-driven behaviors fall out of the same data:
-- **Adaptive timeout** = `2 × avg_latency`, clamped to `[30s, 180s]`. It only ever *raises* your
-  configured `timeout_secs` for a known-slow model — never lowers it.
+One more behavior falls out of the same data:
 - **Health check** — a ~3s endpoint ping before a local model is attempted, so a down endpoint is
-  skipped instead of burning the timeout.
+  skipped instead of burning the timeout. (The per-attempt timeout itself is always exactly
+  `builder.timeout_secs` — nothing adaptive.)
 
 **Inspect & reset.** `bob stats` prints the current standings (runs, success %, avg/last latency,
 score), sorted by score:
@@ -302,12 +314,12 @@ score), sorted by score:
 ```
 model                                          runs  succ%    avg_s   last_s  score
 ollama/Intel/Qwen3-Coder-Next-int4-AutoRound      10    90%    40.0s    38.2s    2.3
-192.168.1.133/cyankiwi/gemma-4-26B-...            10    30%    20.0s    21.1s    1.5
+your-model-host/cyankiwi/gemma-4-26B-...            10    30%    20.0s    21.1s    1.5
 ```
 
 `bob stats --reset` deletes `.bob/model-stats.json` so rankings start cold again.
 
-**Steering it.** By default priority is *learned* (the score above), but three `builder` knobs
+**Steering it.** By default priority is *learned* (the score above), but four `builder` knobs
 let you override it:
 
 ```yaml
@@ -315,6 +327,8 @@ builder:
   reliability_weight: 0.5   # 0.0 = pure speed · 0.5 = balanced (default) · 1.0 = pure reliability
   pin: [gemma]              # always tried FIRST, in this order, ahead of stats ranking
   exclude: [minimax]        # never attempted — dropped from every tier chain
+  escalation_policy: tier   # tier (default) = escalate when a tier fails · none = never
+                            # leave the slice's tier (no surprise cloud spend)
 ```
 
 - **`reliability_weight`** re-biases the score: `reliability^(2w) × speed^(2(1-w))`. At `0.5` it's
@@ -322,6 +336,10 @@ builder:
   that *succeed* even if slower, lower it toward `0.0` to prefer the *fastest* regardless of flakiness.
 - **`pin`** / **`exclude`** are hard overrides (roster alias or raw id). `pin` forces models to the
   front of the chain; `exclude` removes them entirely. `pin` wins if a model is in both.
+- **`escalation_policy: none`** pins a run to its slice's tier — that tier's models are still
+  tried in ranked order, but a tier failure stops the run instead of escalating into higher
+  (possibly paid) tiers. This is enforced; the default `tier` escalates
+  cheap → medium → large → frontier.
 
 You can also `bob stats --reset` to wipe learned history (e.g. after fixing a flaky endpoint that
 unfairly tanked a model's score). `bob stats` shows scores under your configured `reliability_weight`.

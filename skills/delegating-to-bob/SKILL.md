@@ -62,7 +62,7 @@ If `.bob/lessons.md` exists, bob includes it in builder and judge context. Keep 
 - **Choose the builder's model:** keep a named roster in `builder.models` and per-tier model lists in `builder.tiers`; set `builder.model` for the default. (Tier-less configs can still pass `builder.args: ["--model", "provider/model"]` to opencode.)
 - **Guardrails:** `verify.cmds` is an extensible gate — add lints, scanners, or policy scripts (all must pass). `scope.allow_paths: ["src/"]` restricts which paths may change; `scope.max_changed_files` / `max_changed_lines` cap the blast radius. Override these per run when handing Bob a frozen slice.
 - **Judge policy:** `judge.policy: advisory` keeps Abe non-blocking; `blocking` requires Abe to pass; `retry_on_fail` feeds Abe critique back into the next builder prompt.
-- **Model fallback:** `builder.fallback_models` or per-run `fallback_models` retries on builder errors and clear stuck results.
+- **Model fallback:** per-run `fallback_models` retries on builder errors and clear stuck results; `builder.escalation_policy: none` keeps a run in its slice's tier (no escalation into paid tiers).
 - **Cost/time:** `loop.max_iterations`, `loop.max_walltime_secs`.
 
 bob isolates every attempt in a worktree and secret-scans the spec and the diff, so delegation is safe by default: nothing lands until the gate passes and (for `apply`) the user opted in.

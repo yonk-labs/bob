@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 /// tests/, test/, __tests__/ dirs, and *_test.*, *.test.*, *.spec.* suffixes.
 fn is_test_path(path: &str) -> bool {
     let p = Path::new(path);
-    p.components().any(|c| matches!(c, Component::Normal(s) if s == "tests" || s == "test" || s == "__tests__"))
-        || path.ends_with("_test.rs")
+    p.components().any(
+        |c| matches!(c, Component::Normal(s) if s == "tests" || s == "test" || s == "__tests__"),
+    ) || path.ends_with("_test.rs")
         || path.ends_with("_test.js")
         || path.ends_with("_test.py")
         || path.ends_with(".test.js")
@@ -181,18 +182,21 @@ pub enum StepOutcome {
     Judged { verdict: Verdict, critique: String },
 }
 impl StepOutcome {
+    #[cfg(test)]
     pub fn empty_diff() -> Self {
         StepOutcome::EmptyDiff
     }
     pub fn scope_exceeded(d: &str) -> Self {
         StepOutcome::ScopeExceeded { detail: d.into() }
     }
+    #[cfg(test)]
     pub fn verify_failed(o: &str) -> Self {
         StepOutcome::VerifyFailed { output: o.into() }
     }
     pub fn judge_unavailable(d: &str) -> Self {
         StepOutcome::JudgeUnavailable { detail: d.into() }
     }
+    #[cfg(test)]
     pub fn judged(_passed_verify: bool, v: Verdict, c: &str) -> Self {
         StepOutcome::Judged {
             verdict: v,
@@ -549,16 +553,17 @@ fn build_prompt(opts: &RunOpts, critique: Option<&str>, lessons: Option<&str>) -
 /// Surfacing the budget up front turns a mystery 600s hang into a one-line
 /// "context ≈ Nk tokens — trim it". Read-only; never blocks the run. Returns
 /// 0 when there are no files to estimate.
-fn context_est_tokens(opts: &RunOpts) -> u64 {
+fn context_est_tokens(opts: &RunOpts, per_file_cap: Option<u64>) -> u64 {
+    let eff = |n: u64| per_file_cap.map_or(n, |cap| n.min(cap));
     let mut files: Vec<(String, u64)> = Vec::new();
     for f in &opts.context_files {
         if let Ok(m) = std::fs::metadata(f) {
-            files.push((f.display().to_string(), m.len()));
+            files.push((f.display().to_string(), eff(m.len())));
         }
     }
     for p in &opts.editable_paths {
         if let Ok(m) = std::fs::metadata(p) {
-            files.push((p.clone(), m.len()));
+            files.push((p.clone(), eff(m.len())));
         }
     }
     if files.is_empty() {
@@ -566,7 +571,7 @@ fn context_est_tokens(opts: &RunOpts) -> u64 {
     }
     let total: u64 = files.iter().map(|(_, n)| n).sum();
     let est_tokens = total / 4; // ~4 bytes/token, standard rough estimate for code/text
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     let (biggest_name, biggest_bytes) = &files[0];
     eprintln!(
         "bob: context ≈ {}k tokens from {} file(s) ({} KB on disk; largest: {} @ {} KB)",
@@ -585,8 +590,14 @@ fn context_est_tokens(opts: &RunOpts) -> u64 {
 fn enforce_context_budget(
     opts: &RunOpts,
     cfg: &crate::config::ContextCfg,
+    per_file_cap: Option<u64>,
 ) -> anyhow::Result<u64> {
-    let est = context_est_tokens(opts);
+    // The thin builder embeds at most THIN_EMBED_WHOLE_CAP bytes per file
+    // (oversized files become excerpt windows of comparable size), so its
+    // budget counts the embedded size, not the on-disk size — a 330KB
+    // god-file costs ~6k embedded tokens, not ~82k (live find, brownfield
+    // bench 2026-07-06: the estimator refused runs the builder could serve).
+    let est = context_est_tokens(opts, per_file_cap);
     if est > cfg.hard_tokens {
         anyhow::bail!(
             "context ~{}k tokens exceeds hard ceiling {}k — trim files/editable_paths, \
@@ -854,6 +865,18 @@ fn apply_overrides(
     chain
 }
 
+/// Tiers this run may draw models from. `escalation_policy: none` pins the run
+/// to the slice's own tier — the cost-safety valve that keeps a cheap slice
+/// from escalating into paid higher tiers. Any other policy ("tier", or the
+/// legacy alias "model") escalates through the full ordered chain.
+fn tiers_for_policy(tiers: &crate::config::TierCfg, slice_tier: &str, policy: &str) -> Vec<String> {
+    if policy == "none" {
+        vec![slice_tier.to_string()]
+    } else {
+        tiers.ordered_tiers(slice_tier)
+    }
+}
+
 /// Resolve the ordered model-attempt sequence.
 /// - `skip_escalation`: exactly one attempt — the `--model` override, else the
 ///   config default (`None` = the builder's own default). No tiers, no
@@ -899,9 +922,15 @@ pub async fn run_opencode_with_fallbacks(
     // Within each tier, models are ranked by stats (success × speed).
     //
     // Tier selection: slice.tier (per-call override) > config default_tier > "cheap"
-    let slice_tier = opts.tier.as_deref()
+    let slice_tier = opts
+        .tier
+        .as_deref()
         .unwrap_or(&cfg.builder.tiers.default_tier);
-    let tiers_to_try = cfg.builder.tiers.ordered_tiers(slice_tier);
+    let tiers_to_try = tiers_for_policy(
+        &cfg.builder.tiers,
+        slice_tier,
+        &cfg.builder.escalation_policy,
+    );
 
     // ADAPTIVE: for each tier, rank models by historical performance.
     // Dead/slow models sink to the bottom of their tier.
@@ -926,9 +955,7 @@ pub async fn run_opencode_with_fallbacks(
             for ranked_id in &ranked {
                 for m in models {
                     let resolved = cfg.builder.resolved_model(Some(m));
-                    if resolved.as_deref() == Some(ranked_id.as_str())
-                        && !ordered.contains(m)
-                    {
+                    if resolved.as_deref() == Some(ranked_id.as_str()) && !ordered.contains(m) {
                         ordered.push(m.clone());
                         break;
                     }
@@ -947,7 +974,7 @@ pub async fn run_opencode_with_fallbacks(
     // Priority overrides: exclude drops models from the chain entirely; pin forces
     // preferred models to the front (in listed order), ahead of stats ranking.
     if !cfg.builder.exclude.is_empty() {
-        sequence.retain(|a| a.as_deref().map_or(true, |al| !cfg.builder.is_excluded(al)));
+        sequence.retain(|a| a.as_deref().is_none_or(|al| !cfg.builder.is_excluded(al)));
     }
     for pinned in cfg.builder.pin.iter().rev() {
         sequence.retain(|a| a.as_deref() != Some(pinned.as_str()));
@@ -981,7 +1008,9 @@ pub async fn run_opencode_with_fallbacks(
     // Pre-flight the verify gate on the unmodified base tree: catch a gate that
     // already passes (too weak — bob converges on nothing) or errors on bad flags
     // (unpassable — bob loops). Both otherwise look like "the model failed".
-    if let Some(msg) = crate::verify::preflight_diagnose(&cfg.verify.cmds, std::path::Path::new(".")) {
+    if let Some(msg) =
+        crate::verify::preflight_diagnose(&cfg.verify.cmds, std::path::Path::new("."))
+    {
         eprintln!("bob: {msg}");
     }
 
@@ -1064,8 +1093,14 @@ pub async fn run_opencode_with_fallbacks(
             .position(|t| cfg.builder.tiers.models_for(t).iter().any(|m| m == alias))
             .unwrap_or(0);
         if model_tier > current_tier_idx {
-            let from_tier = tiers_to_try.get(current_tier_idx).cloned().unwrap_or_else(|| "?".into());
-            let to_tier = tiers_to_try.get(model_tier).cloned().unwrap_or_else(|| "?".into());
+            let from_tier = tiers_to_try
+                .get(current_tier_idx)
+                .cloned()
+                .unwrap_or_else(|| "?".into());
+            let to_tier = tiers_to_try
+                .get(model_tier)
+                .cloned()
+                .unwrap_or_else(|| "?".into());
             eprintln!("bob: escalating from tier '{from_tier}' to tier '{to_tier}'");
             current_tier_idx = model_tier;
         }
@@ -1077,20 +1112,10 @@ pub async fn run_opencode_with_fallbacks(
             );
         }
 
-        // ADAPTIVE TIMEOUT: use historical avg × 2, clamped [30s, 180s]
-        let model_stats = stats.get(model_id);
-        let adaptive = model_stats.adaptive_timeout();
-        let configured = Duration::from_secs(cfg.builder.timeout_secs);
-        // Adaptive timing may EXTEND patience for known-slow models but must never
-        // shrink the user's configured budget — agentic builders (goose/opencode)
-        // legitimately need minutes, and min() silently capped 600s configs at ~90s.
-        let builder_timeout = adaptive.max(configured);
-        eprintln!(
-            "bob: timeout configured={}s adaptive={}s effective={}s",
-            configured.as_secs(),
-            adaptive.as_secs(),
-            builder_timeout.as_secs()
-        );
+        // Per-attempt builder timeout is exactly the configured budget. An
+        // "adaptive" stats-derived timeout used to be max()'d in here, but it
+        // clamped at 180s against a 600s default — it could never win. Gone.
+        let builder_timeout = Duration::from_secs(cfg.builder.timeout_secs);
 
         let mut attempt_opts = opts.clone();
         attempt_opts.run_id = if idx == 0 {
@@ -1103,7 +1128,8 @@ pub async fn run_opencode_with_fallbacks(
         // Construct the right builder type for this tier.
         // cheap → ThinBuilder (curl, minimal context) or whatever's configured
         // frontier → Opencode (full agent loop) by default
-        let tier_name = tiers_to_try.get(current_tier_idx)
+        let tier_name = tiers_to_try
+            .get(current_tier_idx)
             .map(|s| s.as_str())
             .unwrap_or("cheap");
         // Tier-less config → honor builder.cmd so `cmd: goose` / `cmd: thin`
@@ -1155,6 +1181,11 @@ pub async fn run_opencode_with_fallbacks(
                     base_url,
                     api_key,
                     timeout: builder_timeout,
+                    max_tokens: cfg
+                        .builder
+                        .entry_max_tokens(model_sel.as_deref())
+                        .unwrap_or(65_536),
+                    calls: std::sync::atomic::AtomicU32::new(0),
                 })
             }
             "goose" => {
@@ -1320,7 +1351,9 @@ pub async fn run(
     }
     // Pre-flight context budget gate: refuse (hard) or warn (soft) before any
     // worktree/workspace setup, so an oversized context never burns a worktree.
-    let context_est = enforce_context_budget(&opts, &cfg.context)?;
+    let thin_cap = (cfg.builder.cmd == "thin")
+        .then_some(crate::builder::THIN_EMBED_WHOLE_CAP as u64);
+    let context_est = enforce_context_budget(&opts, &cfg.context, thin_cap)?;
     // Secret-scan inputs before anything enters a prompt.
     let spec_hits = crate::safety::scan(&opts.spec);
     if !spec_hits.is_empty() {
@@ -1346,7 +1379,12 @@ pub async fn run(
         &opts.run_id,
         serde_json::json!({"event": "run_start", "base_sha": base_sha, "model": opts.builder_model}),
     );
-    let judge_spec = build_judge_spec(&opts.spec, lessons.as_deref(), &opts.context_files, ws.path());
+    let judge_spec = build_judge_spec(
+        &opts.spec,
+        lessons.as_deref(),
+        &opts.context_files,
+        ws.path(),
+    );
     let deadline = Instant::now() + Duration::from_secs(cfg.loop_cfg.max_walltime_secs);
 
     let mut state = LoopState {
@@ -1446,9 +1484,7 @@ pub async fn run(
                 // discarded on timeout. Best-effort; never masks the error.
                 if let Ok(partial) = ws.capture_diff() {
                     if !partial.trim().is_empty() {
-                        let iter_dir = art
-                            .join(&opts.run_id)
-                            .join(format!("iter-{}", state.index));
+                        let iter_dir = art.join(&opts.run_id).join(format!("iter-{}", state.index));
                         let _ = std::fs::create_dir_all(&iter_dir);
                         let partial_path = iter_dir.join("partial.diff");
                         if std::fs::write(&partial_path, &partial).is_ok() {
@@ -1568,6 +1604,12 @@ pub async fn run(
                 );
                 if !vr.passed {
                     StepOutcome::VerifyFailed { output: vr.output }
+                } else if cfg.judge.cmd.is_empty() {
+                    // No judge configured: verify is the sole authority. Don't
+                    // spawn-and-fail every iteration — resolve directly.
+                    StepOutcome::JudgeUnavailable {
+                        detail: "no judge configured (judge.cmd empty)".into(),
+                    }
                 } else {
                     match judge.judge(&judge_spec, &diff, &vr.output).await {
                         Ok(o) => {
@@ -1600,9 +1642,7 @@ pub async fn run(
                             let detail = e.to_string();
                             match cfg.judge.policy {
                                 JudgePolicy::Advisory => {
-                                    eprintln!(
-                                        "abe advisory unavailable (non-blocking): {detail}"
-                                    );
+                                    eprintln!("abe advisory unavailable (non-blocking): {detail}");
                                 }
                                 JudgePolicy::RetryOnFail => {
                                     eprintln!(
@@ -1750,6 +1790,16 @@ pub async fn run(
                 break;
             }
             LoopAction::Continue { critique: c } => {
+                // An empty diff caused by edit-apply/format errors carries the
+                // builder's precise why (stderr_tail) — a generic "no changes
+                // were produced" leaves the model repeating the same mistake.
+                let c = if matches!(&step, StepOutcome::EmptyDiff)
+                    && !builder_snapshot.stderr_tail.trim().is_empty()
+                {
+                    format!("{c}\nbuilder reported:\n{}", builder_snapshot.stderr_tail)
+                } else {
+                    c
+                };
                 critique = Some(c);
                 state.had_critique = true;
                 state.index += 1;
@@ -1841,7 +1891,11 @@ mod decision_tests {
         assert!(should_keep_worktree(true, RunStatus::Converged));
     }
 
-    fn verify_cfg(cmds: Vec<&str>, replay: bool, focused_cmds: Vec<&str>) -> crate::config::VerifyCfg {
+    fn verify_cfg(
+        cmds: Vec<&str>,
+        replay: bool,
+        focused_cmds: Vec<&str>,
+    ) -> crate::config::VerifyCfg {
         crate::config::VerifyCfg {
             cmds: cmds.into_iter().map(String::from).collect(),
             replay,
@@ -1918,11 +1972,16 @@ mod decision_tests {
             extract_model_name("Intel/Qwen3-Coder-Next-int4-AutoRound"),
             "Intel/Qwen3-Coder-Next-int4-AutoRound"
         );
-        assert_eq!(extract_model_name("mlx-community/Qwen3-Coder-Next-4bit"),
-            "mlx-community/Qwen3-Coder-Next-4bit");
+        assert_eq!(
+            extract_model_name("mlx-community/Qwen3-Coder-Next-4bit"),
+            "mlx-community/Qwen3-Coder-Next-4bit"
+        );
         // Known provider/host prefixes: strip the first segment.
         assert_eq!(extract_model_name("ollama/Intel/Qwen3"), "Intel/Qwen3");
-        assert_eq!(extract_model_name("192.168.1.133/cyankiwi/gemma"), "cyankiwi/gemma");
+        assert_eq!(
+            extract_model_name("192.168.1.133/cyankiwi/gemma"),
+            "cyankiwi/gemma"
+        );
         assert_eq!(extract_model_name("zai-coding-plan/glm-5.2"), "glm-5.2");
         // Provider/org/model shape (≥2 slashes) strips the leading segment even
         // when the provider alias isn't in the known list — e.g. the mlx endpoint.
@@ -2148,7 +2207,7 @@ mod decision_tests {
     fn advisory_fail_verdict_still_applies() {
         let s = state(0, 3);
         let step = StepOutcome::judged(true, Verdict::Fail, "missing X");
-assert!(matches!(
+        assert!(matches!(
             next_action(&s, &step, JudgePolicy::Advisory),
             LoopAction::Apply
         ));
@@ -2254,11 +2313,7 @@ assert!(matches!(
         // gemma-133 FIRST because the tier chain silently won. The explicit
         // fallback must be attempt #2; tier escalation follows.
         let tier_chain = vec![s("gemma-133"), s("qwen-140"), s("minimax")];
-        let out = apply_overrides(
-            tier_chain,
-            Some("qwen-193".into()),
-            vec!["qwen-140".into()],
-        );
+        let out = apply_overrides(tier_chain, Some("qwen-193".into()), vec!["qwen-140".into()]);
         assert_eq!(
             out,
             vec![s("qwen-193"), s("qwen-140"), s("gemma-133"), s("minimax")]
@@ -2289,7 +2344,10 @@ diff --git a/f.txt b/f.txt
         assert_eq!(opencode_exec_cmd("thin"), "opencode");
         // Custom opencode wrappers are still honored.
         assert_eq!(opencode_exec_cmd("opencode"), "opencode");
-        assert_eq!(opencode_exec_cmd("/usr/local/bin/my-opencode"), "/usr/local/bin/my-opencode");
+        assert_eq!(
+            opencode_exec_cmd("/usr/local/bin/my-opencode"),
+            "/usr/local/bin/my-opencode"
+        );
     }
 
     #[test]
@@ -2303,7 +2361,13 @@ diff --git a/f.txt b/f.txt
     fn skip_escalation_with_model_is_a_single_attempt() {
         // A tier chain + fallbacks that would normally escalate...
         let base = vec![s("qwen"), s("llama")];
-        let out = resolve_sequence(true, base, Some("codex".into()), vec!["fb".into()], Some("cfg".into()));
+        let out = resolve_sequence(
+            true,
+            base,
+            Some("codex".into()),
+            vec!["fb".into()],
+            Some("cfg".into()),
+        );
         // ...is reduced to exactly the --model override. Length 1 ⇒ no fail-over.
         assert_eq!(out, vec![s("codex")]);
     }
@@ -2323,12 +2387,41 @@ diff --git a/f.txt b/f.txt
     }
 
     #[test]
+    fn escalation_policy_none_never_leaves_the_slice_tier() {
+        // B05 regression: `escalation_policy: none` is a cost-safety valve. A
+        // failing cheap-tier attempt must NOT escalate — the frontier model
+        // never enters the attempt chain, so there is nothing to escalate to.
+        let tiers = crate::config::TierCfg {
+            cheap: vec!["qwen".into()],
+            frontier: vec!["codex".into()],
+            default_tier: "cheap".into(),
+            ..Default::default()
+        };
+        assert_eq!(tiers_for_policy(&tiers, "cheap", "none"), vec!["cheap"]);
+        let models: Vec<String> = tiers_for_policy(&tiers, "cheap", "none")
+            .iter()
+            .flat_map(|t| tiers.models_for(t).to_vec())
+            .collect();
+        assert_eq!(models, vec!["qwen"]);
+        // The default policy (and the legacy "model" alias) keep the full ladder.
+        for policy in ["tier", "model"] {
+            assert_eq!(
+                tiers_for_policy(&tiers, "cheap", policy),
+                vec!["cheap", "medium", "large", "frontier"]
+            );
+        }
+    }
+
+    #[test]
     fn without_skip_escalation_keeps_full_chain() {
         // Override leads, tier chain follows — the normal escalating sequence.
         let out = resolve_sequence(false, vec![s("qwen")], Some("codex".into()), vec![], None);
         assert_eq!(out, vec![s("codex"), s("qwen")]);
         // Tier-less config falls back to one default attempt (legacy path).
-        assert_eq!(resolve_sequence(false, vec![], None, vec![], None), vec![None]);
+        assert_eq!(
+            resolve_sequence(false, vec![], None, vec![], None),
+            vec![None]
+        );
     }
 
     #[test]
@@ -2395,12 +2488,26 @@ diff --git a/f.txt b/f.txt
             tier: None,
         };
         let cfg = crate::config::ContextCfg::default(); // soft 16k / hard 32k
-        let err = enforce_context_budget(&opts, &cfg).unwrap_err().to_string();
+        let err = enforce_context_budget(&opts, &cfg, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("hard ceiling"), "{err}");
-        assert!(err.contains("context.hard_tokens"), "remediation missing: {err}");
+        assert!(
+            err.contains("context.hard_tokens"),
+            "remediation missing: {err}"
+        );
+        // the same oversized file passes under the thin per-file cap: the thin
+        // builder embeds at most THIN_EMBED_WHOLE_CAP bytes of it
+        let est = enforce_context_budget(
+            &opts,
+            &cfg,
+            Some(crate::builder::THIN_EMBED_WHOLE_CAP as u64),
+        )
+        .unwrap();
+        assert!(est <= crate::builder::THIN_EMBED_WHOLE_CAP as u64 / 4, "{est}");
         // under the ceiling passes and returns the estimate
         std::fs::write(&big, "x".repeat(4_000)).unwrap();
-        let est = enforce_context_budget(&opts, &cfg).unwrap();
+        let est = enforce_context_budget(&opts, &cfg, None).unwrap();
         assert!(est >= 1_000 / 4 && est < 16_000, "{est}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2520,14 +2627,13 @@ mod flow_tests {
                 args: vec![],
                 model: None,
                 models: Default::default(),
-                fallback_models: vec![],
                 tiers: Default::default(),
                 escalation_policy: "tier".into(),
                 reliability_weight: 0.5,
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
-            idle_stall_secs: 0,
+                idle_stall_secs: 0,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -2608,14 +2714,13 @@ mod flow_tests {
                 args: vec![],
                 model: None,
                 models: Default::default(),
-                fallback_models: vec![],
                 tiers: Default::default(),
                 escalation_policy: "tier".into(),
                 reliability_weight: 0.5,
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
-            idle_stall_secs: 0,
+                idle_stall_secs: 0,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -2702,14 +2807,13 @@ mod flow_tests {
                 args: vec![],
                 model: None,
                 models: Default::default(),
-                fallback_models: vec![],
                 tiers: Default::default(),
                 escalation_policy: "tier".into(),
                 reliability_weight: 0.5,
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
-            idle_stall_secs: 0,
+                idle_stall_secs: 0,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -2812,14 +2916,13 @@ mod flow_tests {
                 args: vec![],
                 model: None,
                 models: Default::default(),
-                fallback_models: vec![],
                 tiers: Default::default(),
                 escalation_policy: "tier".into(),
                 reliability_weight: 0.5,
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
-            idle_stall_secs: 0,
+                idle_stall_secs: 0,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -2918,14 +3021,13 @@ mod flow_tests {
                 args: vec![],
                 model: None,
                 models: Default::default(),
-                fallback_models: vec![],
                 tiers: Default::default(),
                 escalation_policy: "tier".into(),
                 reliability_weight: 0.5,
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
-            idle_stall_secs: 0,
+                idle_stall_secs: 0,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -3058,7 +3160,10 @@ mod flow_tests {
             msg.contains("worktree setup cmd failed"),
             "reported as an infra error, not a builder/judge failure: {msg}"
         );
-        assert!(msg.contains("setup-cmd-boom"), "carries the cmd's stderr: {msg}");
+        assert!(
+            msg.contains("setup-cmd-boom"),
+            "carries the cmd's stderr: {msg}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3070,14 +3175,13 @@ mod flow_tests {
                 args: vec![],
                 model: None,
                 models: Default::default(),
-                fallback_models: vec![],
                 tiers: Default::default(),
                 escalation_policy: "tier".into(),
                 reliability_weight: 0.5,
                 pin: vec![],
                 exclude: vec![],
                 goose_toolshim: false,
-            idle_stall_secs: 0,
+                idle_stall_secs: 0,
             },
             judge: crate::config::JudgeCfg {
                 cmd: "abe".into(),
@@ -3152,10 +3256,8 @@ mod flow_tests {
 
         // events.jsonl proves the in-loop gate that actually ran was the
         // focused one, not the full suite.
-        let events = std::fs::read_to_string(
-            tmp.join(".bob/runs/focused-flow/events.jsonl"),
-        )
-        .unwrap();
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/focused-flow/events.jsonl")).unwrap();
         let verify_lines: Vec<serde_json::Value> = events
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
@@ -3181,7 +3283,8 @@ mod flow_tests {
     #[tokio::test]
     async fn focused_cmds_ignored_when_replay_disabled_flow() {
         let _cwd_guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!("bob-focused-unsafe-flow-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("bob-focused-unsafe-flow-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let g = |a: &[&str]| {
@@ -3220,10 +3323,9 @@ mod flow_tests {
             .await
             .unwrap();
 
-        let events = std::fs::read_to_string(
-            tmp.join(".bob/runs/focused-unsafe-flow/events.jsonl"),
-        )
-        .unwrap();
+        let events =
+            std::fs::read_to_string(tmp.join(".bob/runs/focused-unsafe-flow/events.jsonl"))
+                .unwrap();
         let verify_lines: Vec<serde_json::Value> = events
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
@@ -3363,8 +3465,7 @@ mod flow_tests {
 
         let partial =
             std::fs::read_to_string(tmp.join(".bob/runs/partial/iter-0/partial.diff")).unwrap();
-        let events =
-            std::fs::read_to_string(tmp.join(".bob/runs/partial/events.jsonl")).unwrap();
+        let events = std::fs::read_to_string(tmp.join(".bob/runs/partial/events.jsonl")).unwrap();
         std::env::set_current_dir(prev).unwrap();
 
         assert!(res.is_err(), "timeout still surfaces as Err");
@@ -3378,7 +3479,10 @@ mod flow_tests {
             .find(|v: &serde_json::Value| v["event"] == "partial_diff")
             .expect("partial_diff event emitted");
         assert_eq!(ev["iter"], 0);
-        assert!(ev["path"].as_str().unwrap().ends_with("iter-0/partial.diff"));
+        assert!(ev["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("iter-0/partial.diff"));
         assert!(ev["added_lines"].as_u64().unwrap() >= 1);
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -3505,8 +3609,9 @@ mod flow_tests {
         assert_eq!(rj["status"], "error");
         assert_eq!(rj["stop_reason"], "BuilderError");
         assert!(
-            events.lines().any(|l| l.contains("\"builder_error\"")
-                && l.contains("endpoint unreachable")),
+            events
+                .lines()
+                .any(|l| l.contains("\"builder_error\"") && l.contains("endpoint unreachable")),
             "builder_error event emitted:\n{events}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3532,6 +3637,7 @@ mod flow_tests {
                     model: model.into(),
                     base_url: Some("http://127.0.0.1:1/v1".into()), // dead port
                     api_key_env: None,
+                    max_tokens: None,
                 },
             );
         }
@@ -3549,8 +3655,7 @@ mod flow_tests {
         let res =
             run_opencode_with_fallbacks(&cfg, opts, Some("m1".into()), vec!["m2".into()], false)
                 .await;
-        let events =
-            std::fs::read_to_string(tmp.join(".bob/runs/probe-hop/events.jsonl")).unwrap();
+        let events = std::fs::read_to_string(tmp.join(".bob/runs/probe-hop/events.jsonl")).unwrap();
         std::env::set_current_dir(prev).unwrap();
 
         let err = match res {
@@ -3567,7 +3672,10 @@ mod flow_tests {
             .lines()
             .filter(|l| l.contains("\"builder_error\"") && l.contains("endpoint unreachable"))
             .count();
-        assert_eq!(dead_events, 2, "one builder_error per dead model:\n{events}");
+        assert_eq!(
+            dead_events, 2,
+            "one builder_error per dead model:\n{events}"
+        );
         // F5: the hop itself is visible in the PRIMARY run's events.jsonl —
         // fallback_start names the next model, attempt index, and the reason
         // the previous attempt ended.
@@ -3579,7 +3687,10 @@ mod flow_tests {
         assert_eq!(fb["attempt"], 1);
         assert_eq!(fb["model"], "test-model-2");
         assert!(
-            fb["reason"].as_str().unwrap().contains("endpoint unreachable"),
+            fb["reason"]
+                .as_str()
+                .unwrap()
+                .contains("endpoint unreachable"),
             "reason carries why the previous attempt ended: {fb}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3608,6 +3719,7 @@ mod flow_tests {
                 model: "test-model-dead".into(),
                 base_url: Some("http://127.0.0.1:1/v1".into()), // dead port
                 api_key_env: None,
+                max_tokens: None,
             },
         );
         let opts = RunOpts {
@@ -3641,8 +3753,7 @@ mod flow_tests {
             "terminal artifact records the exhausted-chain reason: {rj}"
         );
         // events.jsonl ENDS with run_end (status error) — hector's closure signal.
-        let last: serde_json::Value =
-            serde_json::from_str(events.lines().last().unwrap()).unwrap();
+        let last: serde_json::Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
         assert_eq!(last["event"], "run_end");
         assert_eq!(last["status"], "error");
         // Exactly one run_end (no double-emit).
@@ -3761,8 +3872,7 @@ mod flow_tests {
         assert_eq!(rj["stop_reason"], "BuilderError");
         assert_eq!(rj["builder"]["failure_kind"], "timeout");
         // run_end is the LAST event — consumers always see it.
-        let last: serde_json::Value =
-            serde_json::from_str(events.lines().last().unwrap()).unwrap();
+        let last: serde_json::Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
         assert_eq!(last["event"], "run_end");
         assert_eq!(last["status"], "error");
         let _ = std::fs::remove_dir_all(&tmp);

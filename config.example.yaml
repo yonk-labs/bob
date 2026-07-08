@@ -9,7 +9,10 @@ builder:
                           # list with `bob models`. (Model ids come from `opencode models`.)
     qwen:    ollama/Intel/Qwen3-Coder-Next-int4-AutoRound   # local, free — solid default for code
     minimax: minimax/MiniMax-M3                             # alias -> real provider/model id
-  fallback_models: []      # roster aliases or raw ids; example ["minimax"] resolves above
+  escalation_policy: tier # with tiers configured: "tier" (default) escalates to the next
+                          # tier when one fails (cheap → medium → large → frontier); "none"
+                          # never leaves the slice's tier — a hard cap on surprise cloud
+                          # spend when higher tiers are paid models.
   args: []                # extra opencode flags (NOT the model), e.g. ["--variant", "high"]
 judge:
   cmd: abe
